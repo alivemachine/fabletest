@@ -45,6 +45,8 @@ class Console:
         self.day_night, self.speed = 0.65, 0.35
         self.civ_count = 3
         self.exporting = False
+        self.cx, self.cy, self.zoom = 0.5, 0.5, 1.0    # viewport on the world
+        self._pan = None
 
         self.build_world()
         self.build_ui()
@@ -55,7 +57,12 @@ class Console:
         print(f"generating world seed={self.seed} size={self.size} ...", flush=True)
         self.full = wc.build_world(self.seed, self.size, self.civ_count)
         self.thumb = self.full.strided(max(1, self.size // 96))
+        self.apply_view()
         print(f"  done in {time.time() - t0:.1f}s")
+
+    def apply_view(self):
+        """The main view is a window onto the planet; thumbnails stay global."""
+        self.view = self.full.view(self.cx, self.cy, self.zoom)
 
     def render(self, ws, layer, t):
         return wc.render(ws, layer, t, self.sea_level, self.river_thr,
@@ -74,7 +81,7 @@ class Console:
         self.ax_main = self.fig.add_axes([0.03, 0.30, 0.46, 0.64])
         self.ax_main.set_facecolor(C_BG)
         self.ax_main.set_xticks([]), self.ax_main.set_yticks([])
-        self.im_main = self.ax_main.imshow(self.render(self.full, self.layer, self.t))
+        self.im_main = self.ax_main.imshow(self.render(self.view, self.layer, self.t))
         self.title = self.ax_main.set_title("", color=C_MUTED, fontsize=9, loc="left", pad=8)
 
         # thumbnails row — width adapts so all layers fit left of the panel
@@ -90,6 +97,10 @@ class Console:
             self.thumb_axes[key] = ax
         self._style_thumb_sel()
         self.fig.canvas.mpl_connect("button_press_event", self.on_click)
+        self.fig.canvas.mpl_connect("scroll_event", self.on_scroll)
+        self.fig.canvas.mpl_connect("button_press_event", self.on_press)
+        self.fig.canvas.mpl_connect("motion_notify_event", self.on_motion)
+        self.fig.canvas.mpl_connect("button_release_event", self.on_release)
 
         # ---- right panel: sliders ----
         def slider(y, label, vmin, vmax, vinit, step=None, fmt="%.2f"):
@@ -186,6 +197,45 @@ class Console:
                 self.refresh()
                 return
 
+    # ---------------- pan / zoom the main view ----------------
+    def _zoom_at(self, px, py, factor):
+        """Zoom keeping the world point under (px, py) (0..1 of the map) fixed."""
+        span = 1.0 / self.zoom
+        wx, wy = self.cx + (px - 0.5) * span, self.cy + (py - 0.5) * span
+        self.zoom = float(np.clip(self.zoom * factor, 1.0, 4096.0))
+        if self.zoom <= 1.0:
+            self.cx, self.cy = 0.5, 0.5
+        else:
+            ns = 1.0 / self.zoom
+            self.cx = (wx - (px - 0.5) * ns) % 1.0
+            self.cy = (wy - (py - 0.5) * ns) % 1.0
+        self.apply_view()
+        self.refresh()
+
+    def on_scroll(self, event):
+        if event.inaxes is not self.ax_main or event.xdata is None:
+            return
+        px = (event.xdata + 0.5) / self.view.size
+        py = (event.ydata + 0.5) / self.view.size
+        self._zoom_at(px, py, 1.25 if event.button == "up" else 1 / 1.25)
+
+    def on_press(self, event):
+        if event.inaxes is self.ax_main and event.button == 1 and self.zoom > 1:
+            self._pan = (event.xdata, event.ydata)
+
+    def on_motion(self, event):
+        if self._pan is None or event.inaxes is not self.ax_main or event.xdata is None:
+            return
+        span = 1.0 / self.zoom
+        self.cx = (self.cx - (event.xdata - self._pan[0]) / self.view.size * span) % 1.0
+        self.cy = (self.cy - (event.ydata - self._pan[1]) / self.view.size * span) % 1.0
+        self._pan = (event.xdata, event.ydata)
+        self.apply_view()
+        self.refresh()
+
+    def on_release(self, _event):
+        self._pan = None
+
     def on_seed(self, text):
         try:
             self.seed = int(text)
@@ -215,13 +265,14 @@ class Console:
     def refresh(self):
         if self.exporting:
             return
-        self.im_main.set_data(self.render(self.full, self.layer, self.t))
+        self.im_main.set_data(self.render(self.view, self.layer, self.t))
         for key, _ in LAYERS:
             self.thumb_ims[key].set_data(self.render(self.thumb, key, self.t))
         day, year = self.t % YEAR_DAYS, int(self.t // YEAR_DAYS)
         name = dict(LAYERS)[self.layer]
+        zoom = f" · ×{self.zoom:.0f}" if self.zoom > 1 else ""
         self.title.set_text(
-            f"seed {self.seed} · {self.size}² · {name.lower()} · day {day:.1f} · year {year}")
+            f"seed {self.seed} · {self.size}² · {name.lower()}{zoom} · day {day:.1f} · year {year}")
         self.export_note.set_text(
             f"exports the {name} layer at seed {self.seed}, {self.size}×{self.size},\n"
             "from the current sim time; meta.json included")
@@ -245,7 +296,7 @@ class Console:
         t0 = self.t
         print(f"exporting {frames} frames -> {out}/", flush=True)
         for f in range(frames):
-            img = self.render(self.full, self.layer, t0 + f * days_per_frame)
+            img = self.render(self.view, self.layer, t0 + f * days_per_frame)
             Image.fromarray(img).save(out / f"frame_{f:04d}.png")
             if f % 10 == 0 or f == frames - 1:
                 self.b_export.label.set_text(f"EXPORTING… {f + 1}/{frames}")

@@ -35,6 +35,14 @@ python3 world_viewer.py --seed 7 --size 512   # prettier, heavier rebuilds
 - **Big map + 7 thumbnails** (world composite, elevation, temperature,
   moisture, flow, biomes, daylight) — all animating. **Click a thumbnail**
   to promote that layer to the main view.
+- **Pan & zoom the big map** — scroll / pinch to zoom, drag to pan,
+  double-click to zoom in or reset. This is not an image zoom: the world is a
+  pure function of *continuous* `(x, y)`, so diving in re-samples the same field
+  at a finer step and **adds** higher-frequency detail, coherent with the planet
+  above it — the coastline you saw from orbit is exactly where you left it, you
+  just see the individual bays now. Thumbnails stay whole-planet so you keep
+  your bearings, and **export captures the current window**, so a zoomed patch
+  exports as easily as the whole globe.
 - **World**: seed textbox + `rnd` button, sea level, river threshold.
 - **Time & climate**: sim speed (days/sec), day/night depth, season
   amplitude (opposite per hemisphere), tide amplitude (sea level breathes).
@@ -102,6 +110,44 @@ war, a storm, or an advancing ice front is a *shock injected into a stock and
 propagated through the food-web graph* — is the M4 Resolver. It is stateful
 (not seekable) by nature, so it is deliberately a separate build, not part of
 this pure-function core.
+
+### Continuous zoom — the pure function at any scale (the step before M4)
+
+The 512² grid was never "the world" — it is one *sampling* of `world(seed, x,
+y, t)`, which is defined for continuous `x, y`. So a "world map" and a "tile-
+accurate patch of one beach" are the same function sampled over different
+windows, not two different data structures:
+
+- **Windowed noise** (`worldgen.noise_window`) samples any window
+  `[cx±span/2, cy±span/2]` of the unit torus at any zoom. Its value at each
+  integer lattice corner is a *hash* of `(seed, octave, i, j)`, so we only ever
+  evaluate the corners a window touches — O(window pixels), independent of zoom
+  depth. A million-cell-wide high-frequency octave is never allocated; it is
+  sampled four corners at a time.
+- **Detail is added, not revealed.** Each octave is divided by a *fixed* total
+  (Σ½ⁿ = 2), never by "how many octaves we summed," so the low octaves
+  contribute identically at every zoom. The planet's coastline stays put; diving
+  in only *adds* the finer octaves that a wider window couldn't resolve. This is
+  why zoom is coherent rather than a blur.
+- **`WorldSlice.view(cx, cy, zoom)`** re-samples the fields for a window and
+  reuses this planet's history timeline, faction cores and normalization by
+  reference — so panning and zooming never re-runs the M3 CA. Latitude,
+  longitude and hillshade are recomputed from the window's *world* coordinates,
+  and the coarse history grid is sub-sampled to the window, so temperature,
+  seasons, day/night and territory all stay correct as you dive in.
+
+A planet is *supposed* to be finite (it wraps — it is a globe); what you
+actually wanted was infinite **detail**, not infinite **extent**, and that is
+what zoom gives: finite world, bottomless zoom, computed only for the window on
+screen.
+
+**Current limits (the next tasks, on the road to M4):** rivers are global D8 and
+can't yet be windowed without upstream boundary conditions, so a zoomed view
+draws no rivers; civilization is still the coarse HIST grid upsampled, so zoom
+does not yet *expand* a cell's population into individual settlements and
+buildings. Both are `expand()` work — turning a coarse cell's summary (faction,
+population, stress) into a deterministic settlement grammar keyed by the cell's
+seed — which is exactly the M4 Resolver this zoom pipeline is the skeleton for.
 
 ## Turning a sequence into a video
 

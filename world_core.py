@@ -28,7 +28,8 @@ in the browser via Pyodide). No matplotlib, no PIL, no I/O — numpy in, RGB out
 import numpy as np
 
 from worldgen import (elevation_field, moisture_field, compute_rivers,
-                      fractal_noise, BIOME_COLORS)
+                      fractal_noise, elevation_window, moisture_window,
+                      noise_window, BIOME_COLORS)
 
 # ---------------------------------------------------------------------------
 # Time model (M2). t is measured in sim DAYS.
@@ -207,8 +208,12 @@ def _sample_history(ws, t):
     unrest_c = ((1 - fr) * ws.hist_unrest[i] + fr * ws.hist_unrest[i + 1]) / 255.0
     own_c = ws.hist_own[i] if fr < 0.5 else ws.hist_own[i + 1]
 
-    idx = (np.arange(size) * HIST_SIZE) // size
-    up = np.ix_(idx, idx)
+    # map each render pixel to its coarse history cell via WORLD coordinates,
+    # so the timeline lines up with the (possibly zoomed) window on screen.
+    step = (np.arange(size, dtype=np.float32) / size - 0.5) * ws.span
+    ci = (((ws.cx + step) % 1.0) * HIST_SIZE).astype(np.int64) % HIST_SIZE
+    ri = (((ws.cy + step) % 1.0) * HIST_SIZE).astype(np.int64) % HIST_SIZE
+    up = np.ix_(ri, ci)
     return (pop_c[up].astype(np.float32), own_c[up].astype(np.int16),
             stress_c[up].astype(np.float32), unrest_c[up].astype(np.float32))
 
@@ -217,21 +222,69 @@ def _sample_history(ws, t):
 class WorldSlice:
     """Static per-resolution data + grids (full res, or strided for thumbs)."""
 
-    def __init__(self, elev, moist, accum, cloud1, cloud2, civ_count, seed):
+    def __init__(self, elev, moist, accum, cloud1, cloud2, civ_count, seed,
+                 cx=0.5, cy=0.5, span=1.0):
         self.size = elev.shape[0]
+        self.seed = int(seed)
+        # viewport on the unit torus: window centered at (cx, cy) of side span.
+        # span == 1 -> the whole planet (the default, backward-compatible view).
+        self.cx, self.cy, self.span = float(cx), float(cy), float(span)
         self.elev, self.moist, self.accum = elev, moist, accum
         self.cloud1, self.cloud2 = cloud1, cloud2
-        size = self.size
-        yn = (np.arange(size, dtype=np.float32) / size)[:, None]
-        self.lat = 1 - np.abs(yn - 0.5) * 2
-        self.lat_signed = (0.5 - yn) * 2
-        self.xn = np.arange(size, dtype=np.float32) / size
-        gy, gx = np.gradient(elev)
-        self.shade = np.clip(1 - (gx + gy) * 2.2, 0.75, 1.25).astype(np.float32)
-        self.log_accum = np.log1p(accum) / np.log1p(accum.max())
-        self.orographic = np.clip(gx * 6.0, 0, 1).astype(np.float32)
+        self._derive_grids()
         self.has_history = False
         self._build_history(civ_count, seed)
+
+    def _derive_grids(self):
+        """Per-pixel grids from the window's WORLD coordinates (so latitude,
+        longitude and hillshade are correct at any pan/zoom, not pixel-relative)."""
+        size = self.size
+        step = (np.arange(size, dtype=np.float32) / size - 0.5) * self.span
+        v = (self.cy + step) % 1.0                 # world y per row
+        u = (self.cx + step) % 1.0                 # world x per column
+        self.lat = (1 - np.abs(v - 0.5) * 2)[:, None]
+        self.lat_signed = ((0.5 - v) * 2)[:, None]
+        self.xn = u
+        gy, gx = np.gradient(self.elev)
+        self.shade = np.clip(1 - (gx + gy) * 2.2, 0.75, 1.25).astype(np.float32)
+        amax = float(self.accum.max())
+        self.log_accum = (np.log1p(self.accum) / np.log1p(amax)
+                          if amax > 0 else np.zeros_like(self.elev))
+        self.orographic = np.clip(gx * 6.0, 0, 1).astype(np.float32)
+
+    # ---- a cheap re-sampled window that SHARES this planet's history ---------
+    def view(self, cx, cy, zoom):
+        """Return a new WorldSlice looking at window (cx, cy, side 1/zoom).
+        Fields are recomputed for the window; the (global) history timeline,
+        faction cores and cloud sheets are reused from this planet by reference,
+        so panning/zooming never re-runs the M3 CA."""
+        zoom = max(1.0, float(zoom))
+        span = 1.0 / zoom
+        if span >= 0.999:                          # whole planet -> this slice
+            return self
+        size = self.size
+        s = WorldSlice.__new__(WorldSlice)
+        s.size, s.seed = size, self.seed
+        s.cx, s.cy, s.span = float(cx), float(cy), span
+        s.elev = elevation_window(size, self.seed, cx, cy, span)
+        s.moist = moisture_window(size, self.seed, cx, cy, span)
+        # global D8 drainage can't be windowed yet (needs upstream boundary
+        # conditions) -> no rivers inside a zoom for now; fields still resolve.
+        s.accum = np.zeros_like(s.elev)
+        c1 = noise_window(self.seed + 4001, cx, cy, span, size, base_period=4)
+        c2 = noise_window(self.seed + 8009, cx, cy, span, size, base_period=3)
+        rng = np.ptp(c1) or 1.0
+        s.cloud1 = ((c1 - c1.min()) / rng).astype(np.float32)
+        rng2 = np.ptp(c2) or 1.0
+        s.cloud2 = ((c2 - c2.min()) / rng2).astype(np.float32)
+        s._derive_grids()
+        # share the pre-integrated history (it is global, not window-local)
+        s.has_history = self.has_history
+        for k in ("hist_days", "hist_pop", "hist_own", "hist_stress",
+                  "hist_unrest", "civ_cores"):
+            if hasattr(self, k):
+                setattr(s, k, getattr(self, k))
+        return s
 
     # ---- downsample a fine field to the coarse HIST grid (nearest) ----------
     def _coarse(self, field):
@@ -430,11 +483,17 @@ def _terrain_gray(ws, tf, sea_eff):
 
 def _city_dots(ws, img, t):
     size = ws.size
+    span, left, top = ws.span, (ws.cx - ws.span / 2), (ws.cy - ws.span / 2)
     for (yn, xn, f, t0) in ws.civ_cores:
         if t <= t0:
             continue
-        cy, cx = int(yn * size), int(xn * size)
-        r = max(1, size // 200)
+        # world -> window pixel, wrapping the torus; skip cores off-window
+        fx = ((xn - left) % 1.0) / span
+        fy = ((yn - top) % 1.0) / span
+        if fx >= 1.0 or fy >= 1.0:
+            continue
+        cx, cy = int(fx * size), int(fy * size)
+        r = max(1, size // 200) + (span < 0.999)     # a touch bigger when zoomed
         img[max(0, cy - r):cy + r + 1, max(0, cx - r):cx + r + 1] = (250, 250, 235)
 
 

@@ -72,7 +72,8 @@ novel mechanic needs *you* to author a new resolver.
 - **M1  Water.** D8 rivers ✅ + rainfall advection (wind carries moisture, rain shadows), lakes via priority-flood.
 - **M2 ✅ Time.** Animate it: day/night, seasons (temp offset), tides (`sin(t)`). Export frames → **watch worlds evolve; reject collapsing ones.** *(world_core.py + the desktop & web layer consoles.)*
 - **M3 ✅ History CA.** Coarse dynamic grid: civilizations, populations, resources, events. Keyframe for time-travel. *(world_core.py `_build_history` — integrated once into a seekable timeline; pests/droughts/ice → famine → emergent war.)*
-- **M4  LOD + Resolver.** expand/collapse, settlements, NPCs near/far, budget cap. Agents = people + animals + storms, one code path.
+- **M3.5 ✅ Continuous zoom.** The grid was one *sampling* of `world(seed,x,y,t)`, not the world. Hash-based windowed noise (`worldgen.noise_window`) + `WorldSlice.view(cx,cy,zoom)` sample any window at any depth, adding octaves (not blur) so detail stays coherent with the planet above — finite world, bottomless zoom, computed only for the window on screen. The LOD-sampling substrate M4 hangs on. *(pan/zoom live in both consoles; rivers + settlement-grammar expansion are the remaining `expand()` work.)*
+- **M4  LOD + Resolver.** expand/collapse, settlements, NPCs near/far, budget cap. Agents = people + animals + storms, one code path. Zoom already re-runs the field stack finer; M4 adds the *society* expansion — a coarse HIST cell's (faction, population, stress) becomes a deterministic settlement grammar (buildings, roads) keyed by the cell's seed — and collapses it back to the statistic when you leave.
 - **M5  Ship in Godot.** Port the deterministic core, add the player, interiors (WFC), rendering. Exports to phone / PC / console.
 
 **Stack:** prototype M0–M3 in Python (numpy + PIL) so you can *see* every layer.

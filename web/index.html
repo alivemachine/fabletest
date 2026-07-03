@@ -28,7 +28,8 @@ main{max-width:1060px;margin:0 auto;padding:14px;display:grid;gap:14px;grid-temp
 .stage{min-width:0}
 .viewwrap{position:relative}
 canvas#view{display:block;width:100%;aspect-ratio:1/1;image-rendering:pixelated;
-  border:1px solid var(--line);background:#000;touch-action:manipulation}
+  border:1px solid var(--line);background:#000;touch-action:none;cursor:grab}
+canvas#view.grabbing{cursor:grabbing}
 .hud{position:absolute;left:8px;bottom:8px;padding:3px 8px;border-radius:3px;
   background:rgba(10,13,16,.72);color:#dfe6ec;font-size:10px;letter-spacing:.05em;
   font-variant-numeric:tabular-nums;pointer-events:none}
@@ -83,6 +84,7 @@ progress.on{display:block}
       <div class="busy" id="busy">LOADING PYTHON RUNTIME…<small id="busysub">pyodide + numpy, ~12 MB on first visit — cached after that</small></div>
     </div>
     <div class="thumbs" id="thumbs"></div>
+    <p class="note" style="margin-top:2px">drag to pan · scroll or pinch to zoom · double-click to zoom in / reset · the world resolves finer detail the deeper you go, coherent with the planet above. Thumbnails stay whole-planet.</p>
   </section>
 
   <aside>
@@ -152,8 +154,10 @@ const S = {
   seed: 42, size: 256, seaLevel: 0.42, riverThr: 120,
   speed: 0.35, dayNight: 0.65, seasonAmp: 0.18, tideAmp: 0.012,
   civCount: 3,
+  cx: 0.5, cy: 0.5, zoom: 1, viewDirty: false,
   t: 0, playing: true, layer: "composite", exporting: false,
 };
+const MAX_ZOOM = 4096;
 const YEAR = 96;
 const LAYERS = [
   ["composite","World"], ["elevation","Elevation"], ["temperature","Temperature"],
@@ -184,7 +188,7 @@ for (const [key, name] of LAYERS){
 function syncSel(){ for (const [k] of LAYERS) thumbs[k].btn.classList.toggle("active", k === S.layer); }
 
 // ---------- pyodide bootstrap ----------
-let py = null, pyRender = null, pyBuild = null;
+let py = null, pyRender = null, pyBuild = null, pyView = null;
 
 async function boot(){
   const pyodide = await loadPyodide({ indexURL: "pyodide/" });
@@ -203,6 +207,11 @@ _state = {}
 def build(seed, size, thumb_px, civ_count):
     _state["full"] = wc.build_world(int(seed), int(size), int(civ_count))
     _state["thumb"] = _state["full"].strided(max(1, int(size) // int(thumb_px)))
+    _state["view"] = _state["full"]          # main canvas: planet until zoomed
+
+def set_view(cx, cy, zoom):
+    # cheap re-sample of a window; reuses the planet's history + cores
+    _state["view"] = _state["full"].view(float(cx), float(cy), float(zoom))
 
 def render_rgba(which, layer, t, sea, thr, season, tide, daynight):
     return wc.render_rgba_bytes(_state[which], layer, float(t), float(sea),
@@ -211,6 +220,7 @@ def render_rgba(which, layer, t, sea, thr, season, tide, daynight):
   py = pyodide;
   pyBuild = pyodide.globals.get("build");
   pyRender = pyodide.globals.get("render_rgba");
+  pyView = pyodide.globals.get("set_view");
   busysub.textContent = "generating world…";
   await new Promise(r => setTimeout(r, 20));
   rebuild();
@@ -223,6 +233,7 @@ def render_rgba(which, layer, t, sea, thr, season, tide, daynight):
 
 function rebuild(){
   pyBuild(S.seed, S.size, THUMB_STRIDE_TARGET, S.civCount);
+  if (S.zoom > 1) pyView(S.cx, S.cy, S.zoom);   // re-aim window at new planet
   draw();
 }
 
@@ -240,8 +251,8 @@ function blit(which, layer, t, canvas, ctx){
 
 let frameCount = 0;
 function draw(){
-  blit("full", S.layer, S.t, view, vctx);
-  // thumbs are cheap (strided) but there are 7 — refresh half per frame
+  blit("view", S.layer, S.t, view, vctx);       // main = the (maybe zoomed) window
+  // thumbs stay whole-planet overviews; refresh half per frame while playing
   for (let i = 0; i < LAYERS.length; i++){
     if (S.playing && (i + frameCount) % 2 !== 0) continue;
     const key = LAYERS[i][0];
@@ -252,12 +263,19 @@ function draw(){
   const day = S.t % YEAR, year = Math.floor(S.t / YEAR);
   const name = LAYERS.find(l => l[0] === S.layer)[1];
   clock.innerHTML = "<b>day " + day.toFixed(1) + "</b> · year " + year + " · seed " + S.seed;
-  hud.textContent = "seed " + S.seed + " · " + S.size + "² · " + name.toLowerCase();
+  const z = S.zoom >= 1000 ? (S.zoom / 1000).toFixed(1) + "k" : Math.round(S.zoom);
+  hud.textContent = "seed " + S.seed + " · " + S.size + "² · " + name.toLowerCase()
+                  + (S.zoom > 1 ? " · ×" + z : "");
 }
 function drawIfPaused(){ if (!S.playing && py) draw(); }
 
 let last = null;
 function loop(now){
+  if (S.viewDirty && py && !S.exporting){       // pan/zoom -> re-sample window
+    pyView(S.cx, S.cy, S.zoom);
+    S.viewDirty = false;
+    if (!S.playing) draw();
+  }
   if (S.playing && !S.exporting){
     if (last != null) S.t += Math.min(0.15, (now - last) / 1000) * S.speed;
     last = now;
@@ -316,6 +334,73 @@ function setPlaying(on){ S.playing = on; playBtn.textContent = on ? "pause" : "r
 playBtn.addEventListener("click", () => setPlaying(!S.playing));
 document.getElementById("resetBtn").addEventListener("click", () => { S.t = 0; if (py) draw(); });
 
+// ---------- pan / zoom the main view (the window onto the continuous world) ----------
+const wrap01 = x => { x %= 1; return x < 0 ? x + 1 : x; };
+function relPos(e){ const r = view.getBoundingClientRect();
+  return [(e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height]; }
+function resetView(){ S.cx = 0.5; S.cy = 0.5; S.zoom = 1; S.viewDirty = true; }
+function zoomAt(px, py, factor){        // keep the world point under (px,py) fixed
+  const span = 1 / S.zoom;
+  const wx = S.cx + (px - 0.5) * span, wy = S.cy + (py - 0.5) * span;
+  const nz = Math.max(1, Math.min(MAX_ZOOM, S.zoom * factor));
+  if (nz === 1){ resetView(); return; }
+  const ns = 1 / nz;
+  S.cx = wrap01(wx - (px - 0.5) * ns);
+  S.cy = wrap01(wy - (py - 0.5) * ns);
+  S.zoom = nz; S.viewDirty = true;
+}
+
+const pointers = new Map();
+let panLast = null, pinchDist = 0;
+view.addEventListener("pointerdown", e => {
+  view.setPointerCapture(e.pointerId);
+  pointers.set(e.pointerId, [e.clientX, e.clientY]);
+  if (pointers.size === 1){ panLast = [e.clientX, e.clientY]; view.classList.add("grabbing"); }
+  else if (pointers.size === 2){
+    const p = [...pointers.values()];
+    pinchDist = Math.hypot(p[0][0]-p[1][0], p[0][1]-p[1][1]);
+  }
+});
+view.addEventListener("pointermove", e => {
+  if (!pointers.has(e.pointerId)) return;
+  pointers.set(e.pointerId, [e.clientX, e.clientY]);
+  const r = view.getBoundingClientRect();
+  if (pointers.size >= 2){                       // pinch zoom
+    const p = [...pointers.values()];
+    const d = Math.hypot(p[0][0]-p[1][0], p[0][1]-p[1][1]);
+    if (pinchDist > 0){
+      const mx = ((p[0][0]+p[1][0])/2 - r.left) / r.width;
+      const my = ((p[0][1]+p[1][1])/2 - r.top) / r.height;
+      zoomAt(mx, my, d / pinchDist);
+    }
+    pinchDist = d; return;
+  }
+  if (panLast && S.zoom > 1){                     // drag pan (only when zoomed)
+    const span = 1 / S.zoom;
+    S.cx = wrap01(S.cx - (e.clientX - panLast[0]) / r.width * span);
+    S.cy = wrap01(S.cy - (e.clientY - panLast[1]) / r.height * span);
+    S.viewDirty = true;
+  }
+  panLast = [e.clientX, e.clientY];
+});
+function endPointer(e){
+  pointers.delete(e.pointerId);
+  if (pointers.size < 2) pinchDist = 0;
+  if (pointers.size === 0){ panLast = null; view.classList.remove("grabbing"); }
+}
+view.addEventListener("pointerup", endPointer);
+view.addEventListener("pointercancel", endPointer);
+view.addEventListener("wheel", e => {
+  e.preventDefault();
+  const [px, py] = relPos(e);
+  zoomAt(px, py, e.deltaY < 0 ? 1.2 : 1 / 1.2);
+}, { passive: false });
+view.addEventListener("dblclick", e => {
+  e.preventDefault();
+  if (S.zoom > 1) resetView();
+  else { const [px, py] = relPos(e); zoomAt(px, py, 4); }
+});
+
 // ---------- export: PNG sequence -> stored zip ----------
 const CRC_TABLE = (() => {
   const t = new Uint32Array(256);
@@ -371,7 +456,7 @@ exportBtn.addEventListener("click", async () => {
   const offctx = off.getContext("2d");
   try {
     for (let f = 0; f < frames; f++){
-      blit("full", layer, t0 + f * dt, off, offctx);
+      blit("view", layer, t0 + f * dt, off, offctx);
       const blob = await new Promise(res => off.toBlob(res, "image/png"));
       files.push({ name: "frame_" + String(f).padStart(4, "0") + ".png",
                    data: new Uint8Array(await blob.arrayBuffer()) });
