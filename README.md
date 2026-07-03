@@ -5,9 +5,19 @@ for the full design. This repo is the Python prototype stage of the roadmap:
 
 - `worldgen.py` — the layer stack itself (M0 fields → biomes, M1 D8 water).
   Runs standalone: `python3 worldgen.py` writes `world_<seed>.png`.
-- `world_viewer.py` — **the layer console**: an interactive interface where
-  every layer animates through time (M2: day/night, seasons, tides), with
-  sliders for the knobs and a one-click PNG-sequence exporter.
+- `world_core.py` — the shared render core: vectorized biomes, the M2 time
+  layer (day/night, seasons, tides), per-layer RGB renderers. numpy in,
+  pixels out; no UI, no I/O.
+- `world_viewer.py` — **the desktop layer console** (matplotlib) around the
+  core: every layer animating, sliders, PNG-sequence exporter.
+- `web/` — **the same console in the browser** (works on a phone):
+  `worldgen.py` + `world_core.py` run unmodified in the browser through
+  Pyodide (Python on WebAssembly); the page is only canvas + sliders + a
+  zip download. Deployed to GitHub Pages by `.github/workflows/pages.yml`,
+  which also vendors the Pyodide runtime so there is no CDN dependency.
+
+**Live console:** https://alivemachine.github.io/fabletest/
+(first visit downloads the Python runtime, ~12 MB, cached afterwards)
 
 ![console](docs/console.png)
 
