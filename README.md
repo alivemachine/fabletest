@@ -56,8 +56,35 @@ Time model: 1 sim day = one day/night cycle, year = 96 days, tide ≈ 12.5 h.
 | Biomes | lookup on (elevation, temperature, moisture) | table |
 | Flora | vegetation density = warmth × water, pulsing with seasons | field |
 | Fauna | herbivore/predator biomass on a Lotka–Volterra limit cycle (a resource/game map) | population CA (far form) |
-| Civilization | 1–6 factions: habitability-seeded territories growing on a logistic curve; each depletes local game | society stock-flow (far form) |
+| Civilization | 1–6 factions: territory + population from the M3 history, tinted by faction; each depletes local game | history CA (M3) |
+| History | the chronicle: same territory with war-fronts (red) and famine/pest zones (violet) drawn on | history CA (M3) |
 | Daylight | the day/night terminator | sin(t) |
+
+### M3 — the history simulation
+
+Civilization is no longer a closed-form curve; it is a coarse cellular
+automaton (`HIST_SIZE`² grid, one step per sim-week) that actually runs:
+
+- **stocks per cell** — population, food capacity, faction influence, unrest.
+- **dynamics** — population grows logistically toward food capacity and
+  colonises reachable land; faction *influence* diffuses outward (blocked by
+  sea and mountains) and whoever has the most influence owns the cell.
+- **war is emergent** — where two factions' influence meet and contest a
+  border, that contest is a mortality term: population dies along the front
+  and ownership flips when one side overtakes. Nobody scripted a war.
+- **shocks feed the food chain** — deterministic **pests/blights**,
+  **droughts** (arid, long), and **cold spells / ice** (polar, long) each
+  depress food capacity in a region for a while. Capacity drops below
+  population → famine (the logistic term goes negative) → unrest → war and
+  migration. That is the pest → famine → war → migration cascade, run through
+  the food web rather than authored.
+
+The CA is **integrated once at build time** into ~110 keyframes over a
+24-year horizon, stored compactly (uint8). `render(t)` interpolates the
+timeline, so history stays fully **seekable and exportable** — scrub to any
+year, export any year — even though the underlying process is stateful. Past
+the horizon the final state holds. The **Civilization** layer shows territory
+and population; the **History** layer overlays the wars and famines.
 
 ### Far form vs near form (why these are seekable)
 

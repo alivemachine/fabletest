@@ -70,8 +70,8 @@ novel mechanic needs *you* to author a new resolver.
 ## Build roadmap
 - **M0 ✅ Fields → biomes, rendered as a map.** *(worldgen.py — done)*
 - **M1  Water.** D8 rivers ✅ + rainfall advection (wind carries moisture, rain shadows), lakes via priority-flood.
-- **M2  Time.** Animate it: day/night, seasons (temp offset), tides (`sin(t)`). Export frames → **watch worlds evolve; reject collapsing ones.**
-- **M3  History CA.** Coarse dynamic grid: civilizations, populations, resources, events. Keyframe for time-travel.
+- **M2 ✅ Time.** Animate it: day/night, seasons (temp offset), tides (`sin(t)`). Export frames → **watch worlds evolve; reject collapsing ones.** *(world_core.py + the desktop & web layer consoles.)*
+- **M3 ✅ History CA.** Coarse dynamic grid: civilizations, populations, resources, events. Keyframe for time-travel. *(world_core.py `_build_history` — integrated once into a seekable timeline; pests/droughts/ice → famine → emergent war.)*
 - **M4  LOD + Resolver.** expand/collapse, settlements, NPCs near/far, budget cap. Agents = people + animals + storms, one code path.
 - **M5  Ship in Godot.** Port the deterministic core, add the player, interiors (WFC), rendering. Exports to phone / PC / console.
 

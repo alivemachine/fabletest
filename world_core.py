@@ -11,13 +11,15 @@ The layer stack, each reading only the layers above it (per DESIGN.md):
     water     D8 flow accumulation                           flow algorithm
     biome     lookup(elevation, temperature, moisture)       table
     ecology   flora(t)  -> fauna(t)                          field + Lotka-Volterra
-    society   civilization(t)                                habitability + logistic stock
+    society   civilization(t), history(t)                    history CA (M3)
 
-Design decision: every time-dependent layer here is the FAR FORM — a pure,
-SEEKABLE function of t (a stock/statistic), never an integrated simulation.
-That keeps render(t) stateless so any frame, at any t, exports on its own.
-The NEAR FORM (herds, cities, wars as live agents that integrate over time)
-is the M4 Resolver and lives elsewhere; see README / the design notes.
+Seekability, the one invariant: render(t) is STATELESS. Fields that are
+algebraic in t (clouds, flora, fauna) are pure functions. The M3 history —
+which genuinely needs state, because "a plague starts on day 40 and spreads"
+is by definition non-seekable — is INTEGRATED ONCE at build time into a
+keyframed timeline; render(t) then only INTERPOLATES that timeline. So the
+simulation is stateful but its consumption is not, and the exporter still
+samples any t on demand.
 
 Consumers: world_viewer.py (desktop matplotlib) and web/index.html (same code
 in the browser via Pyodide). No matplotlib, no PIL, no I/O — numpy in, RGB out.
@@ -34,7 +36,15 @@ from worldgen import (elevation_field, moisture_field, compute_rivers,
 YEAR_DAYS = 96.0          # one year = 96 days
 TIDE_PERIOD = 0.52        # ~semi-diurnal tide
 FAUNA_PERIOD = 32.0       # predator-prey limit cycle length (days)
-CIV_TAU = YEAR_DAYS * 0.30  # settlement growth time constant
+
+# ---------------------------------------------------------------------------
+# History CA (M3) parameters.
+# ---------------------------------------------------------------------------
+HIST_SIZE = 48            # coarse simulation grid (cells per side)
+WEEK_DAYS = 7.0           # one CA step = one week
+HIST_YEARS = 24.0         # how much history to pre-integrate
+KF_WEEKS = 3              # record a keyframe every N weeks
+POP_MAX = 1.2             # population value that maps to a full uint8
 
 LAYERS = [
     ("composite", "World"),
@@ -47,6 +57,7 @@ LAYERS = [
     ("flora", "Flora"),
     ("fauna", "Fauna"),
     ("civ", "Civilization"),
+    ("history", "History"),
     ("light", "Daylight"),
 ]
 
@@ -136,41 +147,21 @@ def flora_field(ws, tf, sea_eff):
 
 
 def fauna_field(flora, t):
-    """Herbivore & predator biomass as a Lotka-Volterra LIMIT CYCLE.
-
-    Instead of integrating the ODE (which would make t non-seekable) we ride
-    its closed orbit directly: both stocks circle their equilibrium, predators
-    lagging prey by a quarter period. Amplitude scales with local carrying
-    capacity = flora. This is the far-form 'stock' the design doc asks for.
-    """
+    """Herbivore & predator biomass as a Lotka-Volterra LIMIT CYCLE."""
     phase = 2 * np.pi * t / FAUNA_PERIOD
     prey_osc = 0.62 + 0.38 * np.sin(phase)
     pred_osc = 0.55 + 0.38 * np.sin(phase - np.pi / 2)   # quarter-cycle lag
     herbivore = flora * prey_osc
-    predator = flora * flora * pred_osc                  # predators need dense prey
+    predator = flora * flora * pred_osc
     return herbivore.astype(np.float32), predator.astype(np.float32)
-
-
-def civ_population(ws, t):
-    """Per-cell settled population in [0,1] and its faction id (-1 = none).
-
-    Territory, founding day, and carrying capacity are baked into the world at
-    build time (annual-mean habitability). Here we only apply logistic growth
-    in t: cities appear at their founding day and fill toward capacity. Pure,
-    seekable — jump to any t and you get that year's population directly.
-    """
-    frac = 1.0 / (1.0 + np.exp(-(t - ws.civ_t0) / CIV_TAU))
-    frac = np.where(ws.faction_id >= 0, frac, 0.0)
-    return (ws.habitability * frac).astype(np.float32), ws.faction_id
 
 
 def clouds_field(ws, t):
     """Cloud cover in [0,1]: two noise sheets advected by the wind, gated by
-    moisture, piled up on windward slopes (orographic lift). Advection is an
-    integer roll derived from t, so it is a pure, seekable function of t."""
+    moisture, piled up on windward slopes. Pure, seekable function of t."""
     size = ws.elev.shape[0]
-    ox1 = int((t * size / 6.0)) % size          # fast low sheet, blows east
-    ox2 = int((t * size / 11.0)) % size         # slow high sheet
+    ox1 = int((t * size / 6.0)) % size
+    ox2 = int((t * size / 11.0)) % size
     oy2 = int((t * size / 40.0)) % size
     c1 = np.roll(ws.cloud1, ox1, axis=1)
     c2 = np.roll(np.roll(ws.cloud2, ox2, axis=1), oy2, axis=0)
@@ -180,13 +171,57 @@ def clouds_field(ws, t):
 
 
 # ===========================================================================
+# Society — the M3 history simulation (integrated once, sampled as a timeline).
+# ===========================================================================
+def _neigh4(a):
+    """4-neighbor mean on the torus (works for 2D or leading-axis stacks)."""
+    ax = a.ndim - 2
+    return 0.25 * (np.roll(a, 1, ax) + np.roll(a, -1, ax)
+                   + np.roll(a, 1, ax + 1) + np.roll(a, -1, ax + 1))
+
+
+def civ_population(ws, t):
+    """Per-cell settled population in [0,1] and faction id (-1 = none), read
+    from the pre-integrated history timeline and upsampled to render size."""
+    pop, own, _stress, _unrest = _sample_history(ws, t)
+    return pop, own
+
+
+def _sample_history(ws, t):
+    """Interpolate the coarse history timeline at day t and upsample to the
+    render grid. Returns (pop, faction_id, stress, unrest), all render-sized."""
+    size = ws.elev.shape[0]
+    if not getattr(ws, "has_history", False):
+        z = np.zeros((size, size), np.float32)
+        return z, np.full((size, size), -1, np.int16), z, z
+
+    days = ws.hist_days
+    tc = float(np.clip(t, days[0], days[-1]))
+    i = int(np.searchsorted(days, tc, side="right") - 1)
+    i = max(0, min(i, len(days) - 2))
+    span = days[i + 1] - days[i]
+    fr = 0.0 if span <= 0 else (tc - days[i]) / span
+
+    pop_c = ((1 - fr) * ws.hist_pop[i] + fr * ws.hist_pop[i + 1]) * (POP_MAX / 255.0)
+    stress_c = ((1 - fr) * ws.hist_stress[i] + fr * ws.hist_stress[i + 1]) / 255.0
+    unrest_c = ((1 - fr) * ws.hist_unrest[i] + fr * ws.hist_unrest[i + 1]) / 255.0
+    own_c = ws.hist_own[i] if fr < 0.5 else ws.hist_own[i + 1]
+
+    idx = (np.arange(size) * HIST_SIZE) // size
+    up = np.ix_(idx, idx)
+    return (pop_c[up].astype(np.float32), own_c[up].astype(np.int16),
+            stress_c[up].astype(np.float32), unrest_c[up].astype(np.float32))
+
+
+# ===========================================================================
 class WorldSlice:
     """Static per-resolution data + grids (full res, or strided for thumbs)."""
 
     def __init__(self, elev, moist, accum, cloud1, cloud2, civ_count, seed):
+        self.size = elev.shape[0]
         self.elev, self.moist, self.accum = elev, moist, accum
         self.cloud1, self.cloud2 = cloud1, cloud2
-        size = elev.shape[0]
+        size = self.size
         yn = (np.arange(size, dtype=np.float32) / size)[:, None]
         self.lat = 1 - np.abs(yn - 0.5) * 2
         self.lat_signed = (0.5 - yn) * 2
@@ -194,90 +229,177 @@ class WorldSlice:
         gy, gx = np.gradient(elev)
         self.shade = np.clip(1 - (gx + gy) * 2.2, 0.75, 1.25).astype(np.float32)
         self.log_accum = np.log1p(accum) / np.log1p(accum.max())
-        # windward (east-facing) slope, for orographic cloud lift
         self.orographic = np.clip(gx * 6.0, 0, 1).astype(np.float32)
-        self._build_civ(civ_count, seed)
+        self.has_history = False
+        self._build_history(civ_count, seed)
 
-    # ---- society: habitability, cores, territory (annual-mean, built once) --
-    def _build_civ(self, civ_count, seed):
-        size = self.elev.shape[0]
-        e, m = self.elev, self.moist
+    # ---- downsample a fine field to the coarse HIST grid (nearest) ----------
+    def _coarse(self, field):
+        idx = (np.arange(HIST_SIZE) * self.size) // HIST_SIZE
+        return field[np.ix_(idx, idx)].astype(np.float32)
+
+    # ---- M3: seed factions, generate events, integrate the timeline --------
+    def _build_history(self, civ_count, seed):
+        if civ_count <= 0:
+            self.civ_cores = []
+            return
+        H = HIST_SIZE
+        e = self._coarse(self.elev)
+        m = self._coarse(self.moist)
         sea0 = 0.42
-        tf0 = temperature_t(e, self.lat, self.lat_signed, sea0, 0.0)  # annual mean
-        flora0 = flora_field(self, tf0, sea0)
-        # habitability = food (flora) + fresh water (rivers + coast) + mild climate
-        water = 0.7 * self.log_accum
-        coast = smoothstep(1 - np.abs(e - sea0) / 0.06) * (e >= sea0)
-        water = np.clip(water + 0.4 * coast, 0, 1)
-        temperate = np.clip(1 - np.abs(tf0 - 0.62) / 0.45, 0, 1)
+        yn = (np.arange(H, dtype=np.float32) / H)[:, None]
+        lat = np.repeat(1 - np.abs(yn - 0.5) * 2, H, axis=1)
         land = e >= sea0
-        H = (0.42 * flora0 + 0.30 * water + 0.28 * temperate) * land
-        H *= np.clip(1 - (e - 0.75) / 0.25, 0, 1)      # avoid high country
-        self.civ_habitability_raw = H.astype(np.float32)
+        temp = np.clip(lat - np.clip(e - sea0, 0, 1) * 0.9, 0, 1)
+        warmth = np.clip((temp - 0.26) / 0.55, 0, 1)
+        wet = smoothstep((m - 0.1) / 0.8)
+        flora0 = warmth * (0.30 + 0.70 * wet) * land
+        water = np.clip(self._coarse(self.log_accum) * 0.7, 0, 1)
+        temperate = np.clip(1 - np.abs(temp - 0.62) / 0.45, 0, 1)
+        hab = (0.42 * flora0 + 0.30 * water + 0.28 * temperate) * land
+        hab *= np.clip(1 - (e - 0.75) / 0.25, 0, 1)
+        cap0 = np.clip(0.15 + 0.95 * hab, 0.0, 1.2) * land       # food capacity
+        passable = land * np.clip(1 - np.clip((e - 0.7) / 0.3, 0, 1) * 0.7, 0.1, 1)
 
-        faction_id = np.full((size, size), -1, np.int16)
-        civ_t0 = np.zeros((size, size), np.float32)
-        habitability = np.zeros((size, size), np.float32)
-        cores = []
-        if civ_count > 0:
-            rng = np.random.default_rng(seed ^ 0x50C1A1)
-            order = np.argsort(-H.reshape(-1))
-            min_sep = size * 0.13
-            for idx in order[:20000]:
-                if H.reshape(-1)[idx] < 0.34:
+        # ---- pick faction cores: habitability maxima, spaced apart ----------
+        rng = np.random.default_rng((seed ^ 0x50C1A1) & 0x7FFFFFFF)
+        order = np.argsort(-hab.reshape(-1))
+        cores, min_sep = [], H * 0.16
+        for idx in order:
+            if hab.reshape(-1)[idx] < 0.30:
+                break
+            cy, cx = divmod(int(idx), H)
+            if all(min((cy - py) % H, (py - cy) % H) ** 2
+                   + min((cx - px) % H, (px - cx) % H) ** 2 >= min_sep ** 2
+                   for py, px in cores):
+                cores.append((cy, cx))
+                if len(cores) >= civ_count:
                     break
-                cy, cx = divmod(int(idx), size)
-                ok = True
-                for (py, px, *_1) in cores:
-                    dy = min((cy - py) % size, (py - cy) % size)
-                    dx = min((cx - px) % size, (px - cx) % size)
-                    if dy * dy + dx * dx < min_sep * min_sep:
-                        ok = False
-                        break
-                if ok:
-                    cores.append([cy, cx])
-                    if len(cores) >= civ_count:
-                        break
-            # assign every land cell to its nearest core (torus), within radius
-            if cores:
-                yy = np.arange(size)
-                xx = np.arange(size)
-                best_d2 = np.full((size, size), np.inf, np.float32)
-                best_f = np.full((size, size), -1, np.int16)
-                t0s = np.sort(rng.uniform(0, 1.6 * YEAR_DAYS, len(cores)))
-                r_max = size * 0.20
-                for f, (cy, cx) in enumerate(cores):
-                    dy = np.minimum((yy - cy) % size, (cy - yy) % size).astype(np.float32)
-                    dx = np.minimum((xx - cx) % size, (cx - xx) % size).astype(np.float32)
-                    d2 = dy[:, None] ** 2 + dx[None, :] ** 2
-                    take = d2 < best_d2
-                    best_d2 = np.where(take, d2, best_d2)
-                    best_f = np.where(take, f, best_f)
-                dist = np.sqrt(best_d2)
-                terr = (dist < r_max) & land & (H > 0.18)
-                falloff = np.clip(1 - dist / r_max, 0, 1)
-                faction_id = np.where(terr, best_f, -1).astype(np.int16)
-                habitability = np.where(terr, H * (0.35 + 0.65 * falloff), 0).astype(np.float32)
-                for f, (cy, cx) in enumerate(cores):
-                    civ_t0[best_f == f] = t0s[f]
-                    cores[f] = [cy / size, cx / size, f, float(t0s[f])]
-        self.faction_id = faction_id
-        self.civ_t0 = civ_t0
-        self.habitability = habitability
-        self.civ_cores = cores          # list of [yn, xn, faction, t0]
+        if not cores:
+            self.civ_cores = []
+            return
+        nf = len(cores)
+
+        # ---- generate deterministic shock events over the horizon ----------
+        weeks = int(HIST_YEARS * YEAR_DAYS / WEEK_DAYS)
+        yy = np.arange(H)[:, None]
+        xx = np.arange(H)[None, :]
+
+        def blob(cy, cx, radius):
+            dy = np.minimum((yy - cy) % H, (cy - yy) % H)
+            dx = np.minimum((xx - cx) % H, (cx - xx) % H)
+            return np.exp(-(dy * dy + dx * dx) / (2 * radius * radius))
+
+        events = []
+        arid = m < 0.4
+        for _ in range(int(HIST_YEARS * 0.7)):        # pests / blights
+            ly = int(rng.integers(0, H)); lx = int(rng.integers(0, H))
+            events.append(("pest", blob(ly, lx, H * 0.10),
+                           int(rng.integers(0, weeks)),
+                           int(rng.integers(4, 12)), float(rng.uniform(0.20, 0.5))))
+        for _ in range(int(HIST_YEARS * 0.25)):       # droughts (arid, long)
+            cand = np.argwhere(arid)
+            ly, lx = cand[rng.integers(len(cand))] if len(cand) else (H // 2, H // 2)
+            events.append(("drought", blob(int(ly), int(lx), H * 0.18),
+                           int(rng.integers(0, weeks)),
+                           int(rng.integers(24, 44)), float(rng.uniform(0.45, 0.7))))
+        polar = (lat < 0.45)
+        for _ in range(max(1, int(HIST_YEARS * 0.12))):  # cold spells / ice
+            events.append(("ice", polar.astype(np.float32),
+                           int(rng.integers(0, weeks)),
+                           int(rng.integers(20, 40)), float(rng.uniform(0.4, 0.65))))
+
+        def event_mult(week):
+            mult = np.ones((H, H), np.float32)
+            for _kind, shape, t0, dur, strength in events:
+                if t0 <= week < t0 + dur:
+                    env = np.sin(np.pi * (week - t0) / dur)   # ramp up then down
+                    mult *= 1 - (1 - strength) * env * shape
+            return mult
+
+        # ---- integrate the coarse CA week by week --------------------------
+        rP, col, src_gain = 0.09, 0.012, 0.55
+        decay, diff, mig, war_mort = 0.986, 0.34, 0.12, 0.07
+        own_thresh, tiny = 0.02, 1e-3
+
+        P = np.zeros((H, H), np.float32)
+        I = np.zeros((nf, H, H), np.float32)
+        for f, (cy, cx) in enumerate(cores):
+            P[cy, cx] = 0.06
+            I[f, cy, cx] = 1.0
+        t0s = np.sort(rng.uniform(0, 1.6 * YEAR_DAYS, nf)) if nf else np.array([])
+
+        kf_pop, kf_own, kf_stress, kf_unrest, kf_days = [], [], [], [], []
+        for w in range(weeks):
+            emult = event_mult(w)
+            cap = np.maximum(cap0 * emult, 1e-3)
+
+            maxI = I.max(0)
+            own = np.where(land & (maxI > own_thresh), I.argmax(0), -1)
+
+            # population: logistic toward capacity + slow colonization of land
+            owned = own >= 0
+            P += (rP * P + col * owned) * (1 - P / cap)
+            P = np.clip(P, 0, POP_MAX)
+
+            # influence: sourced by population, diffuses, decays, blocked by sea
+            for f in range(nf):
+                I[f] += src_gain * P * (own == f)
+            I = decay * ((1 - diff) * I + diff * _neigh4(I)) * passable[None]
+
+            # re-resolve ownership and border contest -> war casualties
+            maxI = I.max(0)
+            if nf >= 2:
+                secondI = np.sort(I, axis=0)[-2]
+            else:
+                secondI = np.zeros_like(maxI)
+            owned = land & (maxI > own_thresh)
+            own = np.where(owned, I.argmax(0), -1)
+            contest = np.where(maxI > tiny, secondI / (maxI + 1e-6), 0.0) * owned
+            P *= 1 - war_mort * contest
+
+            # migration + drop population the state can no longer reach
+            P = (1 - mig) * P + mig * _neigh4(P)
+            P *= (maxI > tiny)
+
+            unrest = np.clip(np.clip(P / cap - 1, 0, 1) + contest, 0, 1)
+            stress = np.clip(1 - emult, 0, 1)
+
+            if w % KF_WEEKS == 0 or w == weeks - 1:
+                kf_days.append(w * WEEK_DAYS)
+                kf_pop.append((np.clip(P / POP_MAX, 0, 1) * 255).astype(np.uint8))
+                kf_own.append(own.astype(np.int8))
+                kf_stress.append((stress * 255).astype(np.uint8))
+                kf_unrest.append((unrest * 255).astype(np.uint8))
+
+        self.has_history = True
+        self.hist_days = np.array(kf_days, np.float32)
+        self.hist_pop = np.stack(kf_pop)
+        self.hist_own = np.stack(kf_own).astype(np.int16)
+        self.hist_stress = np.stack(kf_stress)
+        self.hist_unrest = np.stack(kf_unrest)
+        # normalized founding coords for city markers (yn, xn, faction, founded-day)
+        self.civ_cores = [(cy / H, cx / H, f, float(t0s[f]))
+                          for f, (cy, cx) in enumerate(cores)]
 
     def strided(self, st):
         s = WorldSlice.__new__(WorldSlice)
+        size = self.size
         for k, v in self.__dict__.items():
-            if isinstance(v, np.ndarray):
-                setattr(s, k, v[::st, ::st] if v.ndim == 2 else v[::st])
+            # stride any axis at render resolution (elev, lat, xn, ...); leave
+            # the coarse HIST timeline (no axis == size) shared by reference
+            if isinstance(v, np.ndarray) and any(d == size for d in v.shape):
+                sl = tuple(slice(None, None, st) if d == size else slice(None)
+                           for d in v.shape)
+                setattr(s, k, v[sl])
             else:
-                setattr(s, k, v)     # carry scalars / core list by reference
+                setattr(s, k, v)
+        s.size = s.elev.shape[0]
         return s
 
 
 def build_world(seed, size, civ_count=3):
-    """The heavy, seed-only part: fields, D8 flow, cloud sheets, civ cores."""
+    """The heavy, seed-only part: fields, D8 flow, cloud sheets, M3 history."""
     elev = elevation_field(size, seed).astype(np.float32)
     moist = moisture_field(size, seed).astype(np.float32)
     _, accum = compute_rivers(elev, 0.5)     # accumulation is sea-level-free
@@ -297,6 +419,23 @@ def frame_params(t, sea_level, tide_amp, season_amp):
     season_off = season_amp * np.sin(2 * np.pi * t / YEAR_DAYS)
     sun_x = t % 1.0
     return sea_eff, season_off, sun_x
+
+
+def _terrain_gray(ws, tf, sea_eff):
+    """Dim grayscale terrain base for the society layers."""
+    base = BIOME_LUT[biome_ids(ws.elev, tf, ws.moist, sea_eff)]
+    gray = base @ np.array([0.30, 0.59, 0.11], np.float32)
+    return np.repeat(gray[..., None], 3, axis=2) * 0.55 + 18
+
+
+def _city_dots(ws, img, t):
+    size = ws.size
+    for (yn, xn, f, t0) in ws.civ_cores:
+        if t <= t0:
+            continue
+        cy, cx = int(yn * size), int(xn * size)
+        r = max(1, size // 200)
+        img[max(0, cy - r):cy + r + 1, max(0, cx - r):cx + r + 1] = (250, 250, 235)
 
 
 def render(ws, layer, t, sea_level, river_thr, season_amp, tide_amp, day_night):
@@ -342,30 +481,35 @@ def render(ws, layer, t, sea_level, river_thr, season_amp, tide_amp, day_night):
         civ_p, _ = civ_population(ws, t)
         herb = herb * (1 - 0.7 * np.clip(civ_p, 0, 1))     # settlers hunt/clear game
         img = np.empty(e.shape + (3,), np.float32)
-        img[..., 0] = 40 + 205 * np.clip(pred * 1.6, 0, 1)  # predators redden it
-        img[..., 1] = 40 + 175 * np.clip(herb, 0, 1)        # prey biomass = green
+        img[..., 0] = 40 + 205 * np.clip(pred * 1.6, 0, 1)
+        img[..., 1] = 40 + 175 * np.clip(herb, 0, 1)
         img[..., 2] = 45 + 30 * np.clip(herb, 0, 1)
         img[~land] = (20, 32, 58)
     elif layer == "civ":
         tf = temperature_t(e, ws.lat, ws.lat_signed, sea_eff, season_off)
-        base = BIOME_LUT[biome_ids(e, tf, ws.moist, sea_eff)]
-        gray = base @ np.array([0.30, 0.59, 0.11], np.float32)
-        img = np.repeat(gray[..., None], 3, axis=2) * 0.55 + 18
+        img = _terrain_gray(ws, tf, sea_eff)
         pop, fid = civ_population(ws, t)
         has = fid >= 0
         if has.any():
             tint = CIV_COLORS[np.clip(fid, 0, len(CIV_COLORS) - 1)]
-            a = np.clip(pop, 0, 0.9)[..., None]
+            a = np.clip(pop * 1.4, 0, 0.9)[..., None]
             img = np.where(has[..., None], img * (1 - a) + tint * a, img)
-        size = e.shape[0]
-        for (yn, xn, f, t0) in ws.civ_cores:
-            if t <= t0:
-                continue
-            cy, cx = int(yn * size), int(xn * size)
-            r = max(1, size // 200)
-            y0, y1 = max(0, cy - r), min(size, cy + r + 1)
-            x0, x1 = max(0, cx - r), min(size, cx + r + 1)
-            img[y0:y1, x0:x1] = (250, 250, 235)
+        _city_dots(ws, img, t)
+    elif layer == "history":
+        # the chronicle: territory + where the world is thriving / at war / starving
+        tf = temperature_t(e, ws.lat, ws.lat_signed, sea_eff, season_off)
+        img = _terrain_gray(ws, tf, sea_eff)
+        pop, fid, stress, unrest = _sample_history(ws, t)
+        has = fid >= 0
+        if has.any():
+            tint = CIV_COLORS[np.clip(fid, 0, len(CIV_COLORS) - 1)]
+            a = np.clip(pop * 1.3, 0, 0.85)[..., None]
+            img = np.where(has[..., None], img * (1 - a) + tint * a, img)
+        war = np.clip(unrest * (pop > 0.02), 0, 1)[..., None]          # red fronts
+        img = img * (1 - war) + np.array([235, 60, 45], np.float32) * war
+        fam = np.clip(stress * land * (0.4 + pop), 0, 1)[..., None]    # violet famine
+        img = img * (1 - fam) + np.array([150, 70, 200], np.float32) * fam
+        _city_dots(ws, img, t)
     elif layer == "light":
         l = daylight_row(ws.xn, sun_x, day_night)[None, :]
         img = np.empty(e.shape + (3,), np.float32)
