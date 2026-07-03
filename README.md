@@ -5,9 +5,10 @@ for the full design. This repo is the Python prototype stage of the roadmap:
 
 - `worldgen.py` — the layer stack itself (M0 fields → biomes, M1 D8 water).
   Runs standalone: `python3 worldgen.py` writes `world_<seed>.png`.
-- `world_core.py` — the shared render core: vectorized biomes, the M2 time
-  layer (day/night, seasons, tides), per-layer RGB renderers. numpy in,
-  pixels out; no UI, no I/O.
+- `world_core.py` — the shared render core: the full layer stack (fields →
+  clouds → water → biomes → flora → fauna → civilization), the M2 time layer
+  (day/night, seasons, tides), and per-layer RGB renderers. numpy in, pixels
+  out; no UI, no I/O.
 - `world_viewer.py` — **the desktop layer console** (matplotlib) around the
   core: every layer animating, sliders, PNG-sequence exporter.
 - `web/` — **the same console in the browser** (works on a phone):
@@ -44,6 +45,36 @@ python3 world_viewer.py --seed 7 --size 512   # prettier, heavier rebuilds
   sequence is exactly reproducible.
 
 Time model: 1 sim day = one day/night cycle, year = 96 days, tide ≈ 12.5 h.
+
+## The layers
+
+| Layer | What it is | Tool (per DESIGN.md) |
+|---|---|---|
+| Elevation / Temperature / Moisture | static fields; temp carries seasons | noise + gradient |
+| Clouds | two noise sheets advected by wind, gated by moisture, piled on windward slopes | advected noise |
+| Flow | D8 flow accumulation → rivers | flow algorithm |
+| Biomes | lookup on (elevation, temperature, moisture) | table |
+| Flora | vegetation density = warmth × water, pulsing with seasons | field |
+| Fauna | herbivore/predator biomass on a Lotka–Volterra limit cycle (a resource/game map) | population CA (far form) |
+| Civilization | 1–6 factions: habitability-seeded territories growing on a logistic curve; each depletes local game | society stock-flow (far form) |
+| Daylight | the day/night terminator | sin(t) |
+
+### Far form vs near form (why these are seekable)
+
+Every time-dependent layer here is the **far form** — a pure, *seekable*
+function of `t` (a stock/statistic). You can jump to day 500 without
+simulating days 0–499, which is exactly what the exporter relies on. Fauna
+rides the Lotka–Volterra *limit cycle* directly instead of integrating the
+ODE; civilization applies logistic growth in closed form. Cross-layer
+coupling that can be written as an algebraic function of the current fields
+is included (moisture→flora→fauna carrying capacity; flora+water+climate→
+civilization habitability; civilization→local game depletion).
+
+The **near form** — live agents that integrate over time, where a pest, a
+war, a storm, or an advancing ice front is a *shock injected into a stock and
+propagated through the food-web graph* — is the M4 Resolver. It is stateful
+(not seekable) by nature, so it is deliberately a separate build, not part of
+this pure-function core.
 
 ## Turning a sequence into a video
 

@@ -110,6 +110,8 @@ progress.on{display:block}
         <input type="range" id="sea" min="0.20" max="0.70" step="0.005" value="0.42"></div>
       <div class="rowstack"><div class="top"><label for="riv">river threshold</label><span class="val" id="rivV">120</span></div>
         <input type="range" id="riv" min="20" max="2000" step="10" value="120"></div>
+      <div class="rowstack"><div class="top"><label for="civ">civilizations</label><span class="val" id="civV">3</span></div>
+        <input type="range" id="civ" min="0" max="6" step="1" value="3"></div>
     </div>
 
     <div class="group">
@@ -149,12 +151,14 @@ progress.on{display:block}
 const S = {
   seed: 42, size: 256, seaLevel: 0.42, riverThr: 120,
   speed: 0.35, dayNight: 0.65, seasonAmp: 0.18, tideAmp: 0.012,
+  civCount: 3,
   t: 0, playing: true, layer: "composite", exporting: false,
 };
 const YEAR = 96;
 const LAYERS = [
   ["composite","World"], ["elevation","Elevation"], ["temperature","Temperature"],
-  ["moisture","Moisture"], ["flow","Flow"], ["biome","Biomes"], ["light","Daylight"],
+  ["moisture","Moisture"], ["clouds","Clouds"], ["flow","Flow"], ["biome","Biomes"],
+  ["flora","Flora"], ["fauna","Fauna"], ["civ","Civilization"], ["light","Daylight"],
 ];
 
 const view = document.getElementById("view"), vctx = view.getContext("2d");
@@ -195,8 +199,8 @@ import world_core as wc
 
 _state = {}
 
-def build(seed, size, thumb_px):
-    _state["full"] = wc.build_world(int(seed), int(size))
+def build(seed, size, thumb_px, civ_count):
+    _state["full"] = wc.build_world(int(seed), int(size), int(civ_count))
     _state["thumb"] = _state["full"].strided(max(1, int(size) // int(thumb_px)))
 
 def render_rgba(which, layer, t, sea, thr, season, tide, daynight):
@@ -217,7 +221,7 @@ def render_rgba(which, layer, t, sea, thr, season, tide, daynight):
 }
 
 function rebuild(){
-  pyBuild(S.seed, S.size, THUMB_STRIDE_TARGET);
+  pyBuild(S.seed, S.size, THUMB_STRIDE_TARGET, S.civCount);
   draw();
 }
 
@@ -298,6 +302,12 @@ document.getElementById("size").addEventListener("change", e => {
   riv.value = S.riverThr;
   document.getElementById("rivV").textContent = S.riverThr;
   if (py) withBusy(rebuild);
+});
+const civEl = document.getElementById("civ");
+civEl.addEventListener("input", () => { document.getElementById("civV").textContent = civEl.value; });
+civEl.addEventListener("change", () => {   // rebuild on release (cores are seed-baked)
+  const v = parseInt(civEl.value, 10);
+  if (v !== S.civCount && py){ S.civCount = v; withBusy(rebuild); }
 });
 
 const playBtn = document.getElementById("playBtn");

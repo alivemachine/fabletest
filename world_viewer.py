@@ -43,6 +43,7 @@ class Console:
         self.river_thr = wc.default_river_threshold(size)
         self.season_amp, self.tide_amp = 0.18, 0.012
         self.day_night, self.speed = 0.65, 0.35
+        self.civ_count = 3
         self.exporting = False
 
         self.build_world()
@@ -52,7 +53,7 @@ class Console:
     def build_world(self):
         t0 = time.time()
         print(f"generating world seed={self.seed} size={self.size} ...", flush=True)
-        self.full = wc.build_world(self.seed, self.size)
+        self.full = wc.build_world(self.seed, self.size, self.civ_count)
         self.thumb = self.full.strided(max(1, self.size // 96))
         print(f"  done in {time.time() - t0:.1f}s")
 
@@ -76,14 +77,16 @@ class Console:
         self.im_main = self.ax_main.imshow(self.render(self.full, self.layer, self.t))
         self.title = self.ax_main.set_title("", color=C_MUTED, fontsize=9, loc="left", pad=8)
 
-        # thumbnails row
+        # thumbnails row — width adapts so all layers fit left of the panel
         self.thumb_axes, self.thumb_ims, self.thumb_titles = {}, {}, {}
-        tw = 0.062
+        n = len(LAYERS)
+        step = 0.54 / n
+        tw = step - 0.006
         for i, (key, name) in enumerate(LAYERS):
-            ax = self.fig.add_axes([0.03 + i * (tw + 0.008), 0.155, tw, 0.11])
+            ax = self.fig.add_axes([0.03 + i * step, 0.155, tw, tw * 14 / 8.2])
             ax.set_xticks([]), ax.set_yticks([])
             self.thumb_ims[key] = ax.imshow(self.render(self.thumb, key, self.t))
-            self.thumb_titles[key] = ax.set_title(name.upper(), fontsize=6.5, color=C_MUTED, pad=3)
+            self.thumb_titles[key] = ax.set_title(name.upper(), fontsize=5.4, color=C_MUTED, pad=2)
             self.thumb_axes[key] = ax
         self._style_thumb_sel()
         self.fig.canvas.mpl_connect("button_press_event", self.on_click)
@@ -98,8 +101,11 @@ class Console:
             return s
 
         self.fig.text(0.60, 0.925, "WORLD", fontsize=8, color=C_MUTED)
-        self.s_sea = slider(0.885, "sea level", 0.20, 0.70, self.sea_level)
-        self.s_riv = slider(0.845, "river threshold", 40, 2000, self.river_thr, step=10, fmt="%.0f")
+        self.s_sea = slider(0.895, "sea level", 0.20, 0.70, self.sea_level)
+        self.s_riv = slider(0.860, "river threshold", 40, 2000, self.river_thr, step=10, fmt="%.0f")
+        self.s_civ = slider(0.825, "civilizations", 0, 6, self.civ_count, step=1, fmt="%.0f")
+        self.s_civ.on_changed(lambda v: (setattr(self, "civ_count", int(v)),
+                                         self.build_world(), self.refresh()))
 
         self.fig.text(0.60, 0.795, "TIME & CLIMATE", fontsize=8, color=C_MUTED)
         self.s_speed = slider(0.755, "speed (days/s)", 0.02, 3.0, self.speed)
