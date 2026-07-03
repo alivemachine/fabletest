@@ -19,7 +19,6 @@ Out:  world_<seed>.png
 """
 
 import numpy as np
-from PIL import Image
 
 # ---------------------------------------------------------------------------
 # LAYER 0 — NOISE.  Tileable fractal value-noise. Static, pure f(seed, x, y).
@@ -197,6 +196,7 @@ def compute_rivers(elevation, sea_level, river_threshold=350):
 # ---------------------------------------------------------------------------
 
 def render(seed=42, size=512, sea_level=0.42):
+    from PIL import Image   # only the standalone PNG writer needs PIL
     elevation = elevation_field(size, seed)
     temperature = temperature_field(size, elevation, sea_level)
     moisture = moisture_field(size, seed)
