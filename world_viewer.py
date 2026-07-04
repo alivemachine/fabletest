@@ -119,13 +119,22 @@ class Console:
                                          self.build_world(), self.refresh()))
 
         self.fig.text(0.60, 0.795, "TIME & CLIMATE", fontsize=8, color=C_MUTED)
-        self.s_speed = slider(0.755, "speed (days/s)", 0.02, 3.0, self.speed)
+        # speed is logarithmic: 10^val days/sec, so you can crawl or fast-forward
+        # centuries to watch whether a wrecked world ever recovers.
+        self.s_speed = slider(0.755, "speed 10^ d/s", -1.7, 3.4, np.log10(self.speed))
         self.s_dn = slider(0.715, "day/night depth", 0.0, 1.0, self.day_night)
         self.s_season = slider(0.675, "season amplitude", 0.0, 0.5, self.season_amp, fmt="%.3f")
         self.s_tide = slider(0.635, "tide amplitude", 0.0, 0.05, self.tide_amp, fmt="%.3f")
 
+        def on_speed(v):
+            self.speed = float(10 ** v)
+            self.s_speed.valtext.set_text(f"{self.speed:.2f} d/s" if self.speed < 100
+                                          else f"{self.speed:.0f} d/s")
+        on_speed(np.log10(self.speed))
+        self.s_speed.on_changed(on_speed)
+
         for s, attr in [(self.s_sea, "sea_level"), (self.s_riv, "river_thr"),
-                        (self.s_speed, "speed"), (self.s_dn, "day_night"),
+                        (self.s_dn, "day_night"),
                         (self.s_season, "season_amp"), (self.s_tide, "tide_amp")]:
             s.on_changed(lambda v, a=attr: (setattr(self, a, float(v)), self.refresh()))
 
@@ -148,7 +157,7 @@ class Console:
         self.b_play = button(0.60, 0.475, 0.115, "pause")
         self.b_play.on_clicked(self.on_play)
         self.b_reset = button(0.725, 0.475, 0.115, "reset day 0")
-        self.b_reset.on_clicked(lambda _e: (setattr(self, "t", 0.0), self.refresh()))
+        self.b_reset.on_clicked(self.on_reset)
 
         # ---- export ----
         self.fig.text(0.60, 0.40, "EXPORT SEQUENCE", fontsize=8, color=C_MUTED)
@@ -253,13 +262,22 @@ class Console:
         self.b_play.label.set_text("pause" if self.playing else "run")
         self.fig.canvas.draw_idle()
 
+    def on_reset(self, _e):
+        self.t = 0.0
+        self.full.eco.reset()          # rewind the living world to pristine day 0
+        self.refresh()
+
     # ---------------- frame ----------------
     def tick(self):
         now = time.time()
         dt = min(0.2, now - self._last)
         self._last = now
         if self.playing and not self.exporting:
-            self.t += dt * self.speed
+            days = dt * self.speed
+            self.t += days
+            # advance the stateful ecosystem with the clock (the living world)
+            so = self.season_amp * np.sin(2 * np.pi * self.t / YEAR_DAYS)
+            self.full.eco.step(days, self.sea_level, so)
             self.refresh()
 
     def refresh(self):

@@ -43,10 +43,16 @@ python3 world_viewer.py --seed 7 --size 512   # prettier, heavier rebuilds
   just see the individual bays now. Thumbnails stay whole-planet so you keep
   your bearings, and **export captures the current window**, so a zoomed patch
   exports as easily as the whole globe.
-- **World**: seed textbox + `rnd` button, sea level, river threshold.
-- **Time & climate**: sim speed (days/sec), day/night depth, season
-  amplitude (opposite per hemisphere), tide amplitude (sea level breathes).
-- **Transport**: pause / run, reset to day 0.
+- **World**: seed textbox + `rnd` button, sea level, river threshold. The
+  **tide** is a waterline that *sweeps a fixed beach* (the sand is as wide as
+  the tidal range and stays put; only the water covering it moves); the
+  **sea-level slider** still moves the whole coast — and, on the Vitality layer,
+  floods or exposes land with lasting ecological consequences.
+- **Time & climate**: **logarithmic** sim speed (crawl to thousands of days/sec
+  — fast-forward centuries), day/night depth, season amplitude (opposite per
+  hemisphere; crank it for hot summers that spark fires/drought), tide amplitude.
+- **Transport**: pause / run, **reset to day 0** (also rewinds the living
+  ecosystem to pristine).
 - **Export**: writes `exports/world_s<seed>_<layer>_<N>f/frame_0000.png …`
   of the *current view layer* at the current seed and settings, starting at
   the current sim time, plus a `meta.json` recording every parameter — so any
@@ -66,6 +72,7 @@ Time model: 1 sim day = one day/night cycle, year = 96 days, tide ≈ 12.5 h.
 | Fauna | herbivore/predator biomass on a Lotka–Volterra limit cycle (a resource/game map) | population CA (far form) |
 | Civilization | 1–6 factions: territory + population from the M3 history, tinted by faction; each depletes local game | history CA (M3) |
 | History | the chronicle: same territory with war-fronts (red) and famine/pest zones (violet) drawn on | history CA (M3) |
+| Vitality | the **living, stateful** world: soil fertility, vegetation, fauna, civilisation and burn/salt scars that integrate forward and *remember* — floods drown, droughts burn, and recovery is slow | ecosystem sim (M4, stateful) |
 | Daylight | the day/night terminator | sin(t) |
 
 ### M3 — the history simulation
@@ -110,6 +117,37 @@ war, a storm, or an advancing ice front is a *shock injected into a stock and
 propagated through the food-web graph* — is the M4 Resolver. It is stateful
 (not seekable) by nature, so it is deliberately a separate build, not part of
 this pure-function core.
+
+### Vitality — the living, stateful world (first M4 layer)
+
+Every layer above is a pure function of `t`; **Vitality is not.** It is a coarse
+ecosystem that *integrates forward as the clock runs and has memory*, so events
+leave lasting consequences instead of looping. Per cell it tracks **soil
+fertility, vegetation, fauna, civilisation, and burn/salt scars**:
+
+- **Your sliders are the triggers.** Shoving the **sea-level** slider up floods
+  land relative to the level the ecosystem is *adapted* to (its `sea_ref`,
+  which drifts only slowly) → mass die-off and **salted soil**; pull it back and
+  the exposed seabed is barren, greening only from the edges. High **season
+  amplitude** drives hot summers that **ignite fires** in grass/savanna and
+  **desertify** bare hot ground.
+- **Slow variables give irreversibility.** Fertility and scars heal on a
+  timescale of *years*, and vegetation/fauna/civilisation only recover by
+  **colonisation from surviving neighbours** — so a wiped, isolated region stays
+  dead until life spreads back in. Some worlds never come back; that is the
+  point — you can watch which worlds last.
+- **Consequences ⇒ not scrubbable backward.** The state at day 900 depends on
+  the whole path of what you did, not on a formula of `t`, and the dynamics are
+  dissipative (a burned and a drowned forest both end at `veg=0` — the present
+  can't tell you which). So Vitality only runs **forward or resets**; the *other*
+  layers stay fully seekable. The stateful mess is quarantined to this one layer.
+- **Fast-forward centuries.** The speed control is logarithmic (up to thousands
+  of days/sec, with internal sub-stepping) so you can wreck a world and watch,
+  over simulated centuries, whether it ever greens again.
+
+This is the far→near step of the design made real: the pure layers are the
+seekable substrate; Vitality is the stateful stock field every future M4 agent
+(herds as boids, settlements, NPCs) will expand out of and collapse back into.
 
 ### Continuous zoom — the pure function at any scale (the step before M4)
 

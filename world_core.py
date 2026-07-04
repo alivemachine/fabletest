@@ -59,6 +59,7 @@ LAYERS = [
     ("fauna", "Fauna"),
     ("civ", "Civilization"),
     ("history", "History"),
+    ("vitality", "Vitality"),
     ("light", "Daylight"),
 ]
 
@@ -197,6 +198,16 @@ def civ_population(ws, t):
     return pop, own
 
 
+def _window_indices(ws, n=HIST_SIZE):
+    """np.ix_ that maps each render pixel of `ws` to its coarse (n x n) cell via
+    world coordinates, honouring the slice's viewport (pan/zoom)."""
+    size = ws.size
+    step = (np.arange(size, dtype=np.float32) / size - 0.5) * ws.span
+    ci = (((ws.cx + step) % 1.0) * n).astype(np.int64) % n
+    ri = (((ws.cy + step) % 1.0) * n).astype(np.int64) % n
+    return np.ix_(ri, ci)
+
+
 def _sample_history(ws, t):
     """Interpolate the coarse history timeline at day t and upsample to the
     render grid. Returns (pop, faction_id, stress, unrest), all render-sized."""
@@ -219,10 +230,7 @@ def _sample_history(ws, t):
 
     # map each render pixel to its coarse history cell via WORLD coordinates,
     # so the timeline lines up with the (possibly zoomed) window on screen.
-    step = (np.arange(size, dtype=np.float32) / size - 0.5) * ws.span
-    ci = (((ws.cx + step) % 1.0) * HIST_SIZE).astype(np.int64) % HIST_SIZE
-    ri = (((ws.cy + step) % 1.0) * HIST_SIZE).astype(np.int64) % HIST_SIZE
-    up = np.ix_(ri, ci)
+    up = _window_indices(ws)
     return (pop_c[up].astype(np.float32), own_c[up].astype(np.int16),
             stress_c[up].astype(np.float32), unrest_c[up].astype(np.float32))
 
@@ -287,10 +295,11 @@ class WorldSlice:
         rng2 = np.ptp(c2) or 1.0
         s.cloud2 = ((c2 - c2.min()) / rng2).astype(np.float32)
         s._derive_grids()
-        # share the pre-integrated history (it is global, not window-local)
+        # share the pre-integrated history + the live eco sim (both global, not
+        # window-local) by reference, so zooming never rebuilds or forks them
         s.has_history = self.has_history
         for k in ("hist_days", "hist_pop", "hist_own", "hist_stress",
-                  "hist_unrest", "civ_cores"):
+                  "hist_unrest", "civ_cores", "eco"):
             if hasattr(self, k):
                 setattr(s, k, getattr(self, k))
         return s
@@ -460,6 +469,130 @@ class WorldSlice:
         return s
 
 
+# ===========================================================================
+# EcoSim — the STATEFUL near-form substrate (M4). Everything else in this file
+# is a pure, seekable function of t. This one is not: it integrates forward and
+# has MEMORY, so events leave lasting consequences. A flood salts the soil; a
+# drought burns the forest; recovery is slow and only spreads inward from
+# surviving neighbours, so an isolated dead zone stays dead until life reaches
+# it again — which is how a world can fail to come back. Driven live by the
+# sliders (sea level, seasons); reset() returns it to the pristine world. It is
+# deliberately NOT scrubbable backward (that is what "consequences" means) — it
+# only runs forward or resets. Coarse (HIST_SIZE) and cheap.
+# ===========================================================================
+class EcoSim:
+    def __init__(self, ws, seed=0):
+        H = HIST_SIZE
+        self.H = H
+        self.e = ws._coarse(ws.elev).astype(np.float32)
+        self.m = ws._coarse(ws.moist).astype(np.float32)
+        yn = (np.arange(H, dtype=np.float32) / H)[:, None]
+        self.lat = np.repeat(1 - np.abs(yn - 0.5) * 2, H, axis=1).astype(np.float32)
+        self.lat_signed = np.repeat((0.5 - yn) * 2, H, axis=1).astype(np.float32)
+        self.sea0 = 0.42
+        self.reset()
+
+    def _climate(self, season_off):
+        temp = np.clip(self.lat + season_off * self.lat_signed
+                       - np.clip(self.e - self.sea_ref, 0, 1) * 0.9, 0, 1)
+        warmth = np.clip((temp - 0.26) / 0.55, 0, 1)
+        wet = smoothstep((self.m - 0.1) / 0.8)
+        return warmth, wet
+
+    def reset(self):
+        """Back to the pristine, climax-state world (day 0)."""
+        self.sea_ref = float(self.sea0)
+        self.t = 0.0
+        land = self.e >= self.sea0
+        warmth, wet = self._climate(0.0)
+        cap = warmth * (0.30 + 0.70 * wet) * land
+        self.fert = (np.clip(0.35 + 0.65 * cap, 0.05, 1) * land).astype(np.float32)
+        self.veg = (cap * 0.9).astype(np.float32)
+        self.fauna = (cap * 0.5).astype(np.float32)
+        self.civ = ((cap > 0.55) * 0.35).astype(np.float32)   # some seed settlements
+        self.scorch = np.zeros((self.H, self.H), np.float32)
+
+    def step(self, dt_days, sea_level, season_off):
+        """Advance the ecosystem by dt_days under the current sliders."""
+        if dt_days <= 0:
+            return
+        n = int(min(48, max(1, np.ceil(dt_days / 4.0))))    # sub-step for stability
+        h = min(dt_days / n, 6.0)
+        for _ in range(n):
+            self._micro(h, float(sea_level), float(season_off))
+        self.t += dt_days
+
+    def _micro(self, h, sea_level, season_off):
+        e = self.e
+        warmth, wet = self._climate(season_off)
+        under = e < sea_level
+        land = ~under
+        drowned = under & (e >= self.sea_ref)          # land the sea just took
+        cap = warmth * (0.30 + 0.70 * wet) * self.fert * (1 - self.scorch) * land
+        dry = np.clip(warmth - 0.75 * wet - 0.05, 0, 1)  # hot & dry -> fire/desert
+
+        veg, fauna, civ, fert, scorch = (self.veg, self.fauna, self.civ,
+                                         self.fert, self.scorch)
+
+        # --- flood: drown the biota, salt the soil ---
+        veg = np.where(under, veg * np.exp(-0.6 * h), veg)
+        fauna = np.where(under, fauna * np.exp(-0.5 * h), fauna)
+        civ = np.where(under, civ * np.exp(-0.7 * h), civ)
+        fert = np.where(drowned, fert - 0.008 * h, fert)
+        scorch = np.where(drowned, scorch + 0.020 * h, scorch)
+
+        # --- fire / drought: needs both heat-dryness AND fuel (vegetation), so
+        #     it strikes grass/savanna in hot summers, not bare desert ---
+        burn = np.clip(dry - 0.40, 0, 1) * veg * land
+        ignite = burn * (burn > 0.03)
+        veg = veg - 0.70 * ignite * h
+        fauna = fauna - 0.45 * ignite * h
+        scorch = scorch + 0.40 * ignite * h
+        desert = land & (dry > 0.45) & (veg < 0.10)     # bare hot ground erodes
+        fert = np.where(desert, fert - 0.004 * h, fert)
+
+        # --- recovery on dry land: growth needs a seed (self or neighbour), so
+        #     wiped, isolated cells cannot restart until life spreads back in ---
+        cap_pos = cap > 0.02
+        vseed = 0.015 + 0.85 * veg + 0.5 * _neigh4(veg)
+        veg = np.where(land, veg + 0.045 * h * vseed
+                       * np.clip(1 - veg / (cap + 1e-3), 0, 1) * cap_pos, veg)
+        fcap = 0.9 * veg
+        fseed = 0.02 + 0.85 * fauna + 0.5 * _neigh4(fauna)
+        fauna = np.where(land, fauna + 0.06 * h * fseed
+                         * np.clip(1 - fauna / (fcap + 1e-3), 0, 1) * (fcap > 0.02), fauna)
+        # slow soil rebuild (needs life nearby) and scar fade — the "much time
+        # must pass" knobs, on a timescale of years not days
+        fert = fert + h * (0.0016 * veg + 0.0009 * _neigh4(veg)) * (1 - fert) * land
+        scorch = scorch - 0.0025 * h
+
+        # --- civilization: grows on food, collapses without it, recolonises
+        #     only from surviving neighbours ---
+        food = 0.5 * veg + 0.5 * fauna
+        cseed = 0.55 * civ + 0.35 * _neigh4(civ)
+        ok = land & (food > 0.28)
+        civ = civ + np.where(ok, 0.02 * h * (0.04 + cseed) * (1 - civ), 0)
+        civ = civ - np.where(~ok, 0.05 * h * civ, 0)
+        civ = np.where(food < 0.14, civ * np.exp(-0.12 * h), civ)  # famine wipeout
+        fauna = fauna - 0.03 * h * civ * fauna          # hunting pressure
+        veg = veg - 0.01 * h * civ * veg                # land clearing
+
+        self.veg = np.clip(veg, 0, 1).astype(np.float32)
+        self.fauna = np.clip(fauna, 0, 1).astype(np.float32)
+        self.civ = np.clip(civ, 0, 1).astype(np.float32)
+        self.fert = np.clip(fert, 0.02, 1).astype(np.float32)
+        self.scorch = np.clip(scorch, 0, 1).astype(np.float32)
+        # the coastline the ecosystem is adapted to drifts toward the imposed
+        # level (slowly), so a held sea level becomes the new normal
+        self.sea_ref += 0.02 * h * (sea_level - self.sea_ref)
+
+    def sample(self, ws):
+        """Upsample the coarse state to the render window (honours pan/zoom)."""
+        up = _window_indices(ws)
+        return {k: getattr(self, k)[up] for k in
+                ("veg", "fauna", "fert", "civ", "scorch")}
+
+
 def build_world(seed, size, civ_count=3):
     """The heavy, seed-only part: fields, D8 flow, cloud sheets, M3 history."""
     elev = elevation_field(size, seed).astype(np.float32)
@@ -467,8 +600,10 @@ def build_world(seed, size, civ_count=3):
     _, accum = compute_rivers(elev, 0.5)     # accumulation is sea-level-free
     cloud1 = fractal_noise(size, seed + 4001, base_period=4, octaves=5).astype(np.float32)
     cloud2 = fractal_noise(size, seed + 8009, base_period=3, octaves=4).astype(np.float32)
-    return WorldSlice(elev, moist, accum.astype(np.float32),
-                      cloud1, cloud2, int(civ_count), int(seed))
+    ws = WorldSlice(elev, moist, accum.astype(np.float32),
+                    cloud1, cloud2, int(civ_count), int(seed))
+    ws.eco = EcoSim(ws, int(seed))           # stateful vitality sim (M4)
+    return ws
 
 
 def default_river_threshold(size):
@@ -577,6 +712,31 @@ def render(ws, layer, t, sea_level, river_thr, season_amp, tide_amp, day_night):
         img = img * (1 - war) + np.array([235, 60, 45], np.float32) * war
         fam = np.clip(stress * land * (0.4 + pop), 0, 1)[..., None]    # violet famine
         img = img * (1 - fam) + np.array([150, 70, 200], np.float32) * fam
+        _city_dots(ws, img, t)
+    elif layer == "vitality":
+        # the LIVING world: the stateful ecosystem, where events leave scars.
+        tf = temperature_t(e, ws.lat, ws.lat_signed, sea_eff, season_off)
+        img = _terrain_gray(ws, tf, sea_level, tide_amp)
+        eco = getattr(ws, "eco", None)
+        if eco is not None:
+            s = eco.sample(ws)
+            veg = np.clip(s["veg"] / 0.55, 0, 1)               # healthy veg -> full green
+            scorch = np.clip(s["scorch"], 0, 1)[..., None]
+            fert = np.clip(s["fert"], 0, 1)[..., None]
+            civ = np.clip((s["civ"] - 0.35) / 0.65, 0, 1)[..., None]
+            # barren land tints toward tan (drier/poorer soil = paler)
+            bare = ((1 - veg))[..., None]
+            img = img * (1 - 0.45 * bare) + np.array([168, 140, 96], np.float32) * (0.45 * bare) * (0.5 + 0.5 * fert)
+            # vegetation green is the dominant signal
+            g = (0.9 * veg)[..., None]
+            img = img * (1 - g) + np.array([48, 152, 56], np.float32) * g
+            # burn/salt scars: charred ground
+            img = img * (1 - scorch) + np.array([54, 40, 34], np.float32) * scorch
+            # civilization: a restrained gold accent only where it is dense
+            img = img * (1 - 0.7 * civ) + np.array([240, 222, 128], np.float32) * (0.7 * civ)
+        # the instantaneous waterline covers whatever is currently below it
+        under = (e < sea_eff)[..., None]
+        img = img * (1 - under) + np.array([40, 80, 130], np.float32) * under
         _city_dots(ws, img, t)
     elif layer == "light":
         l = daylight_row(ws.xn, sun_x, day_night)[None, :]

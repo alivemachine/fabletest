@@ -118,8 +118,8 @@ progress.on{display:block}
 
     <div class="group">
       <h2>Time &amp; climate</h2>
-      <div class="rowstack"><div class="top"><label for="speed">speed</label><span class="val" id="speedV">0.35 d/s</span></div>
-        <input type="range" id="speed" min="0.02" max="3" step="0.01" value="0.35"></div>
+      <div class="rowstack"><div class="top"><label for="speed">speed (fast-forward centuries)</label><span class="val" id="speedV">0.35 d/s</span></div>
+        <input type="range" id="speed" min="-1.7" max="3.4" step="0.01" value="-0.456"></div>
       <div class="rowstack"><div class="top"><label for="daynight">day/night depth</label><span class="val" id="daynightV">0.65</span></div>
         <input type="range" id="daynight" min="0" max="1" step="0.01" value="0.65"></div>
       <div class="rowstack"><div class="top"><label for="season">season amplitude</label><span class="val" id="seasonV">0.180</span></div>
@@ -163,7 +163,7 @@ const LAYERS = [
   ["composite","World"], ["elevation","Elevation"], ["temperature","Temperature"],
   ["moisture","Moisture"], ["clouds","Clouds"], ["flow","Flow"], ["biome","Biomes"],
   ["flora","Flora"], ["fauna","Fauna"], ["civ","Civilization"], ["history","History"],
-  ["light","Daylight"],
+  ["vitality","Vitality"], ["light","Daylight"],
 ];
 
 const view = document.getElementById("view"), vctx = view.getContext("2d");
@@ -188,7 +188,7 @@ for (const [key, name] of LAYERS){
 function syncSel(){ for (const [k] of LAYERS) thumbs[k].btn.classList.toggle("active", k === S.layer); }
 
 // ---------- pyodide bootstrap ----------
-let py = null, pyRender = null, pyBuild = null, pyView = null;
+let py = null, pyRender = null, pyBuild = null, pyView = null, pyEco = null, pyEcoReset = null;
 
 async function boot(){
   const pyodide = await loadPyodide({ indexURL: "pyodide/" });
@@ -196,7 +196,7 @@ async function boot(){
   await pyodide.loadPackage("numpy");
   busysub.textContent = "fetching world code…";
   for (const f of ["worldgen.py", "world_core.py"]){
-    const src = await (await fetch(f + "?v=2")).text();
+    const src = await (await fetch(f + "?v=3")).text();
     pyodide.FS.writeFile(f, src);
   }
   pyodide.runPython(`
@@ -213,6 +213,13 @@ def set_view(cx, cy, zoom):
     # cheap re-sample of a window; reuses the planet's history + cores
     _state["view"] = _state["full"].view(float(cx), float(cy), float(zoom))
 
+def eco_step(days, sea, season_off):
+    # advance the stateful ecosystem (the living world) with the clock
+    _state["full"].eco.step(float(days), float(sea), float(season_off))
+
+def eco_reset():
+    _state["full"].eco.reset()
+
 def render_rgba(which, layer, t, sea, thr, season, tide, daynight):
     return wc.render_rgba_bytes(_state[which], layer, float(t), float(sea),
                                 float(thr), float(season), float(tide), float(daynight))
@@ -221,6 +228,8 @@ def render_rgba(which, layer, t, sea, thr, season, tide, daynight):
   pyBuild = pyodide.globals.get("build");
   pyRender = pyodide.globals.get("render_rgba");
   pyView = pyodide.globals.get("set_view");
+  pyEco = pyodide.globals.get("eco_step");
+  pyEcoReset = pyodide.globals.get("eco_reset");
   busysub.textContent = "generating world…";
   await new Promise(r => setTimeout(r, 20));
   rebuild();
@@ -277,7 +286,12 @@ function loop(now){
     if (!S.playing) draw();
   }
   if (S.playing && !S.exporting){
-    if (last != null) S.t += Math.min(0.15, (now - last) / 1000) * S.speed;
+    if (last != null){
+      const days = Math.min(0.15, (now - last) / 1000) * S.speed;
+      S.t += days;
+      const seasonOff = S.seasonAmp * Math.sin(2 * Math.PI * S.t / YEAR);
+      pyEco(days, S.seaLevel, seasonOff);   // advance the living world
+    }
     last = now;
     draw();
   } else last = now;
@@ -295,8 +309,17 @@ function bindRange(id, key, fmt){
 }
 bindRange("sea", "seaLevel", v => v.toFixed(2));
 bindRange("riv", "riverThr", v => v.toFixed(0));
-bindRange("speed", "speed", v => v.toFixed(2) + " d/s");
 bindRange("daynight", "dayNight", v => v.toFixed(2));
+// speed is logarithmic: slider holds log10(days/sec)
+(() => {
+  const el = document.getElementById("speed"), val = document.getElementById("speedV");
+  const upd = () => {
+    S.speed = Math.pow(10, parseFloat(el.value));
+    val.textContent = (S.speed < 100 ? S.speed.toFixed(2) : Math.round(S.speed)) + " d/s";
+    drawIfPaused();
+  };
+  el.addEventListener("input", upd); upd();
+})();
 bindRange("season", "seasonAmp", v => v.toFixed(3));
 bindRange("tide", "tideAmp", v => v.toFixed(3));
 
@@ -332,7 +355,9 @@ civEl.addEventListener("change", () => {   // rebuild on release (cores are seed
 const playBtn = document.getElementById("playBtn");
 function setPlaying(on){ S.playing = on; playBtn.textContent = on ? "pause" : "run"; drawIfPaused(); }
 playBtn.addEventListener("click", () => setPlaying(!S.playing));
-document.getElementById("resetBtn").addEventListener("click", () => { S.t = 0; if (py) draw(); });
+document.getElementById("resetBtn").addEventListener("click", () => {
+  S.t = 0; if (py){ pyEcoReset(); draw(); }        // rewind the living world too
+});
 
 // ---------- pan / zoom the main view (the window onto the continuous world) ----------
 const wrap01 = x => { x %= 1; return x < 0 ? x + 1 : x; };
