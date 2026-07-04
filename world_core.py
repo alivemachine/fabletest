@@ -275,6 +275,14 @@ class WorldSlice:
                           if amax > 0 else np.zeros_like(self.elev))
         self.orographic = np.clip(gx * 6.0, 0, 1).astype(np.float32)
 
+    def _sample_planet(self, field, cx, cy, span, size):
+        """Sample a planet-resolution field at the window's per-pixel world
+        coordinates (nearest, wrapping the torus) -> a size x size window."""
+        step = (np.arange(size, dtype=np.float32) / size - 0.5) * span
+        ci = (((cx + step) % 1.0) * field.shape[1]).astype(np.int64) % field.shape[1]
+        ri = (((cy + step) % 1.0) * field.shape[0]).astype(np.int64) % field.shape[0]
+        return field[np.ix_(ri, ci)]
+
     # ---- a cheap re-sampled window that SHARES this planet's history ---------
     def view(self, cx, cy, zoom):
         """Return a new WorldSlice looking at window (cx, cy, side 1/zoom).
@@ -291,9 +299,23 @@ class WorldSlice:
         s.cx, s.cy, s.span = float(cx), float(cy), span
         s.elev = elevation_window(size, self.seed, cx, cy, span)
         s.moist = moisture_window(size, self.seed, cx, cy, span)
-        # global D8 drainage can't be windowed yet (needs upstream boundary
-        # conditions) -> no rivers inside a zoom for now; fields still resolve.
-        s.accum = np.zeros_like(s.elev)
+        # rivers under zoom: run LOCAL D8 on the window's refined elevation
+        # (traces the fine valley network) and scale it by the PLANET's coarse
+        # accumulation sampled at these world coords (the upstream boundary
+        # condition -- how much catchment actually drains through here). Because
+        # the low noise octaves are shared, the local thalweg sits in the same
+        # valley the planet river runs, so a big river stays a big river when you
+        # dive in, and headwater windows show only their own small streams.
+        _, local = compute_rivers(s.elev, 0.5)
+        local_norm = local.astype(np.float32) / (float(local.max()) or 1.0)
+        # PATH from local D8 (the refined valley, continuous), MAGNITUDE from the
+        # coarse planet accumulation in this region (the upstream volume draining
+        # through here). Keeping them separate avoids the planet pixel grid
+        # fighting the refined thalweg at deep zoom: local_norm ~1 along the
+        # window's main valley, scaled to carry the region's real river volume,
+        # so a big river stays big when you dive in and dry hills stay dry.
+        region = float(self._sample_planet(self.accum, cx, cy, span, size).max())
+        s.accum = local_norm * region
         s.cloud1 = _cloud_sheet(self.seed + 4001, cx, cy, span, size, 4)
         s.cloud2 = _cloud_sheet(self.seed + 8009, cx, cy, span, size, 3)
         s._derive_grids()
@@ -392,7 +414,7 @@ class WorldSlice:
 
         # ---- integrate the coarse CA week by week --------------------------
         rP, col, src_gain = 0.09, 0.012, 0.55
-        decay, diff, mig, war_mort = 0.986, 0.34, 0.12, 0.07
+        decay, diff, mig, conflict_mort = 0.986, 0.34, 0.12, 0.07
         own_thresh, tiny = 0.02, 1e-3
 
         P = np.zeros((H, H), np.float32)
@@ -420,7 +442,7 @@ class WorldSlice:
                 I[f] += src_gain * P * (own == f)
             I = decay * ((1 - diff) * I + diff * _neigh4(I)) * passable[None]
 
-            # re-resolve ownership and border contest -> war casualties
+            # re-resolve ownership and contested borders -> attrition term
             maxI = I.max(0)
             if nf >= 2:
                 secondI = np.sort(I, axis=0)[-2]
@@ -429,7 +451,7 @@ class WorldSlice:
             owned = land & (maxI > own_thresh)
             own = np.where(owned, I.argmax(0), -1)
             contest = np.where(maxI > tiny, secondI / (maxI + 1e-6), 0.0) * owned
-            P *= 1 - war_mort * contest
+            P *= 1 - conflict_mort * contest
 
             # migration + drop population the state can no longer reach
             P = (1 - mig) * P + mig * _neigh4(P)
@@ -474,10 +496,10 @@ class WorldSlice:
 # ===========================================================================
 # EcoSim — the STATEFUL near-form substrate (M4). Everything else in this file
 # is a pure, seekable function of t. This one is not: it integrates forward and
-# has MEMORY, so events leave lasting consequences. A flood salts the soil; a
-# drought burns the forest; recovery is slow and only spreads inward from
-# surviving neighbours, so an isolated dead zone stays dead until life reaches
-# it again — which is how a world can fail to come back. Driven live by the
+# has MEMORY, so events leave lasting consequences. A flood salinates the soil;
+# a drought dries the forest; recovery is slow and only spreads inward from
+# neighbouring cells, so an isolated barren zone stays barren until life reaches
+# it again — which is how a world can fail to recover. Driven live by the
 # sliders (sea level, seasons); reset() returns it to the pristine world. It is
 # deliberately NOT scrubbable backward (that is what "consequences" means) — it
 # only runs forward or resets. Coarse (HIST_SIZE) and cheap.
@@ -533,7 +555,7 @@ class EcoSim:
         warmth, wet = self._climate(season_off)
         under = e < sea_level
         land = ~under
-        drowned = under & (e >= self.sea_ref)          # land the sea just took
+        submerged = under & (e >= self.sea_ref)        # land the sea just covered
         clim = warmth * (0.30 + 0.70 * wet) * land       # climatic potential
         self.clim = clim.astype(np.float32)              # (for health readout)
         cap = clim * self.fert * (1 - self.scorch)
@@ -542,12 +564,12 @@ class EcoSim:
         veg, fauna, civ, fert, scorch = (self.veg, self.fauna, self.civ,
                                          self.fert, self.scorch)
 
-        # --- flood: drown the biota, salt the soil ---
+        # --- flood: submerged biota declines, soil salinates ---
         veg = np.where(under, veg * np.exp(-0.6 * h), veg)
         fauna = np.where(under, fauna * np.exp(-0.5 * h), fauna)
         civ = np.where(under, civ * np.exp(-0.7 * h), civ)
-        fert = np.where(drowned, fert - 0.008 * h, fert)
-        scorch = np.where(drowned, scorch + 0.020 * h, scorch)
+        fert = np.where(submerged, fert - 0.008 * h, fert)
+        scorch = np.where(submerged, scorch + 0.020 * h, scorch)
 
         # --- fire / drought: needs both heat-dryness AND fuel (vegetation), so
         #     it strikes grass/savanna in hot summers, not bare desert ---
@@ -560,7 +582,7 @@ class EcoSim:
         fert = np.where(desert, fert - 0.004 * h, fert)
 
         # --- recovery on dry land: growth needs a seed (self or neighbour), so
-        #     wiped, isolated cells cannot restart until life spreads back in ---
+        #     cleared, isolated cells cannot restart until life spreads back in ---
         cap_pos = cap > 0.02
         vseed = 0.015 + 0.85 * veg + 0.5 * _neigh4(veg)
         veg = np.where(land, veg + 0.045 * h * vseed
@@ -581,7 +603,7 @@ class EcoSim:
         ok = land & (food > 0.28)
         civ = civ + np.where(ok, 0.02 * h * (0.04 + cseed) * (1 - civ), 0)
         civ = civ - np.where(~ok, 0.05 * h * civ, 0)
-        civ = np.where(food < 0.14, civ * np.exp(-0.12 * h), civ)  # famine wipeout
+        civ = np.where(food < 0.14, civ * np.exp(-0.12 * h), civ)  # food-collapse decline
         fauna = fauna - 0.03 * h * civ * fauna          # hunting pressure
         veg = veg - 0.01 * h * civ * veg                # land clearing
 
@@ -737,7 +759,7 @@ def colorize(st, layer):
         img[~land] = (20, 32, 58)
     elif layer == "civ":
         # territory/population from the M3 history, DIMMED where the living
-        # ecosystem has collapsed (famine/flood) and charred where scorched.
+        # ecosystem has collapsed (shortage/flood) and charred where scorched.
         img = _terrain_gray(st["biome_id"])
         pop, fid = civ_population(ws, t)
         has = fid >= 0
@@ -749,7 +771,7 @@ def colorize(st, layer):
         img = img * (1 - sc) + np.array([54, 40, 34], np.float32) * sc
         _city_dots(ws, img, t)
     elif layer == "history":
-        # the chronicle: territory + where the world is thriving / at war / starving
+        # the chronicle: territory + where the world is thriving / in conflict / in shortage
         img = _terrain_gray(st["biome_id"])
         pop, fid, stress, unrest = _sample_history(ws, t)
         has = fid >= 0
@@ -757,10 +779,10 @@ def colorize(st, layer):
             tint = CIV_COLORS[np.clip(fid, 0, len(CIV_COLORS) - 1)]
             a = np.clip(pop * 1.3, 0, 0.85)[..., None]
             img = np.where(has[..., None], img * (1 - a) + tint * a, img)
-        war = np.clip(unrest * (pop > 0.02), 0, 1)[..., None]          # red fronts
-        img = img * (1 - war) + np.array([235, 60, 45], np.float32) * war
-        fam = np.clip(stress * land * (0.4 + pop), 0, 1)[..., None]    # violet famine
-        img = img * (1 - fam) + np.array([150, 70, 200], np.float32) * fam
+        conflict = np.clip(unrest * (pop > 0.02), 0, 1)[..., None]     # red fronts
+        img = img * (1 - conflict) + np.array([235, 60, 45], np.float32) * conflict
+        short = np.clip(stress * land * (0.4 + pop), 0, 1)[..., None]  # violet shortage
+        img = img * (1 - short) + np.array([150, 70, 200], np.float32) * short
         _city_dots(ws, img, t)
     elif layer == "light":
         l = daylight_row(ws.xn, sun_x, day_night)[None, :]

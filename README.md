@@ -74,7 +74,7 @@ Time model: 1 sim day = one day/night cycle, year = 96 days, tide ≈ 12.5 h.
 | Flora | **living** vegetation = climatic baseline × ecosystem health, with burn/salt scars | field ⊕ M4 Δ |
 | Fauna | **living** herbivore/predator biomass (Lotka–Volterra) × ecosystem health — the game map | population CA ⊕ M4 Δ |
 | Civilization | 1–6 factions from the M3 history, **dimmed where the ecosystem has collapsed** and charred where scorched | history CA ⊕ M4 Δ |
-| History | the chronicle: same territory with war-fronts (red) and famine/pest zones (violet) drawn on | history CA (M3) |
+| History | the chronicle: same territory with conflict fronts (red) and shortage/blight zones (violet) drawn on | history CA (M3) |
 | Daylight | the day/night terminator | sin(t) |
 
 ### M3 — the history simulation
@@ -86,22 +86,22 @@ automaton (`HIST_SIZE`² grid, one step per sim-week) that actually runs:
 - **dynamics** — population grows logistically toward food capacity and
   colonises reachable land; faction *influence* diffuses outward (blocked by
   sea and mountains) and whoever has the most influence owns the cell.
-- **war is emergent** — where two factions' influence meet and contest a
-  border, that contest is a mortality term: population dies along the front
-  and ownership flips when one side overtakes. Nobody scripted a war.
+- **border conflict is emergent** — where two factions' influence meet and
+  contest a border, that contest is an attrition term: population declines along
+  the front and ownership flips when one side overtakes. Nothing is scripted.
 - **shocks feed the food chain** — deterministic **pests/blights**,
   **droughts** (arid, long), and **cold spells / ice** (polar, long) each
   depress food capacity in a region for a while. Capacity drops below
-  population → famine (the logistic term goes negative) → unrest → war and
-  migration. That is the pest → famine → war → migration cascade, run through
-  the food web rather than authored.
+  population → food shortage (the logistic term goes negative) → unrest →
+  border conflict and migration. That is the blight → shortage → conflict →
+  migration cascade, run through the food web rather than authored.
 
 The CA is **integrated once at build time** into ~110 keyframes over a
 24-year horizon, stored compactly (uint8). `render(t)` interpolates the
 timeline, so history stays fully **seekable and exportable** — scrub to any
 year, export any year — even though the underlying process is stateful. Past
 the horizon the final state holds. The **Civilization** layer shows territory
-and population; the **History** layer overlays the wars and famines.
+and population; the **History** layer overlays the conflict fronts and shortages.
 
 ### Far form vs near form (why these are seekable)
 
@@ -114,9 +114,9 @@ coupling that can be written as an algebraic function of the current fields
 is included (moisture→flora→fauna carrying capacity; flora+water+climate→
 civilization habitability; civilization→local game depletion).
 
-The **near form** — live agents that integrate over time, where a pest, a
-war, a storm, or an advancing ice front is a *shock injected into a stock and
-propagated through the food-web graph* — is the M4 Resolver. It is stateful
+The **near form** — live agents that integrate over time, where a blight, a
+border conflict, a storm, or an advancing ice front is a *shock injected into a
+stock and propagated through the food-web graph* — is the M4 Resolver. It is stateful
 (not seekable) by nature, so it is deliberately a separate build, not part of
 this pure-function core.
 
@@ -132,18 +132,18 @@ scars. One flora, and it is the living one.
 
 - **Your sliders are the triggers.** Shoving the **sea-level** slider up floods
   land relative to the level the ecosystem is *adapted* to (its `sea_ref`,
-  which drifts only slowly) → mass die-off and **salted soil**; pull it back and
-  the exposed seabed is barren, greening only from the edges. High **season
-  amplitude** drives hot summers that **ignite fires** in grass/savanna and
-  **desertify** bare hot ground.
+  which drifts only slowly) → a biomass crash and **salinated soil**; pull it
+  back and the exposed seabed is barren, greening only from the edges. High
+  **season amplitude** drives hot summers that **ignite fires** in grass/savanna
+  and **desertify** bare hot ground.
 - **Slow variables give irreversibility.** Fertility and scars heal on a
   timescale of *years*, and vegetation/fauna/civilisation only recover by
-  **colonisation from surviving neighbours** — so a wiped, isolated region stays
-  dead until life spreads back in. Some worlds never come back; that is the
+  **colonisation from neighbouring cells** — so a cleared, isolated region stays
+  barren until life spreads back in. Some worlds never recover; that is the
   point — you can watch which worlds last.
 - **Consequences ⇒ not scrubbable backward.** The state at day 900 depends on
   the whole path of what you did, not on a formula of `t`, and the dynamics are
-  dissipative (a burned and a drowned forest both end at `veg=0` — the present
+  dissipative (a burned and a submerged forest both end at `veg=0` — the present
   can't tell you which). So the ecosystem only runs **forward or resets**; the
   seekable channels underneath stay pure. The stateful part is one `EcoSim`.
 - **Fast-forward centuries.** The speed control is logarithmic (up to thousands
