@@ -618,9 +618,9 @@ def frame_params(t, sea_level, tide_amp, season_amp):
     return sea_eff, season_off, sun_x
 
 
-def _terrain_gray(ws, tf, sea, tide=0.0):
-    """Dim grayscale terrain base for the society layers."""
-    base = BIOME_LUT[biome_ids(ws.elev, tf, ws.moist, sea, tide)]
+def _terrain_gray(biome_id):
+    """Dim grayscale terrain base for the society layers, from precomputed ids."""
+    base = BIOME_LUT[biome_id]
     gray = base @ np.array([0.30, 0.59, 0.11], np.float32)
     return np.repeat(gray[..., None], 3, axis=2) * 0.55 + 18
 
@@ -641,11 +641,32 @@ def _city_dots(ws, img, t):
         img[max(0, cy - r):cy + r + 1, max(0, cx - r):cx + r + 1] = (250, 250, 235)
 
 
-def render(ws, layer, t, sea_level, river_thr, season_amp, tide_amp, day_night):
-    """Pure: (world slice, layer name, sim time, knobs) -> uint8 RGB image."""
+def state(ws, t, sea_level, river_thr, season_amp, tide_amp, day_night):
+    """Compute the per-tile world state ONCE — the data every view (and, later,
+    Godot) reads. All field math lives here; the RGB renderers below are thin
+    skins over this dict. Shared fields (temperature, biome ids, vegetation) are
+    computed a single time instead of being re-derived per layer."""
     sea_eff, season_off, sun_x = frame_params(t, sea_level, tide_amp, season_amp)
     e = ws.elev
-    land = e >= sea_eff
+    tf = temperature_t(e, ws.lat, ws.lat_signed, sea_eff, season_off)
+    return {
+        "ws": ws, "t": t, "sea_level": sea_level, "river_thr": river_thr,
+        "tide_amp": tide_amp, "day_night": day_night,
+        "sea_eff": sea_eff, "season_off": season_off, "sun_x": sun_x,
+        "e": e, "land": e >= sea_eff, "tf": tf,
+        "biome_id": biome_ids(e, tf, ws.moist, sea_level, tide_amp),
+        "veg": flora_field(ws, tf, sea_eff),
+        "moist": ws.moist, "log_accum": ws.log_accum,
+    }
+
+
+def colorize(st, layer):
+    """Pure skin: a state dict + a layer name -> uint8 RGB. No field math here."""
+    ws, t = st["ws"], st["t"]
+    e, land, sea_eff = st["e"], st["land"], st["sea_eff"]
+    sun_x, tf = st["sun_x"], st["tf"]
+    sea_level, tide_amp = st["sea_level"], st["tide_amp"]
+    river_thr, day_night = st["river_thr"], st["day_night"]
 
     if layer == "elevation":
         img = np.empty(e.shape + (3,), np.float32)
@@ -659,28 +680,22 @@ def render(ws, layer, t, sea_level, river_thr, season_amp, tide_amp, day_night):
                               [(88, 140, 80), (168, 150, 96), (245, 245, 248)])
         img[~sea_m] = land_rgb[~sea_m]
     elif layer == "temperature":
-        tf = temperature_t(e, ws.lat, ws.lat_signed, sea_eff, season_off)
         img = color_ramp(tf, *TMP_RAMP)
     elif layer == "moisture":
         img = color_ramp(ws.moist, *MOI_RAMP)
     elif layer == "flow":
         img = color_ramp(ws.log_accum, *FLOW_RAMP)
     elif layer == "clouds":
-        tf = temperature_t(e, ws.lat, ws.lat_signed, sea_eff, season_off)
-        base = BIOME_LUT[biome_ids(e, tf, ws.moist, sea_level, tide_amp)] * 0.45
+        base = BIOME_LUT[st["biome_id"]] * 0.45
         cov = clouds_field(ws, t)[..., None]
         img = base * (1 - cov) + np.array([242, 246, 250], np.float32) * cov
         l = daylight_row(ws.xn, sun_x, day_night)[None, :, None]
         img *= 0.35 + 0.65 * l
     elif layer == "flora":
-        tf = temperature_t(e, ws.lat, ws.lat_signed, sea_eff, season_off)
-        veg = flora_field(ws, tf, sea_eff)
-        img = color_ramp(veg, *FLORA_RAMP)
+        img = color_ramp(st["veg"], *FLORA_RAMP)
         img[~land] = (26, 42, 74)
     elif layer == "fauna":
-        tf = temperature_t(e, ws.lat, ws.lat_signed, sea_eff, season_off)
-        veg = flora_field(ws, tf, sea_eff)
-        herb, pred = fauna_field(veg, t)
+        herb, pred = fauna_field(st["veg"], t)
         civ_p, _ = civ_population(ws, t)
         herb = herb * (1 - 0.7 * np.clip(civ_p, 0, 1))     # settlers hunt/clear game
         img = np.empty(e.shape + (3,), np.float32)
@@ -689,8 +704,7 @@ def render(ws, layer, t, sea_level, river_thr, season_amp, tide_amp, day_night):
         img[..., 2] = 45 + 30 * np.clip(herb, 0, 1)
         img[~land] = (20, 32, 58)
     elif layer == "civ":
-        tf = temperature_t(e, ws.lat, ws.lat_signed, sea_eff, season_off)
-        img = _terrain_gray(ws, tf, sea_level, tide_amp)
+        img = _terrain_gray(st["biome_id"])
         pop, fid = civ_population(ws, t)
         has = fid >= 0
         if has.any():
@@ -700,8 +714,7 @@ def render(ws, layer, t, sea_level, river_thr, season_amp, tide_amp, day_night):
         _city_dots(ws, img, t)
     elif layer == "history":
         # the chronicle: territory + where the world is thriving / at war / starving
-        tf = temperature_t(e, ws.lat, ws.lat_signed, sea_eff, season_off)
-        img = _terrain_gray(ws, tf, sea_level, tide_amp)
+        img = _terrain_gray(st["biome_id"])
         pop, fid, stress, unrest = _sample_history(ws, t)
         has = fid >= 0
         if has.any():
@@ -715,8 +728,7 @@ def render(ws, layer, t, sea_level, river_thr, season_amp, tide_amp, day_night):
         _city_dots(ws, img, t)
     elif layer == "vitality":
         # the LIVING world: the stateful ecosystem, where events leave scars.
-        tf = temperature_t(e, ws.lat, ws.lat_signed, sea_eff, season_off)
-        img = _terrain_gray(ws, tf, sea_level, tide_amp)
+        img = _terrain_gray(st["biome_id"])
         eco = getattr(ws, "eco", None)
         if eco is not None:
             s = eco.sample(ws)
@@ -745,11 +757,9 @@ def render(ws, layer, t, sea_level, river_thr, season_amp, tide_amp, day_night):
         img[..., 1] = 248 * l
         img[..., 2] = 80 + 145 * l
     else:  # biome / composite
-        tf = temperature_t(e, ws.lat, ws.lat_signed, sea_eff, season_off)
         # geography is cut by the SLIDER sea level (+ tidal band), so the sand
         # stays put; the instantaneous tide only sweeps a waterline across it.
-        ids = biome_ids(e, tf, ws.moist, sea_level, tide_amp)
-        img = BIOME_LUT[ids].copy()
+        img = BIOME_LUT[st["biome_id"]].copy()
         lo = sea_level - tide_amp                       # permanent low-tide line
         wet = (e >= lo) & (e < sea_eff)                 # intertidal sand, now wet
         img[wet] = (70, 130, 180)
@@ -762,6 +772,12 @@ def render(ws, layer, t, sea_level, river_thr, season_amp, tide_amp, day_night):
             img[..., 1] *= l * 0.96 + 0.04
             img[..., 2] *= l * 0.82 + 0.18
     return np.clip(img, 0, 255).astype(np.uint8)
+
+
+def render(ws, layer, t, sea_level, river_thr, season_amp, tide_amp, day_night):
+    """Convenience: compute state for one frame and skin a single layer."""
+    return colorize(state(ws, t, sea_level, river_thr, season_amp, tide_amp,
+                          day_night), layer)
 
 
 def render_rgba_bytes(ws, layer, t, sea_level, river_thr, season_amp, tide_amp, day_night):
