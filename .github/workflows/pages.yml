@@ -12,9 +12,12 @@ permissions:
   pages: write
   id-token: write
 
+# Never cancel an in-progress Pages deploy: interrupting the publish step is a
+# known cause of "Deployment failed, try again later" wedging the environment.
+# Queue instead, per GitHub's Pages guidance.
 concurrency:
   group: pages
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   deploy:
