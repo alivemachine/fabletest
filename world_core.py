@@ -82,16 +82,25 @@ def smoothstep(x):
     return x * x * (3 - 2 * x)
 
 
-def biome_ids(e, t, m, sea):
-    """Vectorized version of worldgen.classify_biomes -> int16 ids."""
-    water = e < sea
+def biome_ids(e, t, m, sea, tide=0.0):
+    """Vectorized version of worldgen.classify_biomes -> int16 ids.
+
+    `sea` is the GEOGRAPHIC sea level (the slider, no instantaneous tide), so
+    the coastline/beach terrain only moves when you change the slider. `tide`
+    is the tidal amplitude: the beach is the intertidal band it sweeps, so sand
+    is drawn as wide as the tide reaches. The instantaneous waterline (which
+    covers/uncovers that sand each cycle) is applied as a wet overlay in
+    render(), not here — the sand geography itself stays put."""
+    lo = sea - tide                      # lowest the water ever falls (geo)
+    beach_top = sea + tide + 0.015       # intertidal band + a little dry sand
+    water = e < lo
     conds = [
-        water & (e < sea - 0.12),
-        water & (e >= sea - 0.05),
+        water & (e < lo - 0.12),
+        water & (e >= lo - 0.05),
         water,
         e > 0.92,
         e > 0.82,
-        e < sea + 0.015,
+        e < beach_top,
         t < 0.2,
         t < 0.35,
         t < 0.5,
@@ -474,9 +483,9 @@ def frame_params(t, sea_level, tide_amp, season_amp):
     return sea_eff, season_off, sun_x
 
 
-def _terrain_gray(ws, tf, sea_eff):
+def _terrain_gray(ws, tf, sea, tide=0.0):
     """Dim grayscale terrain base for the society layers."""
-    base = BIOME_LUT[biome_ids(ws.elev, tf, ws.moist, sea_eff)]
+    base = BIOME_LUT[biome_ids(ws.elev, tf, ws.moist, sea, tide)]
     gray = base @ np.array([0.30, 0.59, 0.11], np.float32)
     return np.repeat(gray[..., None], 3, axis=2) * 0.55 + 18
 
@@ -523,7 +532,7 @@ def render(ws, layer, t, sea_level, river_thr, season_amp, tide_amp, day_night):
         img = color_ramp(ws.log_accum, *FLOW_RAMP)
     elif layer == "clouds":
         tf = temperature_t(e, ws.lat, ws.lat_signed, sea_eff, season_off)
-        base = BIOME_LUT[biome_ids(e, tf, ws.moist, sea_eff)] * 0.45
+        base = BIOME_LUT[biome_ids(e, tf, ws.moist, sea_level, tide_amp)] * 0.45
         cov = clouds_field(ws, t)[..., None]
         img = base * (1 - cov) + np.array([242, 246, 250], np.float32) * cov
         l = daylight_row(ws.xn, sun_x, day_night)[None, :, None]
@@ -546,7 +555,7 @@ def render(ws, layer, t, sea_level, river_thr, season_amp, tide_amp, day_night):
         img[~land] = (20, 32, 58)
     elif layer == "civ":
         tf = temperature_t(e, ws.lat, ws.lat_signed, sea_eff, season_off)
-        img = _terrain_gray(ws, tf, sea_eff)
+        img = _terrain_gray(ws, tf, sea_level, tide_amp)
         pop, fid = civ_population(ws, t)
         has = fid >= 0
         if has.any():
@@ -557,7 +566,7 @@ def render(ws, layer, t, sea_level, river_thr, season_amp, tide_amp, day_night):
     elif layer == "history":
         # the chronicle: territory + where the world is thriving / at war / starving
         tf = temperature_t(e, ws.lat, ws.lat_signed, sea_eff, season_off)
-        img = _terrain_gray(ws, tf, sea_eff)
+        img = _terrain_gray(ws, tf, sea_level, tide_amp)
         pop, fid, stress, unrest = _sample_history(ws, t)
         has = fid >= 0
         if has.any():
@@ -577,10 +586,14 @@ def render(ws, layer, t, sea_level, river_thr, season_amp, tide_amp, day_night):
         img[..., 2] = 80 + 145 * l
     else:  # biome / composite
         tf = temperature_t(e, ws.lat, ws.lat_signed, sea_eff, season_off)
-        ids = biome_ids(e, tf, ws.moist, sea_eff)
-        img = BIOME_LUT[ids]
+        # geography is cut by the SLIDER sea level (+ tidal band), so the sand
+        # stays put; the instantaneous tide only sweeps a waterline across it.
+        ids = biome_ids(e, tf, ws.moist, sea_level, tide_amp)
+        img = BIOME_LUT[ids].copy()
+        lo = sea_level - tide_amp                       # permanent low-tide line
+        wet = (e >= lo) & (e < sea_eff)                 # intertidal sand, now wet
+        img[wet] = (70, 130, 180)
         if layer == "composite":
-            img = img.copy()
             img[land] *= ws.shade[land, None]
             rivers = (ws.accum > river_thr) & land
             img[rivers] = (70, 130, 200)
