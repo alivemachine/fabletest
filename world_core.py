@@ -284,6 +284,13 @@ class WorldSlice:
         # of pixels wide from orbit; threshold streams stay 1 px)
         accum = _widen_rivers(accum, default_river_threshold(self.size), 1.0)
         self.elev, self.moist, self.accum = elev, moist, accum
+        # magnitude source for zoomed drainage: max-dilated so a 1-px planet
+        # channel cannot fall between the samples of a coarser zoom lattice
+        q = accum.astype(np.float32).copy()
+        for _ in range(max(2, int(np.ceil(self.size / 128 * 1.5)))):
+            for ax, sh in ((0, 1), (0, -1), (1, 1), (1, -1)):
+                q = np.maximum(q, np.roll(q, sh, ax))
+        self._q_src = q
         self.cloud1, self.cloud2 = cloud1, cloud2
         self._derive_grids()
         self.has_history = False
@@ -301,9 +308,13 @@ class WorldSlice:
         self.xn = u
         gy, gx = np.gradient(self.elev)
         self.shade = np.clip(1 - (gx + gy) * 2.2, 0.75, 1.25).astype(np.float32)
-        amax = float(self.accum.max())
-        self.log_accum = (np.log1p(self.accum) / np.log1p(amax)
-                          if amax > 0 else np.zeros_like(self.elev))
+        # the flow ramp is normalized by a PLANET-WIDE constant, not the window
+        # max: otherwise the whole flow map re-brightens whenever a big river
+        # enters or leaves the view (one of the "pixels changed" flickers).
+        if not hasattr(self, "log_norm"):
+            self.log_norm = float(np.log1p(max(float(self.accum.max()), 1.0)))
+        self.log_accum = np.clip(np.log1p(np.maximum(self.accum, 0))
+                                 / self.log_norm, 0, 1).astype(np.float32)
         self.orographic = np.clip(gx * 6.0, 0, 1).astype(np.float32)
 
     def _sample_planet(self, field, cx, cy, span, size):
@@ -347,32 +358,41 @@ class WorldSlice:
         s.cx, s.cy, s.span = float(cx % 1.0), float(cy % 1.0), span
         s.elev = elevation_window(size, self.seed, s.cx, s.cy, span)
         s.moist = moisture_window(size, self.seed, s.cx, s.cy, span)
-        # rivers under zoom — PATH from local D8 on the refined elevation (the
-        # fine valley network; the low noise octaves are shared, so it sits in
-        # the same valley the planet river runs), MAGNITUDE from the planet's
-        # accumulation (the upstream volume). Both are window-independent:
-        #  * local_frac = fraction of the window draining through a pixel (not
-        #    normalized by the window max, which changes as you pan),
-        #  * Q = planet accumulation sampled per-pixel (not a window max).
-        # A wall around the window stops D8 from wrapping torus-style across
-        # the window edge, which is meaningless for a sub-window.
-        walled = s.elev[::st, ::st].copy()
-        walled[0, :] = walled[-1, :] = walled[:, 0] = walled[:, -1] = 2.0
-        _, local = compute_rivers(walled, 0.5)
-        n = walled.shape[0]
-        local_frac = local.astype(np.float32) / float(n * n)
-        trunk = np.clip(local_frac / 0.02, 0, 1)   # ~1 on channels draining >=2%
-        trunk = np.repeat(np.repeat(trunk, st, 0), st, 1)[:size, :size]
-        Q = self._sample_planet(self.accum, s.cx, s.cy, span, size).astype(np.float32)
-        s.accum = trunk * Q
-        # physical channel width, resolvable at this zoom; a smoothing pass
-        # rounds the blocky dilation into banks
-        px_per_planet_px = (size / span) / self.size
-        wide = _widen_rivers(s.accum, default_river_threshold(self.size),
-                             px_per_planet_px, max_r=10)
-        s.accum = 0.5 * wide + 0.5 * _neigh4(wide)
+        # rivers under zoom — drainage lives on a WORLD-FIXED lattice pyramid,
+        # not on the screen's sample grid. Lattice cells sit at multiples of
+        # 1/NL where NL depends only on the zoom OCTAVE, so panning and zooming
+        # change WHICH cells are visible but never where they sit: the network
+        # is anchored to the world and cannot shimmer as the window moves.
+        # Crossing an octave boundary doubles the lattice (finer tributaries
+        # resolve); the main channels persist because the terrain is shared.
+        # PATH comes from local D8 on the lattice (walled: no torus wrap across
+        # a sub-window), MAGNITUDE from the planet's accumulation (upstream
+        # volume, max-dilated at build so thin channels can't fall between
+        # lattice samples). Nothing is normalized by window content.
+        L = max(0, int(np.floor(np.log2(zoom))))
+        NL = 128 << L                              # lattice cells across world
+        j0 = int(np.floor((cx - span / 2) * NL)) - 1
+        i0 = int(np.floor((cy - span / 2) * NL)) - 1
+        n = int(np.ceil(span * NL)) + 3            # visible cells + margin
+        lat_cx = ((j0 + n * 0.5) / NL) % 1.0
+        lat_cy = ((i0 + n * 0.5) / NL) % 1.0
+        eL = elevation_window(n, self.seed, lat_cx, lat_cy, n / NL)
+        eL[0, :] = eL[-1, :] = eL[:, 0] = eL[:, -1] = 2.0
+        _, localL = compute_rivers(eL, 0.5)
+        trunk = np.clip(localL.astype(np.float32) / (n * n) / 0.02, 0, 1)
+        QL = self._sample_planet(self._q_src, lat_cx, lat_cy, n / NL, n)
+        accL = _widen_rivers(trunk * QL.astype(np.float32),
+                             default_river_threshold(self.size),
+                             NL / self.size, max_r=6)
+        # nearest-map the visible lattice cells onto the screen window
+        stepw = (np.arange(size, dtype=np.float64) / size - 0.5) * span
+        wj = np.clip(np.floor((cx + stepw) * NL).astype(np.int64) - j0, 0, n - 1)
+        wi = np.clip(np.floor((cy + stepw) * NL).astype(np.int64) - i0, 0, n - 1)
+        acc = accL[np.ix_(wi, wj)]
+        s.accum = (0.5 * acc + 0.5 * _neigh4(acc)).astype(np.float32)  # soft banks
         s.cloud1 = _cloud_sheet(self.seed + 4001, s.cx, s.cy, span, size, 4)
         s.cloud2 = _cloud_sheet(self.seed + 8009, s.cx, s.cy, span, size, 3)
+        s.log_norm = self.log_norm             # planet-fixed flow normalization
         s._derive_grids()
         # share the pre-integrated history + the live eco sim (both global, not
         # window-local) by reference, so zooming never rebuilds or forks them
