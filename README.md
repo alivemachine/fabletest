@@ -186,13 +186,22 @@ actually wanted was infinite **detail**, not infinite **extent**, and that is
 what zoom gives: finite world, bottomless zoom, computed only for the window on
 screen.
 
-**Current limits (the next tasks, on the road to M4):** rivers are global D8 and
-can't yet be windowed without upstream boundary conditions, so a zoomed view
-draws no rivers; civilization is still the coarse HIST grid upsampled, so zoom
-does not yet *expand* a cell's population into individual settlements and
-buildings. Both are `expand()` work — turning a coarse cell's summary (faction,
-population, stress) into a deterministic settlement grammar keyed by the cell's
-seed — which is exactly the M4 Resolver this zoom pipeline is the skeleton for.
+**Rivers under zoom** work by splitting path from magnitude: the *path* comes
+from local D8 on the window's refined elevation (the fine valley network — the
+shared low octaves put it in the same valley the planet river runs), and the
+*magnitude* comes from the planet's accumulation sampled per pixel (the true
+upstream volume). Channels get **physical width** (∝ √discharge, hydraulic
+geometry), so a big river reads as a line from orbit and resolves to many
+pixels wide as you dive in. The viewport **pixel-snaps** to the drainage
+lattice, so panning translates the exact same samples — no shimmer — and drag
+frames that snap to the same cell reuse the cached window.
+
+**Current limit (the next task, on the road to M4):** civilization is still the
+coarse HIST grid upsampled, so zoom does not yet *expand* a cell's population
+into individual settlements and buildings. That is `expand()` work — turning a
+coarse cell's summary (faction, population, stress) into a deterministic
+settlement grammar keyed by the cell's seed — which is exactly the M4 Resolver
+this zoom pipeline is the skeleton for.
 
 ## Turning a sequence into a video
 

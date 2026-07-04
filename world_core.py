@@ -38,6 +38,33 @@ def _cloud_sheet(seed, cx, cy, span, size, base_period):
     f = noise_window(seed, cx, cy, span, size, base_period=base_period)
     return ((f - f.min()) / (np.ptp(f) or 1.0)).astype(np.float32)
 
+
+def _widen_rivers(accum, thr_ref, px_per_planet_px, max_r=12):
+    """Give the 1-px D8 skeleton a PHYSICAL width. Channel width follows
+    hydraulic geometry (width ~ sqrt(discharge)): a threshold river is ~1
+    planet-pixel wide, the biggest a few. px_per_planet_px converts that world
+    width into pixels at the current zoom, so a big river reads as a line from
+    orbit and RESOLVES to many pixels wide when you dive in, instead of staying
+    a 1-px thread at every scale. Implemented as a value-propagating grassfire:
+    each channel pixel spreads its accumulation over its radius, so downstream
+    consumers (threshold mask, flow ramp) just see a wider field."""
+    w_pp = np.sqrt(np.maximum(accum, 0) / max(thr_ref, 1e-6))     # planet px
+    radius = np.clip(w_pp * px_per_planet_px * 0.5, 0, max_r)
+    radius = np.where(accum >= thr_ref * 0.5, radius, 0).astype(np.float32)
+    passes = int(np.ceil(float(radius.max())))
+    if passes <= 0:
+        return accum.astype(np.float32)
+    val = accum.astype(np.float32).copy()
+    rad = radius.copy()
+    for _ in range(passes):
+        for ax, sh in ((0, 1), (0, -1), (1, 1), (1, -1)):
+            rn = np.roll(rad, sh, ax) - 1.0
+            vn = np.roll(val, sh, ax)
+            take = rn > rad
+            rad = np.where(take, rn, rad)
+            val = np.where(take, vn, val)
+    return np.maximum(val, accum.astype(np.float32))
+
 # ---------------------------------------------------------------------------
 # Time model (M2). t is measured in sim DAYS.
 # ---------------------------------------------------------------------------
@@ -249,9 +276,13 @@ class WorldSlice:
                  cx=0.5, cy=0.5, span=1.0):
         self.size = elev.shape[0]
         self.seed = int(seed)
+        self.planet_size = self.size
         # viewport on the unit torus: window centered at (cx, cy) of side span.
         # span == 1 -> the whole planet (the default, backward-compatible view).
         self.cx, self.cy, self.span = float(cx), float(cy), float(span)
+        # planet rivers get their physical width too (the largest are a couple
+        # of pixels wide from orbit; threshold streams stay 1 px)
+        accum = _widen_rivers(accum, default_river_threshold(self.size), 1.0)
         self.elev, self.moist, self.accum = elev, moist, accum
         self.cloud1, self.cloud2 = cloud1, cloud2
         self._derive_grids()
@@ -294,30 +325,54 @@ class WorldSlice:
         if span >= 0.999:                          # whole planet -> this slice
             return self
         size = self.size
+        # PIXEL-SNAP the viewport: quantize the window center to the drainage
+        # lattice at this zoom, so panning translates the exact same world
+        # samples instead of re-sampling at shifted phases. Without this every
+        # sub-pixel pan rebuilds a slightly different D8 network and the rivers
+        # shimmer; with it the drainage (and all fields) just slide. The lattice
+        # is the STRIDED grid the local D8 runs on, so one pan step = one whole
+        # drainage cell = a pure translation of the network.
+        st = max(1, size // 128)                   # D8 stride (cost + stability)
+        step = (span / size) * st
+        cx = round(cx / step) * step
+        cy = round(cy / step) * step
+        # drag frames usually snap to the same lattice cell -> reuse the window
+        key = (round(cx / step), round(cy / step), round(zoom, 6))
+        cached = getattr(self, "_view_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
         s = WorldSlice.__new__(WorldSlice)
         s.size, s.seed = size, self.seed
-        s.cx, s.cy, s.span = float(cx), float(cy), span
-        s.elev = elevation_window(size, self.seed, cx, cy, span)
-        s.moist = moisture_window(size, self.seed, cx, cy, span)
-        # rivers under zoom: run LOCAL D8 on the window's refined elevation
-        # (traces the fine valley network) and scale it by the PLANET's coarse
-        # accumulation sampled at these world coords (the upstream boundary
-        # condition -- how much catchment actually drains through here). Because
-        # the low noise octaves are shared, the local thalweg sits in the same
-        # valley the planet river runs, so a big river stays a big river when you
-        # dive in, and headwater windows show only their own small streams.
-        _, local = compute_rivers(s.elev, 0.5)
-        local_norm = local.astype(np.float32) / (float(local.max()) or 1.0)
-        # PATH from local D8 (the refined valley, continuous), MAGNITUDE from the
-        # coarse planet accumulation in this region (the upstream volume draining
-        # through here). Keeping them separate avoids the planet pixel grid
-        # fighting the refined thalweg at deep zoom: local_norm ~1 along the
-        # window's main valley, scaled to carry the region's real river volume,
-        # so a big river stays big when you dive in and dry hills stay dry.
-        region = float(self._sample_planet(self.accum, cx, cy, span, size).max())
-        s.accum = local_norm * region
-        s.cloud1 = _cloud_sheet(self.seed + 4001, cx, cy, span, size, 4)
-        s.cloud2 = _cloud_sheet(self.seed + 8009, cx, cy, span, size, 3)
+        s.planet_size = self.size
+        s.cx, s.cy, s.span = float(cx % 1.0), float(cy % 1.0), span
+        s.elev = elevation_window(size, self.seed, s.cx, s.cy, span)
+        s.moist = moisture_window(size, self.seed, s.cx, s.cy, span)
+        # rivers under zoom — PATH from local D8 on the refined elevation (the
+        # fine valley network; the low noise octaves are shared, so it sits in
+        # the same valley the planet river runs), MAGNITUDE from the planet's
+        # accumulation (the upstream volume). Both are window-independent:
+        #  * local_frac = fraction of the window draining through a pixel (not
+        #    normalized by the window max, which changes as you pan),
+        #  * Q = planet accumulation sampled per-pixel (not a window max).
+        # A wall around the window stops D8 from wrapping torus-style across
+        # the window edge, which is meaningless for a sub-window.
+        walled = s.elev[::st, ::st].copy()
+        walled[0, :] = walled[-1, :] = walled[:, 0] = walled[:, -1] = 2.0
+        _, local = compute_rivers(walled, 0.5)
+        n = walled.shape[0]
+        local_frac = local.astype(np.float32) / float(n * n)
+        trunk = np.clip(local_frac / 0.02, 0, 1)   # ~1 on channels draining >=2%
+        trunk = np.repeat(np.repeat(trunk, st, 0), st, 1)[:size, :size]
+        Q = self._sample_planet(self.accum, s.cx, s.cy, span, size).astype(np.float32)
+        s.accum = trunk * Q
+        # physical channel width, resolvable at this zoom; a smoothing pass
+        # rounds the blocky dilation into banks
+        px_per_planet_px = (size / span) / self.size
+        wide = _widen_rivers(s.accum, default_river_threshold(self.size),
+                             px_per_planet_px, max_r=10)
+        s.accum = 0.5 * wide + 0.5 * _neigh4(wide)
+        s.cloud1 = _cloud_sheet(self.seed + 4001, s.cx, s.cy, span, size, 4)
+        s.cloud2 = _cloud_sheet(self.seed + 8009, s.cx, s.cy, span, size, 3)
         s._derive_grids()
         # share the pre-integrated history + the live eco sim (both global, not
         # window-local) by reference, so zooming never rebuilds or forks them
@@ -326,6 +381,7 @@ class WorldSlice:
                   "hist_unrest", "civ_cores", "eco"):
             if hasattr(self, k):
                 setattr(s, k, getattr(self, k))
+        self._view_cache = (key, s)
         return s
 
     # ---- downsample a fine field to the coarse HIST grid (nearest) ----------
