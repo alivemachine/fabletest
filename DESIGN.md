@@ -69,7 +69,7 @@ novel mechanic needs *you* to author a new resolver.
 
 ## Build roadmap
 - **M0 ✅ Fields → biomes, rendered as a map.** *(worldgen.py — done)*
-- **M1  Water.** D8 rivers ✅ + rainfall advection (wind carries moisture, rain shadows), lakes via priority-flood.
+- **M1  Water.** ✅ Real hydrology: depression filling (priority-flood — every river reaches the sea, lakes with outlets fall out for free), de-biased D8 + accumulation, the drainage traced once into a junction-to-junction vector TREE (hydraulic widths `w≈k·√A`, deterministic meanders that refine with zoom, valleys carved into every window's heightfield), and past planet resolution a window-local D8 on the refined carved terrain grows real brooks that drain into the trunks. Still open: rainfall advection (wind carries moisture, rain shadows).
 - **M2 ✅ Time.** Animate it: day/night, seasons (temp offset), tides (`sin(t)`). Export frames → **watch worlds evolve; reject collapsing ones.** *(world_core.py + the desktop & web layer consoles.)*
 - **M3 ✅ History CA.** Coarse dynamic grid: civilizations, populations, resources, events. Keyframe for time-travel. *(world_core.py `_build_history` — integrated once into a seekable timeline; blights/droughts/ice → food shortage → emergent border conflict.)*
 - **M3.5 ✅ Continuous zoom.** The grid was one *sampling* of `world(seed,x,y,t)`, not the world. Hash-based windowed noise (`worldgen.noise_window`) + `WorldSlice.view(cx,cy,zoom)` sample any window at any depth, adding octaves (not blur) so detail stays coherent with the planet above — finite world, bottomless zoom, computed only for the window on screen. The LOD-sampling substrate M4 hangs on. *(pan/zoom live in both consoles; rivers + settlement-grammar expansion are the remaining `expand()` work.)*

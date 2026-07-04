@@ -27,9 +27,9 @@ in the browser via Pyodide). No matplotlib, no PIL, no I/O — numpy in, RGB out
 
 import numpy as np
 
-from worldgen import (elevation_field, moisture_field, compute_rivers,
+from worldgen import (elevation_field, moisture_field, compute_hydrology,
                       elevation_window, moisture_window, noise_window,
-                      BIOME_COLORS)
+                      BIOME_COLORS, SEA_REF, _corner_hash)
 
 
 def _cloud_sheet(seed, cx, cy, span, size, base_period):
@@ -39,106 +39,124 @@ def _cloud_sheet(seed, cx, cy, span, size, base_period):
     return ((f - f.min()) / (np.ptp(f) or 1.0)).astype(np.float32)
 
 
-def _trace_river_network(elev, thr, sea=0.42):
-    """Trace the D8 drainage into VECTOR polylines: a list of world-space line
-    segments (x0,y0)->(x1,y1) in [0,1] coords, each carrying its discharge.
-    Rivers are 1-D curves, so store them as curves — then any zoom rasterizes
-    the same geometry crisply, with no blocky dilation and no shimmer."""
-    S = elev.shape[0]
-    flat = elev.reshape(-1)
-    n = S * S
-    yy, xx = np.divmod(np.arange(n), S)
-    lowest = np.arange(n)
-    lowest_val = flat.copy()
-    for dy, dx in ((-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)):
-        nidx = ((yy + dy) % S) * S + ((xx + dx) % S)
-        nval = flat[nidx]
-        better = nval < lowest_val
-        lowest = np.where(better, nidx, lowest)
-        lowest_val = np.where(better, nval, lowest_val)
-    accum = np.ones(n, dtype=np.float64)
-    for idx in np.argsort(-flat):
-        t = lowest[idx]
-        if t != idx:
-            accum[t] += accum[idx]
-    src = np.where((accum > thr) & (flat >= sea))[0]              # channel cells
-    dst = lowest[src]
-    sy, sx = np.divmod(src, S)
-    dy2, dx2 = np.divmod(dst, S)
-    # unwrap the torus: keep the endpoint delta in [-0.5,0.5] so a segment never
-    # streaks across the whole map at the seam
-    ddx = (((dx2 - sx) + S // 2) % S - S // 2)
-    ddy = (((dy2 - sy) + S // 2) % S - S // 2)
-    keep = ~((src == dst))
-    x0 = (sx[keep] + 0.5) / S
-    y0 = (sy[keep] + 0.5) / S
-    x1 = x0 + ddx[keep] / S
-    y1 = y0 + ddy[keep] / S
-    return {"x0": x0.astype(np.float32), "y0": y0.astype(np.float32),
-            "x1": x1.astype(np.float32), "y1": y1.astype(np.float32),
-            "disc": accum[src][keep].astype(np.float32), "thr": float(thr)}
+# ===========================================================================
+# RIVERS. The planet's drainage (worldgen.compute_hydrology) is traced ONCE
+# into a TREE of vector polylines — junction to junction, each vertex carrying
+# its discharge. Every view then renders that same world-space geometry:
+#
+#   width    real hydraulic geometry (w ≈ k·√drainage-area), so rivers are
+#            hairlines from orbit and only resolve to many pixels wide at
+#            genuinely deep zoom — never inflated "worms";
+#   shape    Chaikin-smoothed at build (kills the D8 staircase), then refined
+#            per view by deterministic midpoint displacement seeded from the
+#            segment's WORLD coordinates: zooming adds meanders exactly the
+#            way terrain adds octaves, identically for every window;
+#   valleys  the network CARVES the heightfield (in every window, at every
+#            zoom), so terrain and rivers agree and hillshade shows drainage;
+#   detail   past planet resolution, a window-local D8 runs on the refined,
+#            carved elevation — the carved trunks act as drains, so the small
+#            streams that appear are REAL drainage of the refined terrain,
+#            not decoration.
+# ===========================================================================
+
+PLANET_KM = 4000.0      # map width; fixes the physical meaning of one cell
+RIVER_W_KM = 0.0035     # hydraulic width: w[km] ≈ this · sqrt(drainage[km²])
+CARVE_DEPTH = 0.012     # valley depth (elevation units) for a threshold river
+MEANDER = 0.30          # midpoint displacement as a fraction of segment length
+BROOK_MIN = 170         # window cells a local stream must drain to be drawn
 
 
-def _widen_rivers(accum, thr_ref, px_per_planet_px, max_r=12):
-    """Give the 1-px D8 skeleton a PHYSICAL width. Channel width follows
-    hydraulic geometry (width ~ sqrt(discharge)): a threshold river is ~1
-    planet-pixel wide, the biggest a few. px_per_planet_px converts that world
-    width into pixels at the current zoom, so a big river reads as a line from
-    orbit and RESOLVES to many pixels wide when you dive in, instead of staying
-    a 1-px thread at every scale. Implemented as a value-propagating grassfire:
-    each channel pixel spreads its accumulation over its radius, so downstream
-    consumers (threshold mask, flow ramp) just see a wider field."""
-    w_pp = np.sqrt(np.maximum(accum, 0) / max(thr_ref, 1e-6))     # planet px
-    radius = np.clip(w_pp * px_per_planet_px * 0.5, 0, max_r)
-    radius = np.where(accum >= thr_ref * 0.5, radius, 0).astype(np.float32)
-    passes = int(np.ceil(float(radius.max())))
-    if passes <= 0:
-        return accum.astype(np.float32)
-    val = accum.astype(np.float32).copy()
-    rad = radius.copy()
+def _net_threshold(planet_size):
+    """Min accumulation (cells) traced into the vector network. Scales with
+    cell count so it is the same PHYSICAL drainage area at any resolution."""
+    return max(12.0, 48.0 * (planet_size / 256.0) ** 2)
+
+
+def _width_world(acc, planet_size):
+    """Channel width in world units from drainage area, via w ≈ k·√A."""
+    return RIVER_W_KM * np.sqrt(np.maximum(acc, 1.0)) / planet_size
+
+
+def _chaikin(x, y, a, passes=2):
+    """Corner-cutting smoothing; endpoints pinned so junctions stay connected."""
     for _ in range(passes):
-        for ax, sh in ((0, 1), (0, -1), (1, 1), (1, -1)):
-            rn = np.roll(rad, sh, ax) - 1.0
-            vn = np.roll(val, sh, ax)
-            take = rn > rad
-            rad = np.where(take, rn, rad)
-            val = np.where(take, vn, val)
-    return np.maximum(val, accum.astype(np.float32))
+        if x.size < 3:
+            break
+        def one(v):
+            out = np.empty(2 * v.size, v.dtype)
+            out[0], out[-1] = v[0], v[-1]
+            out[1:-1:2] = 0.75 * v[:-1] + 0.25 * v[1:]
+            out[2:-1:2] = 0.25 * v[:-1] + 0.75 * v[1:]
+            return out
+        x, y, a = one(x), one(y), one(a)
+    return x, y, a
 
 
-def _rasterize_rivers(net, cx, cy, span, size):
-    """Draw the vector river network into a (size,size) discharge field for the
-    window (cx,cy,span). Each segment is a capsule (thick line) whose width
-    follows hydraulic geometry (~sqrt(discharge)) and grows with zoom, so rivers
-    are smooth curves at any depth. Only segments overlapping the window are
-    drawn; the torus is handled by testing the 9 wrapped copies."""
-    out = np.zeros((size, size), np.float32)
-    if net is None or len(net["disc"]) == 0:
-        return out
-    inv = size / span                          # world -> pixel scale
-    left, top = cx - span / 2, cy - span / 2
-    thr = net["thr"]
-    # world-space half-width: ~0.5 planet-px at threshold, wider with discharge
-    hw_world = (0.6 / net.get("planet_size", 256)) * np.sqrt(
-        np.maximum(net["disc"] / thr, 1.0))
-    for ox in (-1.0, 0.0, 1.0):
-        X0 = (net["x0"] + ox - left) * inv
-        X1 = (net["x1"] + ox - left) * inv
-        for oy in (-1.0, 0.0, 1.0):
-            Y0 = (net["y0"] + oy - top) * inv
-            Y1 = (net["y1"] + oy - top) * inv
-            rad = np.maximum(hw_world * inv, 0.6)      # px
-            lo_x = np.minimum(X0, X1) - rad; hi_x = np.maximum(X0, X1) + rad
-            lo_y = np.minimum(Y0, Y1) - rad; hi_y = np.maximum(Y0, Y1) + rad
-            vis = np.where((hi_x >= 0) & (lo_x < size) &
-                           (hi_y >= 0) & (lo_y < size))[0]
-            for k in vis:
-                _draw_capsule(out, X0[k], Y0[k], X1[k], Y1[k],
-                              rad[k], net["disc"][k], size)
-    return out
+def _extract_network(parent, accum, size, thr, sea):
+    """Trace the D8 forest into junction-to-junction polylines. Returns a list
+    of (x, y, acc) arrays in UNWRAPPED world coords (a polyline may run past
+    [0,1) across the torus seam; the rasterizer tests wrapped copies)."""
+    n = size * size
+    acc = accum.reshape(-1)
+    sea_f = sea.reshape(-1)
+    chan = (acc > thr) & (~sea_f)
+    node = np.arange(n)
+    moving = chan & (parent != node)
+    inflow = np.bincount(parent[moving], minlength=n)   # channel tributaries in
+    junc = chan & (inflow >= 2)
+    starts = np.where((chan & (inflow == 0)) | junc)[0]
+    edges = []
+    for s0 in starts:
+        cur = int(s0)
+        xs = [(cur % size + 0.5) / size]
+        ys = [(cur // size + 0.5) / size]
+        aa = [float(acc[cur])]
+        for _ in range(4 * n):
+            nxt = int(parent[cur])
+            if nxt == cur:
+                break
+            ddx = ((nxt % size) - (cur % size) + size // 2) % size - size // 2
+            ddy = ((nxt // size) - (cur // size) + size // 2) % size - size // 2
+            xs.append(xs[-1] + ddx / size)
+            ys.append(ys[-1] + ddy / size)
+            aa.append(float(acc[nxt]))
+            cur = nxt
+            if sea_f[cur] or junc[cur] or not chan[cur]:
+                break
+        if len(xs) >= 2:
+            x, y, a = _chaikin(np.asarray(xs), np.asarray(ys),
+                               np.asarray(aa, np.float64))
+            edges.append((x.astype(np.float32), y.astype(np.float32),
+                          a.astype(np.float32)))
+    return edges
 
 
-def _draw_capsule(out, x0, y0, x1, y1, rad, value, size):
+def _refine_polyline(x, y, a, levels, planet_size, seed):
+    """Deterministic fractal meanders: midpoints displaced perpendicular by a
+    hash of their WORLD position, recursively. The same world curve falls out
+    of every window and zoom; deeper zoom just reveals more levels."""
+    for lvl in range(levels):
+        dx, dy = np.diff(x), np.diff(y)
+        q = np.float64(planet_size) * (2 << lvl)
+        mx, my = x[:-1] + dx * 0.5, y[:-1] + dy * 0.5
+        h = _corner_hash(seed + 13, 91 + lvl,
+                         np.round(mx * q).astype(np.int64),
+                         np.round(my * q).astype(np.int64)) - 0.5
+        mx = mx - dy * h * MEANDER
+        my = my + dx * h * MEANDER
+        def weave(v, m):
+            out = np.empty(v.size + m.size, v.dtype)
+            out[0::2], out[1::2] = v, m
+            return out
+        x = weave(x, mx)
+        y = weave(y, my)
+        a = weave(a, 0.5 * (a[:-1] + a[1:]))
+    return x, y, a
+
+
+def _stroke_capsule(alpha, disc, x0, y0, x1, y1, rad, a_vis, value, size):
+    """One wide river segment: antialiased coverage into `alpha`, discharge
+    into `disc`."""
     x_lo = max(0, int(np.floor(min(x0, x1) - rad)))
     x_hi = min(size, int(np.ceil(max(x0, x1) + rad)) + 1)
     y_lo = max(0, int(np.floor(min(y0, y1) - rad)))
@@ -153,11 +171,208 @@ def _draw_capsule(out, x0, y0, x1, y1, rad, value, size):
         t = np.zeros((1, 1), np.float32)
     else:
         t = np.clip(((xs - x0) * dx + (ys - y0) * dy) / ll, 0.0, 1.0)
-    px, py = x0 + t * dx, y0 + t * dy
-    dist = np.sqrt((xs - px) ** 2 + (ys - py) ** 2)
-    cover = np.clip(rad - dist + 0.5, 0.0, 1.0)      # 1px antialiased edge
-    sub = out[y_lo:y_hi, x_lo:x_hi]
-    np.maximum(sub, value * cover, out=sub)
+    dist = np.sqrt((xs - (x0 + t * dx)) ** 2 + (ys - (y0 + t * dy)) ** 2)
+    cover = np.clip(rad - dist + 0.5, 0.0, 1.0)
+    sub_a = alpha[y_lo:y_hi, x_lo:x_hi]
+    np.maximum(sub_a, a_vis * cover, out=sub_a)
+    sub_d = disc[y_lo:y_hi, x_lo:x_hi]
+    np.maximum(sub_d, np.where(cover > 0.2, value, 0.0).astype(np.float32),
+               out=sub_d)
+
+
+def _splat_thin(alpha, disc, carve, segs, size):
+    """Batch-draw thin (≲1.5px) stroke segments and ALL carve centerlines as
+    resampled points with bilinear max-splat — one vectorized pass for the
+    whole network instead of a Python loop per segment."""
+    X0, Y0, X1, Y1, A, V, D, W = (np.concatenate(s) for s in zip(*segs))
+    L = np.hypot(X1 - X0, Y1 - Y0)
+    m = np.maximum(1, np.ceil(L / 0.6).astype(np.int64))
+    eid = np.repeat(np.arange(m.size), m)
+    base = np.repeat(np.cumsum(m) - m, m)
+    t = (np.arange(eid.size) - base + 0.5) / m[eid]
+    xs = X0[eid] + t * (X1 - X0)[eid]
+    ys = Y0[eid] + t * (Y1 - Y0)[eid]
+    av, vv = A[eid], V[eid]
+    dv, thin = D[eid], (W[eid] <= 1.5)
+    xi = np.floor(xs - 0.5).astype(np.int64)
+    yi = np.floor(ys - 0.5).astype(np.int64)
+    fx, fy = xs - 0.5 - xi, ys - 0.5 - yi
+    af, df_, cf = alpha.reshape(-1), disc.reshape(-1), carve.reshape(-1)
+    for ddx, ddy in ((0, 0), (1, 0), (0, 1), (1, 1)):
+        w = (fx if ddx else 1 - fx) * (fy if ddy else 1 - fy)
+        gx, gy = xi + ddx, yi + ddy
+        ok = (gx >= 0) & (gx < size) & (gy >= 0) & (gy < size)
+        idx = gy[ok] * size + gx[ok]
+        wk = w[ok]
+        np.maximum.at(cf, idx, (wk * dv[ok]).astype(np.float32))
+        tm = thin[ok]
+        np.maximum.at(af, idx[tm], (wk[tm] * av[ok][tm]).astype(np.float32))
+        hit = tm & (wk > 0.25)
+        np.maximum.at(df_, idx[hit], vv[ok][hit].astype(np.float32))
+
+
+def _shift_max8(a):
+    """8-neighbor max WITHOUT torus wrap (windows are not periodic)."""
+    p = np.pad(a, 1)
+    m = a
+    for dy in (0, 1, 2):
+        for dx in (0, 1, 2):
+            if dy == 1 and dx == 1:
+                continue
+            m = np.maximum(m, p[dy:dy + a.shape[0], dx:dx + a.shape[1]])
+    return m
+
+
+def _stroke_field(net, cx, cy, span, size, planet_size, seed):
+    """Render the vector network for window (cx,cy,span) at size².
+    Returns (alpha, disc, carve):
+      alpha  stroke coverage in [0,1] (already faded for sub-pixel widths)
+      disc   discharge (planet cells) under the stroke, for gating/color
+      carve  valley depth to SUBTRACT from the window's elevation."""
+    alpha = np.zeros((size, size), np.float32)
+    disc = np.zeros((size, size), np.float32)
+    carve = np.zeros((size, size), np.float32)
+    if not net:
+        return alpha, disc, carve
+    inv = size / span
+    left, top = cx - span / 2.0, cy - span / 2.0
+    ppp = inv / planet_size                     # screen px per planet cell
+    # refine until segments are ~0.8px (build segments are ~0.25 planet cells),
+    # so meanders start appearing as soon as a channel spans multiple pixels
+    levels = int(np.clip(np.ceil(np.log2(max(ppp / 3.2, 1e-9))), 0, 6))
+    thr = _net_threshold(planet_size)
+    pad = 14.0 / inv
+    thin_segs = []
+    for bx, by, ba in net:
+        o0 = int(np.ceil(left - pad - bx.max()))
+        o1 = int(np.floor(left + span + pad - bx.min()))
+        p0 = int(np.ceil(top - pad - by.max()))
+        p1 = int(np.floor(top + span + pad - by.min()))
+        if o1 < o0 or p1 < p0:
+            continue
+        rx, ry, ra = _refine_polyline(bx.astype(np.float64),
+                                      by.astype(np.float64),
+                                      ba.astype(np.float64),
+                                      levels, planet_size, seed)
+        w_px = (_width_world(ra, planet_size) * inv).astype(np.float64)
+        dep = np.clip(CARVE_DEPTH * (ra / thr) ** 0.25, 0.0,
+                      3.0 * CARVE_DEPTH)
+        for ox in range(o0, o1 + 1):
+            for oy in range(p0, p1 + 1):
+                X = ((rx + ox - left) * inv)
+                Y = ((ry + oy - top) * inv)
+                sw = np.maximum(w_px[:-1], w_px[1:])
+                sv = np.maximum(ra[:-1], ra[1:])
+                sa = 0.32 + 0.68 * np.clip(sw / 0.9, 0.0, 1.0)
+                sd = np.maximum(dep[:-1], dep[1:])
+                mgn = 2.0 + sw
+                vis = ((np.minimum(X[:-1], X[1:]) < size + mgn) &
+                       (np.maximum(X[:-1], X[1:]) > -mgn) &
+                       (np.minimum(Y[:-1], Y[1:]) < size + mgn) &
+                       (np.maximum(Y[:-1], Y[1:]) > -mgn))
+                if not vis.any():
+                    continue
+                thin_segs.append((X[:-1][vis], Y[:-1][vis],
+                                  X[1:][vis], Y[1:][vis],
+                                  sa[vis], sv[vis], sd[vis], sw[vis]))
+                for k in np.where(vis & (sw > 1.5))[0]:
+                    _stroke_capsule(alpha, disc, X[k], Y[k], X[k + 1],
+                                    Y[k + 1], sw[k] * 0.5, 1.0, sv[k], size)
+    if thin_segs:
+        _splat_thin(alpha, disc, carve, thin_segs, size)
+    # widen the carved centerline into a valley: world-anchored radius
+    # (~1.5 planet cells on screen), exponential cross-profile
+    r = int(np.clip(round(1.5 * ppp), 1, 12))
+    for _ in range(r):
+        carve = np.maximum(carve, 0.78 * _shift_max8(carve))
+    return alpha, disc, carve
+
+
+# ---------------------------------------------------------------------------
+# Window-local drainage: past planet resolution the vector net has no more
+# detail, so run the SAME hydrology (fill -> D8 -> accumulation) on the
+# window's refined, valley-carved elevation. Trunk channels, lakes, the sea
+# and the window border are the drains; anything ≥ BROOK_MIN cells becomes a
+# visible brook. Pixel-snapped viewports (see WorldSlice.view) make this a
+# pure function of the window, so panning slides it rigidly.
+# ---------------------------------------------------------------------------
+
+def _shift_min8(a):
+    p = np.pad(a, 1, constant_values=np.inf)
+    m = np.full_like(a, np.inf)
+    for dy in (0, 1, 2):
+        for dx in (0, 1, 2):
+            if dy == 1 and dx == 1:
+                continue
+            m = np.minimum(m, p[dy:dy + a.shape[0], dx:dx + a.shape[1]])
+    return m
+
+
+def _box3(a):
+    p = np.pad(a, 1, mode="edge")
+    return (p[:-2, :-2] + p[:-2, 1:-1] + p[:-2, 2:] +
+            p[1:-1, :-2] + p[1:-1, 1:-1] + p[1:-1, 2:] +
+            p[2:, :-2] + p[2:, 1:-1] + p[2:, 2:]) / 9.0
+
+
+def _local_streams(elev, moist, trunk_alpha, lake_lv, cx, cy, span, seed,
+                   max_iters=96):
+    size = elev.shape[0]
+    e = elev.astype(np.float64)
+    # de-bias the local D8 exactly like the planet's: a per-cell hash jitter,
+    # keyed by the cell's WORLD coordinate (the viewport is pixel-snapped, so
+    # panning sees the same jitter and the brooks slide rigidly). Amplitude
+    # tracks the LOCAL relief so broad uniform slopes wander too, instead of
+    # locking into parallel 45° runs.
+    q = size / span
+    step = (np.arange(size, dtype=np.float64) / size - 0.5) * span
+    qx = np.round((cx + step) * q).astype(np.int64)[None, :]
+    qy = np.round((cy + step) * q).astype(np.int64)[:, None]
+    gy, gx = np.gradient(e)
+    relief = _box3(_box3(np.abs(gx) + np.abs(gy)))
+    amp = 1.4 * relief + 0.25 * float(relief.mean())
+    e = e + (_corner_hash(seed + 77, 37, qx, qy).astype(np.float64) - 0.5) * amp
+    seeds = (trunk_alpha > 0.30) | (e < SEA_REF) | ((lake_lv > 0) & (e < lake_lv))
+    seeds[0, :] = seeds[-1, :] = seeds[:, 0] = seeds[:, -1] = True
+    f = np.where(seeds, e, np.inf)
+    for _ in range(max_iters):                       # bounded local pit fill
+        nf = np.maximum(e, np.minimum(f, _shift_min8(f) + 1e-7))
+        if np.array_equal(nf, f):
+            break
+        f = nf
+    f = np.where(np.isinf(f), e, f)
+    # local D8 (non-torus)
+    yy, xx = np.divmod(np.arange(size * size), size)
+    parent = np.arange(size * size)
+    best = f.reshape(-1).copy()
+    p = np.pad(f, 1, constant_values=np.inf)
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dy == 0 and dx == 0:
+                continue
+            nval = p[1 + dy:1 + dy + size, 1 + dx:1 + dx + size].reshape(-1)
+            nidx = np.clip(yy + dy, 0, size - 1) * size + np.clip(xx + dx, 0, size - 1)
+            better = nval < best
+            parent = np.where(better, nidx, parent)
+            best = np.where(better, nval, best)
+    node = np.arange(size * size)
+    stop = seeds.reshape(-1)                    # water stops at its drains
+    src = node[(parent != node) & ~stop]
+    dst = parent[src]
+    acc = np.ones(size * size, np.float64)
+    for i in range(max_iters):
+        new = 1.0 + np.bincount(dst, weights=acc[src], minlength=size * size)
+        if i % 8 == 7 and np.array_equal(new, acc):
+            break
+        acc = new
+    acc = acc.reshape(size, size)
+    brook = (acc >= BROOK_MIN) & ~seeds
+    a = np.zeros((size, size), np.float32)
+    a[brook] = np.clip(0.20 + 0.13 * np.log2(acc[brook] / BROOK_MIN + 1.0),
+                       0.0, 0.55)
+    # drainage density follows rainfall: deserts carry few perennial brooks
+    a *= np.clip((moist - 0.12) / 0.45, 0.06, 1.0).astype(np.float32)
+    return a, acc.astype(np.float32)
 
 # ---------------------------------------------------------------------------
 # Time model (M2). t is measured in sim DAYS.
@@ -210,7 +425,7 @@ def smoothstep(x):
     return x * x * (3 - 2 * x)
 
 
-def biome_ids(e, t, m, sea, tide=0.0):
+def biome_ids(e, t, m, sea, tide=0.0, lake_lv=None):
     """Vectorized version of worldgen.classify_biomes -> int16 ids.
 
     `sea` is the GEOGRAPHIC sea level (the slider, no instantaneous tide), so
@@ -218,10 +433,16 @@ def biome_ids(e, t, m, sea, tide=0.0):
     is the tidal amplitude: the beach is the intertidal band it sweeps, so sand
     is drawn as wide as the tide reaches. The instantaneous waterline (which
     covers/uncovers that sand each cycle) is applied as a wet overlay in
-    render(), not here — the sand geography itself stays put."""
+    render(), not here — the sand geography itself stays put.
+
+    `lake_lv` is the standing-water surface from the hydrology (0 = no lake):
+    cells under it are water too, and the refined window elevation decides the
+    shoreline, so lake edges gain fractal detail with zoom like coasts do."""
     lo = sea - tide                      # lowest the water ever falls (geo)
     beach_top = sea + tide + 0.015       # intertidal band + a little dry sand
     water = e < lo
+    if lake_lv is not None:
+        water = water | (e < lake_lv)
     conds = [
         water & (e < lo - 0.12),
         water & (e >= lo - 0.05),
@@ -366,7 +587,7 @@ def _sample_history(ws, t):
 class WorldSlice:
     """Static per-resolution data + grids (full res, or strided for thumbs)."""
 
-    def __init__(self, elev, moist, accum, cloud1, cloud2, civ_count, seed,
+    def __init__(self, elev, moist, hyd, cloud1, cloud2, civ_count, seed,
                  cx=0.5, cy=0.5, span=1.0):
         self.size = elev.shape[0]
         self.seed = int(seed)
@@ -374,15 +595,20 @@ class WorldSlice:
         # viewport on the unit torus: window centered at (cx, cy) of side span.
         # span == 1 -> the whole planet (the default, backward-compatible view).
         self.cx, self.cy, self.span = float(cx), float(cy), float(span)
-        # planet rivers get their physical width too (the largest are a couple
-        # of pixels wide from orbit; threshold streams stay 1 px)
-        accum = _widen_rivers(accum, default_river_threshold(self.size), 1.0)
-        self.elev, self.moist, self.accum = elev, moist, accum
-        # trace the drainage into VECTOR polylines once; zoomed views rasterize
-        # this same world geometry crisply at any depth (no dilation artifacts).
-        self._river_net = _trace_river_network(
-            elev, default_river_threshold(self.size))
-        self._river_net["planet_size"] = self.size
+        self.accum = hyd["accum"]                  # raw planetary accumulation
+        self.lake_level = hyd["lake_level"]
+        self.lake_lv = self.lake_level             # this window == the planet
+        # trace the drainage into the vector TREE once; every view (including
+        # this planet view) rasterizes that same world geometry.
+        self.net = _extract_network(hyd["parent"], self.accum, self.size,
+                                    _net_threshold(self.size), hyd["sea"])
+        alpha, disc, carve = _stroke_field(self.net, self.cx, self.cy,
+                                           self.span, self.size,
+                                           self.planet_size, self.seed)
+        self.river_alpha, self.river_disc = alpha, disc
+        self.brook_alpha = np.zeros_like(alpha)    # local streams: zoomed only
+        self.elev = np.clip(elev - carve, 0.0, 1.0)  # valleys under the rivers
+        self.moist = moist
         self.cloud1, self.cloud2 = cloud1, cloud2
         self._derive_grids()
         self.has_history = False
@@ -450,11 +676,29 @@ class WorldSlice:
         s.cx, s.cy, s.span = float(cx % 1.0), float(cy % 1.0), span
         s.elev = elevation_window(size, self.seed, s.cx, s.cy, span)
         s.moist = moisture_window(size, self.seed, s.cx, s.cy, span)
-        # rivers: rasterize the planet's VECTOR network into this window. It is
-        # the same world-space geometry at every pan/zoom, so it slides rigidly
-        # with the terrain (no shimmer) and draws as smooth strokes whose width
-        # grows with discharge and zoom (no blocky dilation).
-        s.accum = _rasterize_rivers(self._river_net, cx, cy, span, size)
+        # rivers: rasterize the planet's vector TREE into this window — the
+        # same world-space geometry at every pan/zoom (slides rigidly, no
+        # shimmer), refined with deterministic meanders at this zoom, and its
+        # valleys carved into the refined elevation so terrain agrees.
+        alpha, disc, carve = _stroke_field(self.net, cx, cy, span, size,
+                                           self.planet_size, self.seed)
+        s.elev = np.clip(s.elev - carve, 0.0, 1.0)
+        s.river_alpha, s.river_disc = alpha, disc
+        s.lake_lv = self._sample_planet(self.lake_level, cx, cy, span, size)
+        s.net = self.net
+        s.lake_level = self.lake_level
+        s.brook_alpha = np.zeros_like(alpha)
+        s.accum = disc
+        if span <= 0.14:
+            # deep zoom: the planet-res drainage has run out of detail, so run
+            # REAL local drainage on the refined, carved window elevation. The
+            # carved trunks / lakes / sea are the drains it empties into.
+            s.brook_alpha, acc_local = _local_streams(
+                s.elev, s.moist, alpha, s.lake_lv, cx, cy, span, self.seed)
+            # flow layer: lift local cell counts so a just-visible brook reads
+            # like the smallest vector river (display scaling only)
+            lift = _net_threshold(self.planet_size) / BROOK_MIN
+            s.accum = np.maximum(disc, acc_local * lift)
         s.cloud1 = _cloud_sheet(self.seed + 4001, s.cx, s.cy, span, size, 4)
         s.cloud2 = _cloud_sheet(self.seed + 8009, s.cx, s.cy, span, size, 3)
         s.log_norm = self.log_norm             # planet-fixed flow normalization
@@ -631,6 +875,13 @@ class WorldSlice:
             else:
                 setattr(s, k, v)
         s.size = s.elev.shape[0]
+        # striding a 1px stroke field would leave dotted rivers; re-rasterize
+        # the vector network at the thumbnail's own resolution instead
+        if getattr(self, "net", None):
+            a, d, _ = _stroke_field(self.net, self.cx, self.cy, self.span,
+                                    s.size, self.planet_size, self.seed)
+            s.river_alpha, s.river_disc = a, d
+            s.brook_alpha = np.zeros_like(a)
         return s
 
 
@@ -765,13 +1016,13 @@ class EcoSim:
 
 
 def build_world(seed, size, civ_count=3):
-    """The heavy, seed-only part: fields, D8 flow, cloud sheets, M3 history."""
+    """The heavy, seed-only part: fields, hydrology, cloud sheets, M3 history."""
     elev = elevation_field(size, seed).astype(np.float32)
     moist = moisture_field(size, seed).astype(np.float32)
-    _, accum = compute_rivers(elev, 0.5)     # accumulation is sea-level-free
+    hyd = compute_hydrology(elev, int(seed))   # fill -> D8 -> accum -> lakes
     cloud1 = _cloud_sheet(seed + 4001, 0.5, 0.5, 1.0, size, 4)
     cloud2 = _cloud_sheet(seed + 8009, 0.5, 0.5, 1.0, size, 3)
-    ws = WorldSlice(elev, moist, accum.astype(np.float32),
+    ws = WorldSlice(elev, moist, hyd,
                     cloud1, cloud2, int(civ_count), int(seed))
     ws.eco = EcoSim(ws, int(seed))           # stateful vitality sim (M4)
     return ws
@@ -825,10 +1076,14 @@ def state(ws, t, sea_level, river_thr, season_amp, tide_amp, day_night):
         "tide_amp": tide_amp, "day_night": day_night,
         "sea_eff": sea_eff, "season_off": season_off, "sun_x": sun_x,
         "e": e, "land": e >= sea_eff, "tf": tf,
-        "biome_id": biome_ids(e, tf, ws.moist, sea_level, tide_amp),
+        "biome_id": biome_ids(e, tf, ws.moist, sea_level, tide_amp,
+                              getattr(ws, "lake_lv", None)),
         "veg": flora_field(ws, tf, sea_eff),
         "moist": ws.moist, "log_accum": ws.log_accum,
     }
+    lake_lv = getattr(ws, "lake_lv", None)
+    if lake_lv is not None:
+        st["veg"] = np.where(e < lake_lv, 0.0, st["veg"]).astype(np.float32)
     # the stateful ecosystem's DEVIATION from the seekable baseline: health in
     # [0,1] (1 = undamaged) plus the burn/salt scar. The biotic layers below are
     # baseline x health, so an undisturbed world matches the pure fields and a
@@ -940,8 +1195,22 @@ def colorize(st, layer):
         img[wet] = (70, 130, 180)
         if layer == "composite":
             img[land] *= ws.shade[land, None]
-            rivers = (ws.accum > river_thr) & land
-            img[rivers] = (70, 130, 200)
+            ra = getattr(ws, "river_alpha", None)
+            if ra is not None:
+                # the slider fades tributaries below the threshold instead of
+                # hard-cutting them, so the dendritic tree stays readable
+                gate = np.clip(ws.river_disc / max(river_thr, 1.0), 0, 1) ** 0.6
+                a = ra * gate
+                ba = getattr(ws, "brook_alpha", None)
+                if ba is not None:
+                    a = np.maximum(a, ba)
+                lake_lv = getattr(ws, "lake_lv", 0.0)
+                a = np.where(land & ~(e < lake_lv), a, 0.0)[..., None]
+                depth = np.clip(np.log1p(ws.river_disc) / ws.log_norm,
+                                0, 1)[..., None]
+                wat = (np.array([86, 148, 205], np.float32) * (1 - depth)
+                       + np.array([30, 80, 150], np.float32) * depth)
+                img = img * (1 - a) + wat * a
             l = daylight_row(ws.xn, sun_x, day_night)[None, :]
             img[..., 0] *= l
             img[..., 1] *= l * 0.96 + 0.04

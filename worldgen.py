@@ -151,40 +151,134 @@ BIOME_COLORS = {
 }
 
 # ---------------------------------------------------------------------------
-# WATER — D8 FLOW.  Deterministic hydrology: flow direction from
-#           each cell to its lowest neighbor, then flow ACCUMULATION.
-#           High accumulation on land = a river. Wraps on the torus.
+# WATER — planetary hydrology. Real drainage, in four deterministic steps:
+#
+#   1. JITTER    a tiny per-cell hash offset breaks D8's 8-direction grid
+#                bias (without it, steepest descent on smooth noise locks
+#                onto long straight 45° runs — the "diagonal rivers" bug).
+#   2. FILL      depression filling (a vectorized priority-flood): every
+#                pit is raised to its spill level with an epsilon gradient
+#                toward the ocean, so EVERY land cell provably drains to
+#                the sea. Cells raised above the original terrain are
+#                standing water — lakes, with outlets, for free.
+#   3. D8        steepest-descent flow direction on the filled surface.
+#   4. ACCUM     flow accumulation as a vectorized fixed-point iteration
+#                (acc = 1 + inflow, repeated until stable) — no Python
+#                per-cell loop, so it stays fast under Pyodide too.
 # ---------------------------------------------------------------------------
 
-def compute_rivers(elevation, sea_level, river_threshold=350):
-    size = elevation.shape[0]
-    e = elevation
-    # 8 neighbor offsets
-    offsets = [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]
+SEA_REF = 0.42        # geographic reference sea level the drainage is built for
 
-    # For each cell, find lowest neighbor (wraparound = torus)
-    flat = e.reshape(-1)
-    n = size * size
-    lowest = np.arange(n)                       # default: drains to self (sink)
-    lowest_val = flat.copy()
+_D8 = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
+
+
+def _flow_jitter(seed, size):
+    """Deterministic per-cell offset in [-0.5, 0.5) used to de-bias D8."""
+    iy, ix = np.mgrid[0:size, 0:size]
+    return _corner_hash(seed ^ 0xA5F00D, 31, ix, iy).astype(np.float64) - 0.5
+
+
+def _roll_min8(f):
+    m = None
+    for dy, dx in _D8:
+        r = np.roll(np.roll(f, dy, 0), dx, 1)
+        m = r if m is None else np.minimum(m, r)
+    return m
+
+
+def fill_depressions(elev, water, eps=1e-6, max_iters=None):
+    """Raise every closed depression to its spill level (+eps per step toward
+    the ocean), by iterative morphological reconstruction: start from the
+    ocean seeds and repeatedly relax  f = max(elev, min(f, neighbors+eps)).
+    Equivalent to priority-flood, but each pass is 8 vectorized rolls instead
+    of a per-cell heap, which matters in the browser. Torus-aware."""
+    e = elev.astype(np.float64)
+    f = np.where(water, e, np.inf)
+    if not water.any():                       # waterworldless seed: lowest cell
+        f.flat[int(np.argmin(e))] = float(e.min())
+    if max_iters is None:
+        max_iters = 8 * e.shape[0]
+    for _ in range(max_iters):
+        nf = np.maximum(e, np.minimum(f, _roll_min8(f) + eps))
+        if np.array_equal(nf, f):
+            break
+        f = nf
+    return f
+
+
+def d8_parents(f):
+    """Flat index of each cell's steepest-descent neighbor (self = sink)."""
+    size = f.shape[0]
+    flat = f.reshape(-1)
+    n = flat.size
     yy, xx = np.divmod(np.arange(n), size)
-    for dy, dx in offsets:
-        ny = (yy + dy) % size
-        nx = (xx + dx) % size
-        nidx = ny * size + nx
-        nval = flat[nidx]                       # elevation AT neighbor (y+dy, x+dx)
-        better = nval < lowest_val
-        lowest = np.where(better, nidx, lowest)
-        lowest_val = np.where(better, nval, lowest_val)
+    parent = np.arange(n)
+    best = flat.copy()
+    for dy, dx in _D8:
+        nidx = ((yy + dy) % size) * size + ((xx + dx) % size)
+        nval = flat[nidx]
+        better = nval < best
+        parent = np.where(better, nidx, parent)
+        best = np.where(better, nval, best)
+    return parent
 
-    # Flow accumulation: process cells from highest to lowest, push water down.
-    order = np.argsort(-flat)                    # descending elevation
-    accum = np.ones(n, dtype=np.int32)
-    for idx in order:
-        tgt = lowest[idx]
-        if tgt != idx:
-            accum[tgt] += accum[idx]
 
-    accum = accum.reshape(size, size)
-    rivers = (accum > river_threshold) & (e >= sea_level)
-    return rivers, accum
+def flow_accumulation(parent, max_iters=None):
+    """Cells drained through each cell (incl. itself). Fixed-point iteration
+    acc = 1 + Σ children's acc; converges in (longest flow path) passes, each
+    pass one vectorized bincount."""
+    n = parent.size
+    node = np.arange(n)
+    src = node[parent != node]
+    dst = parent[src]
+    acc = np.ones(n, np.float64)
+    if max_iters is None:
+        max_iters = 8 * int(np.sqrt(n))
+    for _ in range(max_iters):
+        new = 1.0 + np.bincount(dst, weights=acc[src], minlength=n)
+        if np.array_equal(new, acc):
+            break
+        acc = new
+    return acc
+
+
+def _dilate_max8(a):
+    m = a
+    for dy, dx in _D8:
+        m = np.maximum(m, np.roll(np.roll(a, dy, 0), dx, 1))
+    return m
+
+
+def compute_hydrology(elev, seed, sea_level=SEA_REF):
+    """Full planetary drainage for a heightfield. Returns a dict:
+        accum      (size,size) float32  cells drained through each cell
+        parent     (n,)        int64    D8 downstream flat index (self=sink)
+        lake_level (size,size) float32  standing-water surface (0 = no lake)
+        sea        (size,size) bool     below reference sea level
+    The drainage is anchored to `sea_level` (the geographic reference); the
+    UI's sea-level slider only moves the rendered waterline, as before."""
+    size = elev.shape[0]
+    # jitter amplitude ~ the finest noise octave's cell-scale relief: strong
+    # enough that steepest descent wanders and merges (dendritic) instead of
+    # locking into parallel 45° runs on broad smooth slopes
+    jit_amp = 0.5 * 0.5 ** np.floor(np.log2(size / 3.0))
+    ej = elev.astype(np.float64) + _flow_jitter(seed, size) * jit_amp
+    water = ej < sea_level
+    filled = fill_depressions(ej, water)
+    parent = d8_parents(filled)
+    accum = flow_accumulation(parent).reshape(size, size).astype(np.float32)
+    depth = filled - ej
+    lake = (~water) & (depth > 2.5 * jit_amp)      # deeper than the jitter floor
+    lake_level = np.where(lake, filled, 0.0).astype(np.float32)
+    # dilate one cell so the refined-elevation shoreline test (e < level) can
+    # decide the water's edge inside neighboring cells too, not the raster grid
+    lake_level = _dilate_max8(lake_level)
+    return {"accum": accum, "parent": parent,
+            "lake_level": lake_level, "sea": water}
+
+
+def compute_rivers(elevation, sea_level, river_threshold=350):
+    """Back-compat wrapper: boolean river mask + accumulation field."""
+    h = compute_hydrology(elevation, 0, sea_level)
+    rivers = (h["accum"] > river_threshold) & (elevation >= sea_level)
+    return rivers, h["accum"]
