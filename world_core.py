@@ -39,6 +39,46 @@ def _cloud_sheet(seed, cx, cy, span, size, base_period):
     return ((f - f.min()) / (np.ptp(f) or 1.0)).astype(np.float32)
 
 
+def _trace_river_network(elev, thr, sea=0.42):
+    """Trace the D8 drainage into VECTOR polylines: a list of world-space line
+    segments (x0,y0)->(x1,y1) in [0,1] coords, each carrying its discharge.
+    Rivers are 1-D curves, so store them as curves — then any zoom rasterizes
+    the same geometry crisply, with no blocky dilation and no shimmer."""
+    S = elev.shape[0]
+    flat = elev.reshape(-1)
+    n = S * S
+    yy, xx = np.divmod(np.arange(n), S)
+    lowest = np.arange(n)
+    lowest_val = flat.copy()
+    for dy, dx in ((-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)):
+        nidx = ((yy + dy) % S) * S + ((xx + dx) % S)
+        nval = flat[nidx]
+        better = nval < lowest_val
+        lowest = np.where(better, nidx, lowest)
+        lowest_val = np.where(better, nval, lowest_val)
+    accum = np.ones(n, dtype=np.float64)
+    for idx in np.argsort(-flat):
+        t = lowest[idx]
+        if t != idx:
+            accum[t] += accum[idx]
+    src = np.where((accum > thr) & (flat >= sea))[0]              # channel cells
+    dst = lowest[src]
+    sy, sx = np.divmod(src, S)
+    dy2, dx2 = np.divmod(dst, S)
+    # unwrap the torus: keep the endpoint delta in [-0.5,0.5] so a segment never
+    # streaks across the whole map at the seam
+    ddx = (((dx2 - sx) + S // 2) % S - S // 2)
+    ddy = (((dy2 - sy) + S // 2) % S - S // 2)
+    keep = ~((src == dst))
+    x0 = (sx[keep] + 0.5) / S
+    y0 = (sy[keep] + 0.5) / S
+    x1 = x0 + ddx[keep] / S
+    y1 = y0 + ddy[keep] / S
+    return {"x0": x0.astype(np.float32), "y0": y0.astype(np.float32),
+            "x1": x1.astype(np.float32), "y1": y1.astype(np.float32),
+            "disc": accum[src][keep].astype(np.float32), "thr": float(thr)}
+
+
 def _widen_rivers(accum, thr_ref, px_per_planet_px, max_r=12):
     """Give the 1-px D8 skeleton a PHYSICAL width. Channel width follows
     hydraulic geometry (width ~ sqrt(discharge)): a threshold river is ~1
@@ -64,6 +104,60 @@ def _widen_rivers(accum, thr_ref, px_per_planet_px, max_r=12):
             rad = np.where(take, rn, rad)
             val = np.where(take, vn, val)
     return np.maximum(val, accum.astype(np.float32))
+
+
+def _rasterize_rivers(net, cx, cy, span, size):
+    """Draw the vector river network into a (size,size) discharge field for the
+    window (cx,cy,span). Each segment is a capsule (thick line) whose width
+    follows hydraulic geometry (~sqrt(discharge)) and grows with zoom, so rivers
+    are smooth curves at any depth. Only segments overlapping the window are
+    drawn; the torus is handled by testing the 9 wrapped copies."""
+    out = np.zeros((size, size), np.float32)
+    if net is None or len(net["disc"]) == 0:
+        return out
+    inv = size / span                          # world -> pixel scale
+    left, top = cx - span / 2, cy - span / 2
+    thr = net["thr"]
+    # world-space half-width: ~0.5 planet-px at threshold, wider with discharge
+    hw_world = (0.6 / net.get("planet_size", 256)) * np.sqrt(
+        np.maximum(net["disc"] / thr, 1.0))
+    for ox in (-1.0, 0.0, 1.0):
+        X0 = (net["x0"] + ox - left) * inv
+        X1 = (net["x1"] + ox - left) * inv
+        for oy in (-1.0, 0.0, 1.0):
+            Y0 = (net["y0"] + oy - top) * inv
+            Y1 = (net["y1"] + oy - top) * inv
+            rad = np.maximum(hw_world * inv, 0.6)      # px
+            lo_x = np.minimum(X0, X1) - rad; hi_x = np.maximum(X0, X1) + rad
+            lo_y = np.minimum(Y0, Y1) - rad; hi_y = np.maximum(Y0, Y1) + rad
+            vis = np.where((hi_x >= 0) & (lo_x < size) &
+                           (hi_y >= 0) & (lo_y < size))[0]
+            for k in vis:
+                _draw_capsule(out, X0[k], Y0[k], X1[k], Y1[k],
+                              rad[k], net["disc"][k], size)
+    return out
+
+
+def _draw_capsule(out, x0, y0, x1, y1, rad, value, size):
+    x_lo = max(0, int(np.floor(min(x0, x1) - rad)))
+    x_hi = min(size, int(np.ceil(max(x0, x1) + rad)) + 1)
+    y_lo = max(0, int(np.floor(min(y0, y1) - rad)))
+    y_hi = min(size, int(np.ceil(max(y0, y1) + rad)) + 1)
+    if x_hi <= x_lo or y_hi <= y_lo:
+        return
+    ys = np.arange(y_lo, y_hi)[:, None].astype(np.float32)
+    xs = np.arange(x_lo, x_hi)[None, :].astype(np.float32)
+    dx, dy = x1 - x0, y1 - y0
+    ll = dx * dx + dy * dy
+    if ll < 1e-9:
+        t = np.zeros((1, 1), np.float32)
+    else:
+        t = np.clip(((xs - x0) * dx + (ys - y0) * dy) / ll, 0.0, 1.0)
+    px, py = x0 + t * dx, y0 + t * dy
+    dist = np.sqrt((xs - px) ** 2 + (ys - py) ** 2)
+    cover = np.clip(rad - dist + 0.5, 0.0, 1.0)      # 1px antialiased edge
+    sub = out[y_lo:y_hi, x_lo:x_hi]
+    np.maximum(sub, value * cover, out=sub)
 
 # ---------------------------------------------------------------------------
 # Time model (M2). t is measured in sim DAYS.
@@ -284,13 +378,11 @@ class WorldSlice:
         # of pixels wide from orbit; threshold streams stay 1 px)
         accum = _widen_rivers(accum, default_river_threshold(self.size), 1.0)
         self.elev, self.moist, self.accum = elev, moist, accum
-        # magnitude source for zoomed drainage: max-dilated so a 1-px planet
-        # channel cannot fall between the samples of a coarser zoom lattice
-        q = accum.astype(np.float32).copy()
-        for _ in range(max(2, int(np.ceil(self.size / 128 * 1.5)))):
-            for ax, sh in ((0, 1), (0, -1), (1, 1), (1, -1)):
-                q = np.maximum(q, np.roll(q, sh, ax))
-        self._q_src = q
+        # trace the drainage into VECTOR polylines once; zoomed views rasterize
+        # this same world geometry crisply at any depth (no dilation artifacts).
+        self._river_net = _trace_river_network(
+            elev, default_river_threshold(self.size))
+        self._river_net["planet_size"] = self.size
         self.cloud1, self.cloud2 = cloud1, cloud2
         self._derive_grids()
         self.has_history = False
@@ -358,38 +450,11 @@ class WorldSlice:
         s.cx, s.cy, s.span = float(cx % 1.0), float(cy % 1.0), span
         s.elev = elevation_window(size, self.seed, s.cx, s.cy, span)
         s.moist = moisture_window(size, self.seed, s.cx, s.cy, span)
-        # rivers under zoom — drainage lives on a WORLD-FIXED lattice pyramid,
-        # not on the screen's sample grid. Lattice cells sit at multiples of
-        # 1/NL where NL depends only on the zoom OCTAVE, so panning and zooming
-        # change WHICH cells are visible but never where they sit: the network
-        # is anchored to the world and cannot shimmer as the window moves.
-        # Crossing an octave boundary doubles the lattice (finer tributaries
-        # resolve); the main channels persist because the terrain is shared.
-        # PATH comes from local D8 on the lattice (walled: no torus wrap across
-        # a sub-window), MAGNITUDE from the planet's accumulation (upstream
-        # volume, max-dilated at build so thin channels can't fall between
-        # lattice samples). Nothing is normalized by window content.
-        L = max(0, int(np.floor(np.log2(zoom))))
-        NL = 128 << L                              # lattice cells across world
-        j0 = int(np.floor((cx - span / 2) * NL)) - 1
-        i0 = int(np.floor((cy - span / 2) * NL)) - 1
-        n = int(np.ceil(span * NL)) + 3            # visible cells + margin
-        lat_cx = ((j0 + n * 0.5) / NL) % 1.0
-        lat_cy = ((i0 + n * 0.5) / NL) % 1.0
-        eL = elevation_window(n, self.seed, lat_cx, lat_cy, n / NL)
-        eL[0, :] = eL[-1, :] = eL[:, 0] = eL[:, -1] = 2.0
-        _, localL = compute_rivers(eL, 0.5)
-        trunk = np.clip(localL.astype(np.float32) / (n * n) / 0.02, 0, 1)
-        QL = self._sample_planet(self._q_src, lat_cx, lat_cy, n / NL, n)
-        accL = _widen_rivers(trunk * QL.astype(np.float32),
-                             default_river_threshold(self.size),
-                             NL / self.size, max_r=6)
-        # nearest-map the visible lattice cells onto the screen window
-        stepw = (np.arange(size, dtype=np.float64) / size - 0.5) * span
-        wj = np.clip(np.floor((cx + stepw) * NL).astype(np.int64) - j0, 0, n - 1)
-        wi = np.clip(np.floor((cy + stepw) * NL).astype(np.int64) - i0, 0, n - 1)
-        acc = accL[np.ix_(wi, wj)]
-        s.accum = (0.5 * acc + 0.5 * _neigh4(acc)).astype(np.float32)  # soft banks
+        # rivers: rasterize the planet's VECTOR network into this window. It is
+        # the same world-space geometry at every pan/zoom, so it slides rigidly
+        # with the terrain (no shimmer) and draws as smooth strokes whose width
+        # grows with discharge and zoom (no blocky dilation).
+        s.accum = _rasterize_rivers(self._river_net, cx, cy, span, size)
         s.cloud1 = _cloud_sheet(self.seed + 4001, s.cx, s.cy, span, size, 4)
         s.cloud2 = _cloud_sheet(self.seed + 8009, s.cx, s.cy, span, size, 3)
         s.log_norm = self.log_norm             # planet-fixed flow normalization
