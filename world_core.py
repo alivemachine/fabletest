@@ -28,8 +28,15 @@ in the browser via Pyodide). No matplotlib, no PIL, no I/O — numpy in, RGB out
 import numpy as np
 
 from worldgen import (elevation_field, moisture_field, compute_rivers,
-                      fractal_noise, elevation_window, moisture_window,
-                      noise_window, BIOME_COLORS)
+                      elevation_window, moisture_window, noise_window,
+                      BIOME_COLORS)
+
+
+def _cloud_sheet(seed, cx, cy, span, size, base_period):
+    """A [0,1]-normalized noise sheet for cloud cover, windowable like the
+    terrain fields (so clouds stay coherent under pan/zoom)."""
+    f = noise_window(seed, cx, cy, span, size, base_period=base_period)
+    return ((f - f.min()) / (np.ptp(f) or 1.0)).astype(np.float32)
 
 # ---------------------------------------------------------------------------
 # Time model (M2). t is measured in sim DAYS.
@@ -59,7 +66,6 @@ LAYERS = [
     ("fauna", "Fauna"),
     ("civ", "Civilization"),
     ("history", "History"),
-    ("vitality", "Vitality"),
     ("light", "Daylight"),
 ]
 
@@ -288,12 +294,8 @@ class WorldSlice:
         # global D8 drainage can't be windowed yet (needs upstream boundary
         # conditions) -> no rivers inside a zoom for now; fields still resolve.
         s.accum = np.zeros_like(s.elev)
-        c1 = noise_window(self.seed + 4001, cx, cy, span, size, base_period=4)
-        c2 = noise_window(self.seed + 8009, cx, cy, span, size, base_period=3)
-        rng = np.ptp(c1) or 1.0
-        s.cloud1 = ((c1 - c1.min()) / rng).astype(np.float32)
-        rng2 = np.ptp(c2) or 1.0
-        s.cloud2 = ((c2 - c2.min()) / rng2).astype(np.float32)
+        s.cloud1 = _cloud_sheet(self.seed + 4001, cx, cy, span, size, 4)
+        s.cloud2 = _cloud_sheet(self.seed + 8009, cx, cy, span, size, 3)
         s._derive_grids()
         # share the pre-integrated history + the live eco sim (both global, not
         # window-local) by reference, so zooming never rebuilds or forks them
@@ -500,16 +502,20 @@ class EcoSim:
         return warmth, wet
 
     def reset(self):
-        """Back to the pristine, climax-state world (day 0)."""
+        """Back to the pristine, climax-state world (day 0): full soil, and
+        vegetation/fauna at the climate's potential, so health == 1 everywhere
+        and the flora/fauna layers look exactly like their pure baseline until
+        something happens to them."""
         self.sea_ref = float(self.sea0)
         self.t = 0.0
-        land = self.e >= self.sea0
+        land = (self.e >= self.sea0).astype(np.float32)
         warmth, wet = self._climate(0.0)
-        cap = warmth * (0.30 + 0.70 * wet) * land
-        self.fert = (np.clip(0.35 + 0.65 * cap, 0.05, 1) * land).astype(np.float32)
-        self.veg = (cap * 0.9).astype(np.float32)
-        self.fauna = (cap * 0.5).astype(np.float32)
-        self.civ = ((cap > 0.55) * 0.35).astype(np.float32)   # some seed settlements
+        clim = warmth * (0.30 + 0.70 * wet) * land          # climatic potential
+        self.clim = clim.astype(np.float32)
+        self.fert = land.copy()                             # climax soil = 1 on land
+        self.veg = clim.astype(np.float32)                  # at full potential
+        self.fauna = (0.6 * clim).astype(np.float32)
+        self.civ = ((clim > 0.55) * 0.35).astype(np.float32)   # some seed settlements
         self.scorch = np.zeros((self.H, self.H), np.float32)
 
     def step(self, dt_days, sea_level, season_off):
@@ -528,7 +534,9 @@ class EcoSim:
         under = e < sea_level
         land = ~under
         drowned = under & (e >= self.sea_ref)          # land the sea just took
-        cap = warmth * (0.30 + 0.70 * wet) * self.fert * (1 - self.scorch) * land
+        clim = warmth * (0.30 + 0.70 * wet) * land       # climatic potential
+        self.clim = clim.astype(np.float32)              # (for health readout)
+        cap = clim * self.fert * (1 - self.scorch)
         dry = np.clip(warmth - 0.75 * wet - 0.05, 0, 1)  # hot & dry -> fire/desert
 
         veg, fauna, civ, fert, scorch = (self.veg, self.fauna, self.civ,
@@ -590,7 +598,7 @@ class EcoSim:
         """Upsample the coarse state to the render window (honours pan/zoom)."""
         up = _window_indices(ws)
         return {k: getattr(self, k)[up] for k in
-                ("veg", "fauna", "fert", "civ", "scorch")}
+                ("veg", "fauna", "fert", "civ", "scorch", "clim")}
 
 
 def build_world(seed, size, civ_count=3):
@@ -598,8 +606,8 @@ def build_world(seed, size, civ_count=3):
     elev = elevation_field(size, seed).astype(np.float32)
     moist = moisture_field(size, seed).astype(np.float32)
     _, accum = compute_rivers(elev, 0.5)     # accumulation is sea-level-free
-    cloud1 = fractal_noise(size, seed + 4001, base_period=4, octaves=5).astype(np.float32)
-    cloud2 = fractal_noise(size, seed + 8009, base_period=3, octaves=4).astype(np.float32)
+    cloud1 = _cloud_sheet(seed + 4001, 0.5, 0.5, 1.0, size, 4)
+    cloud2 = _cloud_sheet(seed + 8009, 0.5, 0.5, 1.0, size, 3)
     ws = WorldSlice(elev, moist, accum.astype(np.float32),
                     cloud1, cloud2, int(civ_count), int(seed))
     ws.eco = EcoSim(ws, int(seed))           # stateful vitality sim (M4)
@@ -649,7 +657,7 @@ def state(ws, t, sea_level, river_thr, season_amp, tide_amp, day_night):
     sea_eff, season_off, sun_x = frame_params(t, sea_level, tide_amp, season_amp)
     e = ws.elev
     tf = temperature_t(e, ws.lat, ws.lat_signed, sea_eff, season_off)
-    return {
+    st = {
         "ws": ws, "t": t, "sea_level": sea_level, "river_thr": river_thr,
         "tide_amp": tide_amp, "day_night": day_night,
         "sea_eff": sea_eff, "season_off": season_off, "sun_x": sun_x,
@@ -658,6 +666,23 @@ def state(ws, t, sea_level, river_thr, season_amp, tide_amp, day_night):
         "veg": flora_field(ws, tf, sea_eff),
         "moist": ws.moist, "log_accum": ws.log_accum,
     }
+    # the stateful ecosystem's DEVIATION from the seekable baseline: health in
+    # [0,1] (1 = undamaged) plus the burn/salt scar. The biotic layers below are
+    # baseline x health, so an undisturbed world matches the pure fields and a
+    # flooded/burned one carries its scars. (Absent eco -> health 1, no scar.)
+    eco = getattr(ws, "eco", None)
+    if eco is not None:
+        es = eco.sample(ws)
+        clim = es["clim"] + 1e-3
+        st["veg_health"] = np.clip(es["veg"] / clim, 0, 1)
+        st["fauna_health"] = np.clip(es["fauna"] / (0.6 * clim), 0, 1)
+        st["civ_health"] = np.clip(es["civ"], 0, 1)
+        st["scorch"] = np.clip(es["scorch"], 0, 1)
+    else:
+        one = np.ones_like(e)
+        st["veg_health"] = st["fauna_health"] = one
+        st["civ_health"] = st["scorch"] = np.zeros_like(e)
+    return st
 
 
 def colorize(st, layer):
@@ -692,10 +717,17 @@ def colorize(st, layer):
         l = daylight_row(ws.xn, sun_x, day_night)[None, :, None]
         img *= 0.35 + 0.65 * l
     elif layer == "flora":
-        img = color_ramp(st["veg"], *FLORA_RAMP)
+        # LIVING vegetation = climatic baseline x ecosystem health, then scars.
+        veg = st["veg"] * st["veg_health"]
+        img = color_ramp(veg, *FLORA_RAMP)
+        sc = st["scorch"][..., None]
+        img = img * (1 - sc) + np.array([70, 54, 44], np.float32) * sc   # burn/salt scar
         img[~land] = (26, 42, 74)
     elif layer == "fauna":
+        # LIVING game = baseline biomass x ecosystem health, minus settlement pressure.
+        fh = st["fauna_health"]
         herb, pred = fauna_field(st["veg"], t)
+        herb, pred = herb * fh, pred * fh
         civ_p, _ = civ_population(ws, t)
         herb = herb * (1 - 0.7 * np.clip(civ_p, 0, 1))     # settlers hunt/clear game
         img = np.empty(e.shape + (3,), np.float32)
@@ -704,13 +736,17 @@ def colorize(st, layer):
         img[..., 2] = 45 + 30 * np.clip(herb, 0, 1)
         img[~land] = (20, 32, 58)
     elif layer == "civ":
+        # territory/population from the M3 history, DIMMED where the living
+        # ecosystem has collapsed (famine/flood) and charred where scorched.
         img = _terrain_gray(st["biome_id"])
         pop, fid = civ_population(ws, t)
         has = fid >= 0
         if has.any():
             tint = CIV_COLORS[np.clip(fid, 0, len(CIV_COLORS) - 1)]
-            a = np.clip(pop * 1.4, 0, 0.9)[..., None]
+            a = (np.clip(pop * 1.4, 0, 0.9) * (0.3 + 0.7 * st["civ_health"]))[..., None]
             img = np.where(has[..., None], img * (1 - a) + tint * a, img)
+        sc = st["scorch"][..., None]
+        img = img * (1 - sc) + np.array([54, 40, 34], np.float32) * sc
         _city_dots(ws, img, t)
     elif layer == "history":
         # the chronicle: territory + where the world is thriving / at war / starving
@@ -725,30 +761,6 @@ def colorize(st, layer):
         img = img * (1 - war) + np.array([235, 60, 45], np.float32) * war
         fam = np.clip(stress * land * (0.4 + pop), 0, 1)[..., None]    # violet famine
         img = img * (1 - fam) + np.array([150, 70, 200], np.float32) * fam
-        _city_dots(ws, img, t)
-    elif layer == "vitality":
-        # the LIVING world: the stateful ecosystem, where events leave scars.
-        img = _terrain_gray(st["biome_id"])
-        eco = getattr(ws, "eco", None)
-        if eco is not None:
-            s = eco.sample(ws)
-            veg = np.clip(s["veg"] / 0.55, 0, 1)               # healthy veg -> full green
-            scorch = np.clip(s["scorch"], 0, 1)[..., None]
-            fert = np.clip(s["fert"], 0, 1)[..., None]
-            civ = np.clip((s["civ"] - 0.35) / 0.65, 0, 1)[..., None]
-            # barren land tints toward tan (drier/poorer soil = paler)
-            bare = ((1 - veg))[..., None]
-            img = img * (1 - 0.45 * bare) + np.array([168, 140, 96], np.float32) * (0.45 * bare) * (0.5 + 0.5 * fert)
-            # vegetation green is the dominant signal
-            g = (0.9 * veg)[..., None]
-            img = img * (1 - g) + np.array([48, 152, 56], np.float32) * g
-            # burn/salt scars: charred ground
-            img = img * (1 - scorch) + np.array([54, 40, 34], np.float32) * scorch
-            # civilization: a restrained gold accent only where it is dense
-            img = img * (1 - 0.7 * civ) + np.array([240, 222, 128], np.float32) * (0.7 * civ)
-        # the instantaneous waterline covers whatever is currently below it
-        under = (e < sea_eff)[..., None]
-        img = img * (1 - under) + np.array([40, 80, 130], np.float32) * under
         _city_dots(ws, img, t)
     elif layer == "light":
         l = daylight_row(ws.xn, sun_x, day_night)[None, :]

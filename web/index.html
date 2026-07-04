@@ -163,7 +163,7 @@ const LAYERS = [
   ["composite","World"], ["elevation","Elevation"], ["temperature","Temperature"],
   ["moisture","Moisture"], ["clouds","Clouds"], ["flow","Flow"], ["biome","Biomes"],
   ["flora","Flora"], ["fauna","Fauna"], ["civ","Civilization"], ["history","History"],
-  ["vitality","Vitality"], ["light","Daylight"],
+  ["light","Daylight"],
 ];
 
 const view = document.getElementById("view"), vctx = view.getContext("2d");
@@ -196,7 +196,7 @@ async function boot(){
   await pyodide.loadPackage("numpy");
   busysub.textContent = "fetching world code…";
   for (const f of ["worldgen.py", "world_core.py"]){
-    const src = await (await fetch(f + "?v=3")).text();
+    const src = await (await fetch(f + "?v=4")).text();
     pyodide.FS.writeFile(f, src);
   }
   pyodide.runPython(`

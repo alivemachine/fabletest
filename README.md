@@ -1,14 +1,16 @@
-# World Engine — prototype (M0–M2)
+# World Engine — prototype (M0–M4)
 
 The world is a pure function: `world(seed, x, y, t) → layers`. See `DESIGN.md`
 for the full design. This repo is the Python prototype stage of the roadmap:
 
-- `worldgen.py` — the layer stack itself (M0 fields → biomes, M1 D8 water).
-  Runs standalone: `python3 worldgen.py` writes `world_<seed>.png`.
-- `world_core.py` — the shared render core: the full layer stack (fields →
-  clouds → water → biomes → flora → fauna → civilization), the M2 time layer
-  (day/night, seasons, tides), and per-layer RGB renderers. numpy in, pixels
-  out; no UI, no I/O.
+- `worldgen.py` — the world's **field producers** (data, not pixels): windowed
+  tileable noise → elevation & moisture, and D8 flow → rivers. Pure numbers.
+- `world_core.py` — the shared core. `state(ws, t, …)` computes the world's
+  **per-tile data once** (elevation, temperature, biome ids, vegetation, water,
+  ecosystem health …); `colorize(state, layer)` is a thin RGB skin over it, and
+  `render()` wraps the two. Also holds the M2 time layer, the M3 history CA, and
+  the M4 `EcoSim`. numpy in, data/pixels out; no UI, no I/O. `state()` is the
+  seam a Godot `TileMapLayer` reads directly.
 - `world_viewer.py` — **the desktop layer console** (matplotlib) around the
   core: every layer animating, sliders, PNG-sequence exporter.
 - `web/` — **the same console in the browser** (works on a phone):
@@ -46,8 +48,9 @@ python3 world_viewer.py --seed 7 --size 512   # prettier, heavier rebuilds
 - **World**: seed textbox + `rnd` button, sea level, river threshold. The
   **tide** is a waterline that *sweeps a fixed beach* (the sand is as wide as
   the tidal range and stays put; only the water covering it moves); the
-  **sea-level slider** still moves the whole coast — and, on the Vitality layer,
-  floods or exposes land with lasting ecological consequences.
+  **sea-level slider** still moves the whole coast — and, with the clock running,
+  floods or exposes land with lasting consequences visible in the flora/fauna/civ
+  layers.
 - **Time & climate**: **logarithmic** sim speed (crawl to thousands of days/sec
   — fast-forward centuries), day/night depth, season amplitude (opposite per
   hemisphere; crank it for hot summers that spark fires/drought), tide amplitude.
@@ -68,11 +71,10 @@ Time model: 1 sim day = one day/night cycle, year = 96 days, tide ≈ 12.5 h.
 | Clouds | two noise sheets advected by wind, gated by moisture, piled on windward slopes | advected noise |
 | Flow | D8 flow accumulation → rivers | flow algorithm |
 | Biomes | lookup on (elevation, temperature, moisture) | table |
-| Flora | vegetation density = warmth × water, pulsing with seasons | field |
-| Fauna | herbivore/predator biomass on a Lotka–Volterra limit cycle (a resource/game map) | population CA (far form) |
-| Civilization | 1–6 factions: territory + population from the M3 history, tinted by faction; each depletes local game | history CA (M3) |
+| Flora | **living** vegetation = climatic baseline × ecosystem health, with burn/salt scars | field ⊕ M4 Δ |
+| Fauna | **living** herbivore/predator biomass (Lotka–Volterra) × ecosystem health — the game map | population CA ⊕ M4 Δ |
+| Civilization | 1–6 factions from the M3 history, **dimmed where the ecosystem has collapsed** and charred where scorched | history CA ⊕ M4 Δ |
 | History | the chronicle: same territory with war-fronts (red) and famine/pest zones (violet) drawn on | history CA (M3) |
-| Vitality | the **living, stateful** world: soil fertility, vegetation, fauna, civilisation and burn/salt scars that integrate forward and *remember* — floods drown, droughts burn, and recovery is slow | ecosystem sim (M4, stateful) |
 | Daylight | the day/night terminator | sin(t) |
 
 ### M3 — the history simulation
@@ -118,12 +120,15 @@ propagated through the food-web graph* — is the M4 Resolver. It is stateful
 (not seekable) by nature, so it is deliberately a separate build, not part of
 this pure-function core.
 
-### Vitality — the living, stateful world (first M4 layer)
+### The living ecosystem (M4 `EcoSim`, folded into flora/fauna/civ)
 
-Every layer above is a pure function of `t`; **Vitality is not.** It is a coarse
-ecosystem that *integrates forward as the clock runs and has memory*, so events
-leave lasting consequences instead of looping. Per cell it tracks **soil
-fertility, vegetation, fauna, civilisation, and burn/salt scars**:
+Most layers are pure functions of `t`; the **ecosystem is not.** A coarse sim
+(`EcoSim`) *integrates forward as the clock runs and has memory*, tracking **soil
+fertility, vegetation, fauna, civilisation, and burn/salt scars** per cell. It is
+not a separate layer — it is the stateful **Δ** that the flora, fauna and
+civilisation channels carry: each is drawn as `baseline × ecosystem-health`, so
+an undisturbed world matches the pure fields exactly and a wrecked one shows its
+scars. One flora, and it is the living one.
 
 - **Your sliders are the triggers.** Shoving the **sea-level** slider up floods
   land relative to the level the ecosystem is *adapted* to (its `sea_ref`,
@@ -139,15 +144,17 @@ fertility, vegetation, fauna, civilisation, and burn/salt scars**:
 - **Consequences ⇒ not scrubbable backward.** The state at day 900 depends on
   the whole path of what you did, not on a formula of `t`, and the dynamics are
   dissipative (a burned and a drowned forest both end at `veg=0` — the present
-  can't tell you which). So Vitality only runs **forward or resets**; the *other*
-  layers stay fully seekable. The stateful mess is quarantined to this one layer.
+  can't tell you which). So the ecosystem only runs **forward or resets**; the
+  seekable channels underneath stay pure. The stateful part is one `EcoSim`.
 - **Fast-forward centuries.** The speed control is logarithmic (up to thousands
   of days/sec, with internal sub-stepping) so you can wreck a world and watch,
-  over simulated centuries, whether it ever greens again.
+  over simulated centuries, whether it ever greens again — in the flora, fauna
+  and civilisation layers directly.
 
-This is the far→near step of the design made real: the pure layers are the
-seekable substrate; Vitality is the stateful stock field every future M4 agent
-(herds as boids, settlements, NPCs) will expand out of and collapse back into.
+This is the far→near step of the design made real: the pure baselines are the
+seekable substrate; the ecosystem `Δ` is the stateful stock field every future
+M4 agent (herds as boids, settlements, NPCs) will expand out of and collapse
+back into.
 
 ### Continuous zoom — the pure function at any scale (the step before M4)
 
