@@ -186,7 +186,7 @@ def _splat_thin(alpha, disc, carve, segs, size):
     whole network instead of a Python loop per segment."""
     X0, Y0, X1, Y1, A, V, D, W = (np.concatenate(s) for s in zip(*segs))
     L = np.hypot(X1 - X0, Y1 - Y0)
-    m = np.maximum(1, np.ceil(L / 0.6).astype(np.int64))
+    m = np.maximum(1, np.ceil(L / 0.6).astype(np.int32))
     eid = np.repeat(np.arange(m.size), m)
     base = np.repeat(np.cumsum(m) - m, m)
     t = (np.arange(eid.size) - base + 0.5) / m[eid]
