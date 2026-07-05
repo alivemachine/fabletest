@@ -32,11 +32,31 @@ from worldgen import (elevation_field, moisture_field, compute_hydrology,
                       BIOME_COLORS, SEA_REF, _corner_hash)
 
 
+# Fixed per-seed cloud normalization: sampled ONCE from a coarse whole-torus
+# view and reused for every window — exactly like worldgen._planet_norm does for
+# elevation/moisture. Without a fixed range each window rescales to its own local
+# min/max, so the SAME world point is a different brightness in the thumbnail,
+# the main view, and every pan — that is the seam/brightness-pumping bug.
+_CLOUD_NORM = {}
+
+
+def _cloud_norm(seed, base_period):
+    key = (int(seed), int(base_period))
+    hit = _CLOUD_NORM.get(key)
+    if hit is None:
+        f = noise_window(seed, 0.5, 0.5, 1.0, 96, base_period=base_period)
+        hit = (float(f.min()), float(np.ptp(f) or 1.0))
+        _CLOUD_NORM[key] = hit
+    return hit
+
+
 def _cloud_sheet(seed, cx, cy, span, size, base_period):
-    """A [0,1]-normalized noise sheet for cloud cover, windowable like the
-    terrain fields (so clouds stay coherent under pan/zoom)."""
+    """A [0,1] cloud-cover sheet, windowed like the terrain fields and using a
+    FIXED per-seed normalization at every zoom — so adjacent windows agree at
+    their seams and the brightness never pumps as you pan or dive in."""
     f = noise_window(seed, cx, cy, span, size, base_period=base_period)
-    return ((f - f.min()) / (np.ptp(f) or 1.0)).astype(np.float32)
+    lo, ptp = _cloud_norm(seed, base_period)
+    return np.clip((f - lo) / ptp, 0.0, 1.0).astype(np.float32)
 
 
 # ===========================================================================
@@ -647,17 +667,27 @@ def fauna_field(flora, t):
     return herbivore.astype(np.float32), predator.astype(np.float32)
 
 
+# Wind velocity in WORLD units per day (fraction of the torus width). Advection
+# is a shift of the SAMPLE CENTER in world coordinates — not a roll of the window
+# array — so clouds drift the same physical speed at every zoom and translate
+# rigidly with the window as you pan. No window-edge wrap, no whole-pixel jumps,
+# no racing across the frame at deep zoom.
+CLOUD_WIND1_X = 1.0 / 6.0
+CLOUD_WIND2_X = 1.0 / 11.0
+CLOUD_WIND2_Y = 1.0 / 40.0
+
+
 def clouds_field(ws, t):
     """Cloud cover in [0,1]: two noise sheets drifting with the wind at
-    different speeds. Pure, seekable function of t, and fully decoupled from
-    the terrain below — no moisture gating, no orographic (slope) term, so
-    the cover is just a mask that moves."""
+    different speeds. Pure, seekable function of t, fully decoupled from the
+    terrain below — no moisture gating, no orographic (slope) term, just a mask
+    that moves. Re-sampled per frame at time-advected WORLD centers, so the
+    cover stays coherent under pan/zoom in both the browser console and Godot."""
     size = ws.elev.shape[0]
-    ox1 = int((t * size / 6.0)) % size
-    ox2 = int((t * size / 11.0)) % size
-    oy2 = int((t * size / 40.0)) % size
-    c1 = np.roll(ws.cloud1, ox1, axis=1)
-    c2 = np.roll(np.roll(ws.cloud2, ox2, axis=1), oy2, axis=0)
+    c1 = _cloud_sheet(ws.seed + 4001, ws.cx - t * CLOUD_WIND1_X, ws.cy,
+                      ws.span, size, 4)
+    c2 = _cloud_sheet(ws.seed + 8009, ws.cx - t * CLOUD_WIND2_X,
+                      ws.cy - t * CLOUD_WIND2_Y, ws.span, size, 3)
     sheet = 0.6 * c1 + 0.4 * c2
     return smoothstep((sheet - 0.46) / 0.30).astype(np.float32)
 
@@ -923,7 +953,7 @@ def _settlements(ws, t, sea_level):
 class WorldSlice:
     """Static per-resolution data + grids (full res, or strided for thumbs)."""
 
-    def __init__(self, elev, moist, hyd, cloud1, cloud2, civ_count, seed,
+    def __init__(self, elev, moist, hyd, civ_count, seed,
                  cx=0.5, cy=0.5, span=1.0):
         self.size = elev.shape[0]
         self.seed = int(seed)
@@ -945,7 +975,6 @@ class WorldSlice:
         self.brook_alpha = np.zeros_like(alpha)    # local streams: zoomed only
         self.elev = np.clip(elev - carve, 0.0, 1.0)  # valleys under the rivers
         self.moist = moist
-        self.cloud1, self.cloud2 = cloud1, cloud2
         self._derive_grids()
         self.has_history = False
         self._build_history(civ_count, seed)
@@ -1175,10 +1204,6 @@ class WorldSlice:
         s.brook_alpha = np.zeros_like(s.river_alpha)
         s.net = self.net
         s.lake_level = self.lake_level
-        s.cloud1 = np.clip(self._sample_planet_linear(self.cloud1, s.cx, s.cy, span, size, grid),
-                           0.0, 1.0)
-        s.cloud2 = np.clip(self._sample_planet_linear(self.cloud2, s.cx, s.cy, span, size, grid),
-                           0.0, 1.0)
         s.log_norm = self.log_norm
         s._derive_grids()
         self._share_world_state(s)
@@ -1242,8 +1267,6 @@ class WorldSlice:
             # like the smallest vector river (display scaling only)
             lift = _net_threshold(self.planet_size) / BROOK_MIN
             s.accum = np.maximum(disc, acc_local * lift)
-        s.cloud1 = _cloud_sheet(self.seed + 4001, s.cx, s.cy, span, size, 4)
-        s.cloud2 = _cloud_sheet(self.seed + 8009, s.cx, s.cy, span, size, 3)
         s.log_norm = self.log_norm             # planet-fixed flow normalization
         s._derive_grids()
         # share the pre-integrated history + the live eco sim (both global, not
@@ -1570,10 +1593,7 @@ def build_world(seed, size, civ_count=3):
     elev = elevation_field(size, seed).astype(np.float32)
     moist = moisture_field(size, seed).astype(np.float32)
     hyd = compute_hydrology(elev, int(seed))   # fill -> D8 -> accum -> lakes
-    cloud1 = _cloud_sheet(seed + 4001, 0.5, 0.5, 1.0, size, 4)
-    cloud2 = _cloud_sheet(seed + 8009, 0.5, 0.5, 1.0, size, 3)
-    ws = WorldSlice(elev, moist, hyd,
-                    cloud1, cloud2, int(civ_count), int(seed))
+    ws = WorldSlice(elev, moist, hyd, int(civ_count), int(seed))
     ws.eco = EcoSim(ws, int(seed))           # stateful vitality sim (M4)
     return ws
 
