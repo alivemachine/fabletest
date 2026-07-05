@@ -493,23 +493,21 @@ def _sample_offset(a, ox, oy, fill):
     return out
 
 
-def _sun_field(ws, sun_x, season_off):
-    """Per-column sun direction (east/south/up) for a FLAT map.
+def _sun_dir(sun_x, season_off):
+    """ONE sun direction (east/south/up) for the whole map at this instant.
 
-    Local time depends only on x: the sun rises in the east, arcs overhead,
-    and sets in the west, so the day/night terminator is a straight band that
-    sweeps across the map as t advances. Every row sees the same sky — no
-    spherical/equirectangular terms, and the hillshade direction no longer
-    drifts with latitude or pan."""
-    hour = (ws.xn - sun_x) * (2 * np.pi)          # 0 at local noon
+    The map is a flat plane, so every point shares the same sun — there is no
+    lit side / dark side. Day and night are a transition over TIME for the
+    entire map at once: fraction-of-day .0 is midnight, .25 sunrise in the
+    east, .5 noon, .75 sunset in the west. All spatial variation in the light
+    comes from slopes (normal map), terrain cast shadows, and cloud shadows —
+    together, the global shadow map."""
+    hour = (sun_x - 0.5) * (2 * np.pi)            # 0 at noon
     sx = -np.sin(hour)                            # east at dawn -> west at dusk
     sz = np.cos(hour)                             # up: +1 noon, -1 midnight
-    sy = np.full_like(sx, SUN_LEAN + SUN_SEASON_LEAN * season_off)
+    sy = SUN_LEAN + SUN_SEASON_LEAN * season_off
     inv = 1.0 / np.sqrt(sx * sx + sy * sy + sz * sz)
-    rows = np.ones((ws.size, 1), np.float32)      # broadcast to the full grid
-    return ((rows * (sx * inv)).astype(np.float32),
-            (rows * (sy * inv)).astype(np.float32),
-            (rows * (sz * inv)).astype(np.float32))
+    return float(sx * inv), float(sy * inv), float(sz * inv)
 
 
 def _terrain_shadow(height, sx, sy, sz, pixel_world):
@@ -550,26 +548,26 @@ def _cloud_shadow(clouds, sx, sy, sz, pixel_world):
 
 
 def _lighting_fields(ws, sun_x, season_off, day_night, clouds):
-    """Derived lighting payload: normals, sun visibility, and shadow masks."""
-    sx, sy, sz = _sun_field(ws, sun_x, season_off)
-    sun = np.stack((sx, sy, sz), axis=-1)
-    ndotl = np.clip(np.sum(ws.normal * sun, axis=2), 0, 1).astype(np.float32)
-    day = smoothstep((sz + 0.10) / 0.20).astype(np.float32)
-    cy = ws.size // 2
-    cx = ws.size // 2
-    sx0 = float(sx[cy, cx])
-    sy0 = float(sy[cy, cx])
-    sz0 = float(max(sz[cy, cx], 0.0))
-    terrain_vis = _terrain_shadow(ws.height, sx0, sy0, sz0, ws.pixel_world)
-    cloud_vis = _cloud_shadow(clouds, sx0, sy0, max(sz0, 0.08), ws.pixel_world)
+    """Derived lighting payload: normals, sun visibility, and shadow masks.
+
+    One sun direction lights the whole frame; ndotl (the normal map), the
+    terrain cast shadows and the cloud shadows all use that same vector, so
+    they agree by construction."""
+    sx, sy, sz = _sun_dir(sun_x, season_off)
+    ndotl = np.clip(ws.normal[..., 0] * sx + ws.normal[..., 1] * sy
+                    + ws.normal[..., 2] * sz, 0, 1).astype(np.float32)
+    day = float(smoothstep((sz + 0.10) / 0.20))   # whole-map dusk/dawn fade
+    terrain_vis = _terrain_shadow(ws.height, sx, sy, max(sz, 0.0),
+                                  ws.pixel_world)
+    cloud_vis = _cloud_shadow(clouds, sx, sy, max(sz, 0.08), ws.pixel_world)
     direct = ndotl * terrain_vis * cloud_vis
     lit = day * (0.28 + 0.72 * direct)
     floor = 1.0 - 0.72 * day_night
     sunlight = floor + (1.0 - floor) * lit
     return {
         "normal": ws.normal,
-        "sun_dir": np.array([sx0, sy0, sz0], np.float32),
-        "sun_up": np.clip(sz, 0, 1).astype(np.float32),
+        "sun_dir": np.array([sx, sy, sz], np.float32),
+        "sun_up": np.float32(max(sz, 0.0)),
         "terrain_shadow": terrain_vis,
         "cloud_shadow": cloud_vis,
         "sunlight": np.clip(sunlight, 0, 1).astype(np.float32),
