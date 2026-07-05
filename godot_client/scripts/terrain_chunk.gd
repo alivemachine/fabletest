@@ -656,6 +656,37 @@ func _draw_tree(center: Vector2, height_px: float, biome_id: int, sun: float, ve
         Color(1.0, 1.0, 1.0, 0.94).lerp(Color(1.0, 1.0, 1.0, 1.0), sun * 0.14))
 
 
+func _draw_building(center: Vector2, height_px: float, wall: Color) -> void:
+    # An isometric box standing on the tile's top face. The footprint is a
+    # fraction of the tile so the structure reads as a building sitting ON the
+    # ground rather than replacing it; walls carry the faction tint (passed in),
+    # the roof is a darkened warm cap so blocks stay legible when packed into a
+    # settlement. Same diamond projection as _draw_block, lifted by wall height.
+    var fw := tile_width * 0.30      # footprint half-width  (iso x)
+    var fh := tile_height * 0.30     # footprint half-height (iso y)
+    var wall_h := 22.0               # how tall the walls stand, in px
+    var top_center := center - Vector2(0.0, height_px)
+
+    # base diamond (on the ground) and the roof diamond (base lifted by wall_h)
+    var b_top := top_center + Vector2(0.0, -fh)
+    var b_right := top_center + Vector2(fw, 0.0)
+    var b_bottom := top_center + Vector2(0.0, fh)
+    var b_left := top_center + Vector2(-fw, 0.0)
+    var lift := Vector2(0.0, wall_h)
+    var r_top := b_top - lift
+    var r_right := b_right - lift
+    var r_bottom := b_bottom - lift
+    var r_left := b_left - lift
+
+    # two front walls (matching the block's left/right shading), then the roof
+    var left_wall := wall.darkened(0.30)
+    var right_wall := wall.darkened(0.14)
+    var roof := wall.lerp(Color8(96, 62, 52), 0.5).lightened(0.04)
+    draw_colored_polygon(PackedVector2Array([b_left, b_bottom, r_bottom, r_left]), left_wall)
+    draw_colored_polygon(PackedVector2Array([b_right, b_bottom, r_bottom, r_right]), right_wall)
+    draw_colored_polygon(PackedVector2Array([r_top, r_right, r_bottom, r_left]), roof)
+
+
 func _tree_texture(biome_id: int) -> Texture2D:
     var key := str(biome_id)
     if _tree_textures.has(key):
