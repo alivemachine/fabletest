@@ -107,6 +107,39 @@ class WorldBridge:
         river_gate = np.clip(ws.river_disc / max(float(st["river_thr"]), 1.0), 0.0, 1.0) ** 0.6
         river = np.maximum(river_alpha * river_gate, brook_alpha).astype(np.float32)
         veg_live = np.clip(st["veg"] * st["veg_health"], 0.0, 1.0)
+
+        # --- directional flow: water runs downhill of the CARVED terrain (the
+        # river valleys are cut into ws.elev), so the channel direction is the
+        # negative gradient. Angle is quantized to a byte (0..255 == 0..TAU,
+        # +x east, +y south); speed is nonzero only on actual watercourses and
+        # scales with discharge, so a trunk river pushes harder than a brook.
+        gy, gx = np.gradient(ws.elev, ws.pixel_world, ws.pixel_world)
+        ang = np.arctan2(-gy, -gx)
+        flow_dir = ((ang / (2.0 * np.pi)) % 1.0).astype(np.float32)
+        disc_n = np.clip(np.log1p(np.maximum(ws.river_disc, 0.0))
+                         / max(float(getattr(ws, "log_norm", 1.0)), 1e-6), 0.0, 1.0)
+        on_stream = river > 0.02
+        still_water = ws.elev < float(st["sea_eff"])   # sea/lakes: no current
+        flow_speed = np.where(on_stream & ~still_water,
+                              np.clip(0.25 + 0.75 * disc_n, 0.25, 1.0),
+                              0.0).astype(np.float32)
+
+        # --- living fauna (same math as the fauna layer): herd + predator
+        # densities the game can spawn/behave from
+        fh = st["fauna_health"]
+        herb, pred = wc.fauna_field(st["veg"], st["t"])
+        civ_p, fid = wc.civ_population(ws, st["t"])
+        herb = np.clip(herb * fh * (1.0 - 0.7 * np.clip(civ_p, 0.0, 1.0)), 0.0, 1.0)
+        pred = np.clip(pred * fh, 0.0, 1.0)
+
+        # --- structures from the M4 settlement expand(): buildings paint
+        # alpha 1.0, roads ~0.75 -> a 3-state byte the game can collide with
+        settle_a, _settle_rgb = wc._settlements(ws, st["t"], float(st["sea_level"]))
+        structure = np.zeros(settle_a.shape, np.uint8)
+        structure[settle_a >= 0.4] = 1                 # road
+        structure[settle_a >= 0.95] = 2                # building
+        faction = np.clip(fid.astype(np.int16) + 1, 0, 255).astype(np.uint8)
+
         return {
             "biome_id": _q_i16_array(st["biome_id"]),
             "height": _q_u8_array(ws.elev),
@@ -114,6 +147,14 @@ class WorldBridge:
             "river": _q_u8_array(river),
             "vegetation": _q_u8_array(veg_live),
             "scorch": _q_u8_array(st["scorch"]),
+            "flow_dir": _q_u8_array(flow_dir),
+            "flow_speed": _q_u8_array(flow_speed),
+            "fauna_herb": _q_u8_array(herb),
+            "fauna_pred": _q_u8_array(pred),
+            "structure": np.ascontiguousarray(structure.ravel()),
+            "faction": np.ascontiguousarray(faction.ravel()),
+            "moisture": _q_u8_array(ws.moist),
+            "temperature": _q_u8_array(st["tf"]),
         }
 
     def _payload_binary(self, ws: wc.WorldSlice, st: dict[str, Any], target_tiles: int) -> bytes:
@@ -121,7 +162,7 @@ class WorldBridge:
         header = struct.pack(
             "<4sHHIHHfffffffBBH",
             b"FTB1",
-            1,
+            2,
             int(ws.size),
             int(self.seed),
             int(self.size),
@@ -138,7 +179,10 @@ class WorldBridge:
             0,
         )
         parts = [header]
-        for name in ("biome_id", "height", "sunlight", "river", "vegetation", "scorch"):
+        for name in ("biome_id", "height", "sunlight", "river", "vegetation",
+                     "scorch", "flow_dir", "flow_speed", "fauna_herb",
+                     "fauna_pred", "structure", "faction", "moisture",
+                     "temperature"):
             parts.append(fields[name].tobytes())
         return b"".join(parts)
 

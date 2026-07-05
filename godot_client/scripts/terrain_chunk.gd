@@ -2,7 +2,14 @@ extends Node2D
 
 const PixelArt = preload("res://scripts/pixel_art.gd")
 const FRAME_PACKET_HEADER_BYTES := 48
-const FRAME_PACKET_VERSION := 1
+const FRAME_PACKET_VERSION_MIN := 1
+const FRAME_PACKET_VERSION_MAX := 2
+
+# faction tints, matching world_core.CIV_COLORS (index = faction id)
+const CIV_COLORS := [
+    Color8(214, 69, 65), Color8(232, 184, 58), Color8(58, 176, 168),
+    Color8(150, 96, 210), Color8(232, 128, 52), Color8(96, 178, 84),
+]
 
 const BIOME_INFO := [
     {"name": "deep_ocean", "base": Color8(30, 60, 120), "accent": Color8(68, 100, 156), "water": true, "foliage": false},
@@ -19,6 +26,21 @@ const BIOME_INFO := [
     {"name": "snow", "base": Color8(235, 240, 245), "accent": Color8(250, 252, 255), "water": false, "foliage": false},
     {"name": "mountain", "base": Color8(130, 125, 120), "accent": Color8(162, 156, 150), "water": false, "foliage": false},
     {"name": "high_peak", "base": Color8(200, 200, 205), "accent": Color8(230, 232, 238), "water": false, "foliage": false},
+    # sub-biome ground types (worldgen.BIOME_COLORS, appended in this order):
+    # the color codes Godot keys tiles from — wheat fields vs jungle vs oasis
+    {"name": "tall_grass", "base": Color8(100, 168, 62), "accent": Color8(134, 198, 96), "water": false, "foliage": true},
+    {"name": "meadow", "base": Color8(146, 198, 108), "accent": Color8(178, 222, 142), "water": false, "foliage": true},
+    {"name": "wheat_soil", "base": Color8(196, 176, 98), "accent": Color8(220, 202, 128), "water": false, "foliage": false},
+    {"name": "acacia_scrub", "base": Color8(162, 176, 74), "accent": Color8(192, 204, 108), "water": false, "foliage": true},
+    {"name": "dunes", "base": Color8(236, 216, 142), "accent": Color8(248, 234, 172), "water": false, "foliage": false},
+    {"name": "reg_rock", "base": Color8(198, 170, 112), "accent": Color8(220, 194, 140), "water": false, "foliage": false},
+    {"name": "shrub_steppe", "base": Color8(208, 196, 132), "accent": Color8(228, 216, 160), "water": false, "foliage": true},
+    {"name": "oasis", "base": Color8(62, 168, 118), "accent": Color8(98, 198, 150), "water": false, "foliage": true},
+    {"name": "glade", "base": Color8(98, 168, 88), "accent": Color8(132, 198, 120), "water": false, "foliage": true},
+    {"name": "dark_forest", "base": Color8(38, 98, 48), "accent": Color8(66, 128, 76), "water": false, "foliage": true},
+    {"name": "jungle_clear", "base": Color8(72, 148, 82), "accent": Color8(104, 178, 112), "water": false, "foliage": true},
+    {"name": "rocky_tundra", "base": Color8(148, 152, 142), "accent": Color8(176, 180, 170), "water": false, "foliage": false},
+    {"name": "scree", "base": Color8(108, 102, 96), "accent": Color8(136, 130, 122), "water": false, "foliage": false},
 ]
 
 var tile_width := 56.0
@@ -216,6 +238,19 @@ func focus_radius_tiles(world_uv: Vector2) -> float:
     return max(absf(dx), absf(dy))
 
 
+func cell_info(world_uv: Vector2) -> Dictionary:
+    # Everything the game knows about the cell under `world_uv`: biome name &
+    # id (the tile color code), water & directional flow (uv axes, +y south),
+    # fauna densities, structure (0 none / 1 road / 2 building), owning
+    # faction, moisture/temperature, sunlight, vegetation, scorch, height.
+    # Returns {} until that cell has streamed in — callers must tolerate it.
+    var tile := _world_to_tile(world_uv)
+    var rec = _tile_cache.get(_tile_key(tile.x, tile.y), null)
+    if rec == null:
+        return {}
+    return rec.get("env", {})
+
+
 func ground_height_for_focus(world_uv: Vector2) -> float:
     var tile := _world_to_tile(world_uv)
     var rec = _tile_cache.get(_tile_key(tile.x, tile.y), null)
@@ -268,6 +303,8 @@ func _draw() -> void:
         var tree_biome: int = rec["tree_biome"]
         if tree_biome >= 0:
             _draw_tree(iso, height_px, tree_biome, rec["tree_sun"], rec["tree_veg"])
+        if int(rec.get("structure", 0)) == 2:
+            _draw_building(iso, height_px, rec.get("wall", Color8(200, 190, 170)))
 
 
 func _start_build(payload) -> void:
@@ -398,6 +435,14 @@ func _build_snapshot(payload: Dictionary) -> Dictionary:
     var rivers = fields.get("river", PackedByteArray())
     var vegetation = fields.get("vegetation", PackedByteArray())
     var scorch = fields.get("scorch", PackedByteArray())
+    var flow_dir = fields.get("flow_dir", PackedByteArray())
+    var flow_speed = fields.get("flow_speed", PackedByteArray())
+    var fauna_herb = fields.get("fauna_herb", PackedByteArray())
+    var fauna_pred = fields.get("fauna_pred", PackedByteArray())
+    var structure_f = fields.get("structure", PackedByteArray())
+    var faction_f = fields.get("faction", PackedByteArray())
+    var moisture_f = fields.get("moisture", PackedByteArray())
+    var temperature_f = fields.get("temperature", PackedByteArray())
     # Map each chunk cell to its GLOBAL tile coordinate. The chunk's center cell
     # (size/2, size/2) sits at center_uv, i.e. global tile round(center_uv/tile).
     var grid_n: int = max(1, int(round(1.0 / tile_world)))
@@ -421,10 +466,19 @@ func _build_snapshot(payload: Dictionary) -> Dictionary:
                 var veg := float(_field_u8(vegetation, index, 0)) / 255.0
                 var burn := float(_field_u8(scorch, index, 0)) / 255.0
                 var elev := float(_field_u8(heights, index)) / 255.0
+                var structure := _field_u8(structure_f, index, 0)
+                var faction := _field_u8(faction_f, index, 0) - 1
+                var speed := float(_field_u8(flow_speed, index, 0)) / 255.0
+                var flow := Vector2.ZERO
+                if speed > 0.01:
+                    var ang := float(_field_u8(flow_dir, index, 0)) / 255.0 * TAU
+                    flow = Vector2(cos(ang), sin(ang)) * speed
                 var height_px := _column_height_px_for(elev, sea_effective)
                 var top_color := base.lerp(accent, 0.18).lerp(Color.WHITE, sun * 0.24)
                 if burn > 0.0:
                     top_color = top_color.lerp(Color8(82, 56, 42), burn * 0.58)
+                if structure == 1:
+                    top_color = top_color.lerp(Color8(124, 104, 78), 0.62)  # dirt road
                 var left_color := top_color.darkened(0.28 if not water else 0.10)
                 var right_color := top_color.darkened(0.16 if not water else 0.18)
                 var water_scale := 0.0
@@ -440,10 +494,15 @@ func _build_snapshot(payload: Dictionary) -> Dictionary:
                 var tree_biome := -1
                 var tree_sun := 0.0
                 var tree_veg := 0.0
-                if foliage and veg > 0.26 and _hash01(gtx, gty, seed) > 0.55:
+                if structure == 0 and foliage and veg > 0.26 and _hash01(gtx, gty, seed) > 0.55:
                     tree_biome = biome_id
                     tree_sun = sun
                     tree_veg = veg
+                var wall_color := Color(0.0, 0.0, 0.0, 0.0)
+                if structure == 2:
+                    var tint: Color = CIV_COLORS[clampi(faction, 0, CIV_COLORS.size() - 1)] \
+                        if faction >= 0 else Color8(160, 150, 132)
+                    wall_color = tint.lerp(Color8(228, 214, 186), 0.58)
                 var key := Vector2i(((gtx % grid_n) + grid_n) % grid_n,
                     ((gty % grid_n) + grid_n) % grid_n)
                 tiles.append({
@@ -458,6 +517,26 @@ func _build_snapshot(payload: Dictionary) -> Dictionary:
                     "tree_biome": tree_biome,
                     "tree_sun": tree_sun,
                     "tree_veg": tree_veg,
+                    "structure": structure,
+                    "wall": wall_color,
+                    # everything the PLAYER reads about this cell, in one place
+                    "env": {
+                        "biome_id": biome_id,
+                        "biome": info["name"],
+                        "water": water,
+                        "river": river,
+                        "flow": flow,               # direction * speed, uv axes
+                        "herb": float(_field_u8(fauna_herb, index, 0)) / 255.0,
+                        "pred": float(_field_u8(fauna_pred, index, 0)) / 255.0,
+                        "structure": structure,     # 0 none / 1 road / 2 building
+                        "faction": faction,         # -1 = unclaimed
+                        "moisture": float(_field_u8(moisture_f, index, 0)) / 255.0,
+                        "temperature": float(_field_u8(temperature_f, index, 0)) / 255.0,
+                        "sunlight": sun,
+                        "vegetation": veg,
+                        "scorch": burn,
+                        "height": elev,
+                    },
                 })
     return {
         "size": size,
@@ -488,7 +567,7 @@ func _decode_frame_packet(body: PackedByteArray) -> Dictionary:
     if body[0] != 70 or body[1] != 84 or body[2] != 66 or body[3] != 49:
         return {}
     var version := int(body.decode_u16(4))
-    if version != FRAME_PACKET_VERSION:
+    if version < FRAME_PACKET_VERSION_MIN or version > FRAME_PACKET_VERSION_MAX:
         return {}
     var size := int(body.decode_u16(6))
     var seed_v := int(body.decode_u32(8))
@@ -496,19 +575,21 @@ func _decode_frame_packet(body: PackedByteArray) -> Dictionary:
     var target_tiles := int(body.decode_u16(14))
     var cells := size * size
     var offset := FRAME_PACKET_HEADER_BYTES
+    var fields := {}
     var biome_bytes := _copy_bytes(body, offset, cells * 2)
     offset += cells * 2
-    var height_bytes := _copy_bytes(body, offset, cells)
-    offset += cells
-    var sunlight_bytes := _copy_bytes(body, offset, cells)
-    offset += cells
-    var river_bytes := _copy_bytes(body, offset, cells)
-    offset += cells
-    var vegetation_bytes := _copy_bytes(body, offset, cells)
-    offset += cells
-    var scorch_bytes := _copy_bytes(body, offset, cells)
-    if scorch_bytes.size() != cells:
-        return {}
+    fields["biome_id"] = biome_bytes
+    var u8_names: Array = ["height", "sunlight", "river", "vegetation", "scorch"]
+    if version >= 2:
+        # v2 appends the environment planes the player character reads
+        u8_names += ["flow_dir", "flow_speed", "fauna_herb", "fauna_pred",
+                     "structure", "faction", "moisture", "temperature"]
+    for field_name in u8_names:
+        var plane := _copy_bytes(body, offset, cells)
+        offset += cells
+        if plane.size() != cells:
+            return {}
+        fields[field_name] = plane
     return {
         "seed": seed_v,
         "planet_size": planet_size,
@@ -525,14 +606,7 @@ func _decode_frame_packet(body: PackedByteArray) -> Dictionary:
         "sea_effective": float(body.decode_float(40)),
         "sunlight_mean": int(body[44]),
         "cloud_mean": int(body[45]),
-        "fields": {
-            "biome_id": biome_bytes,
-            "height": height_bytes,
-            "sunlight": sunlight_bytes,
-            "river": river_bytes,
-            "vegetation": vegetation_bytes,
-            "scorch": scorch_bytes,
-        },
+        "fields": fields,
     }
 
 
