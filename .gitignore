@@ -1,3 +1,4 @@
 exports/
 __pycache__/
 world_*.png
+pyodide-0.26.4.tar.bz2
