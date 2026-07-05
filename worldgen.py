@@ -148,6 +148,23 @@ BIOME_COLORS = {
     "snow":        (235, 240, 245),
     "mountain":    (130, 125, 120),
     "high_peak":   (200, 200, 205),
+    # --- ground detail: sub-biomes refined from the ground-noise channel
+    # (world_core.biome_ids). APPENDED so the ids above stay stable; each is
+    # a distinct flat color code the game can key tiles from (Godot receives
+    # the integer biome_id — these colors are the same table made visible).
+    "tall_grass":   (100, 168,  62),   # grassland: dense high grass
+    "meadow":       (146, 198, 108),   # grassland: light flowering meadow
+    "wheat_soil":   (196, 176,  98),   # grassland: fertile loam — field-able
+    "acacia_scrub": (162, 176,  74),   # savanna: scattered scrub
+    "dunes":        (236, 216, 142),   # desert: soft dune sand
+    "reg_rock":     (198, 170, 112),   # desert: hard rocky reg
+    "shrub_steppe": (208, 196, 132),   # desert: sparse shrub steppe
+    "oasis":        ( 62, 168, 118),   # desert: wet green pocket
+    "glade":        ( 98, 168,  88),   # forest: open glade
+    "dark_forest":  ( 38,  98,  48),   # forest: dense old growth
+    "jungle_clear": ( 72, 148,  82),   # jungle: clearing
+    "rocky_tundra": (148, 152, 142),   # tundra: frost-shattered rock
+    "scree":        (108, 102,  96),   # mountain: loose scree slope
 }
 
 # ---------------------------------------------------------------------------

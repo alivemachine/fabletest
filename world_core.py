@@ -435,7 +435,7 @@ def smoothstep(x):
     return x * x * (3 - 2 * x)
 
 
-def biome_ids(e, t, m, sea, tide=0.0, lake_lv=None):
+def biome_ids(e, t, m, sea, tide=0.0, lake_lv=None, g=None):
     """Vectorized version of worldgen.classify_biomes -> int16 ids.
 
     `sea` is the GEOGRAPHIC sea level (the slider, no instantaneous tide), so
@@ -471,7 +471,28 @@ def biome_ids(e, t, m, sea, tide=0.0, lake_lv=None):
     choices = [BID[n] for n in (
         "deep_ocean", "shallow", "ocean", "high_peak", "mountain", "beach",
         "snow", "tundra", "taiga", "desert", "savanna", "grassland", "forest")]
-    return np.select(conds, choices, default=BID["jungle"]).astype(np.int16)
+    bid = np.select(conds, choices, default=BID["jungle"]).astype(np.int16)
+    if g is not None:
+        # sub-biome refinement: the ground channel splits each broad biome
+        # into distinct, tile-able ground types (each its own color code the
+        # game can key on). Same octave noise as terrain -> zoom-coherent.
+        def sub(base, mask, name):
+            bid[(bid == BID[base]) & mask] = BID[name]
+        hi, vhi, lo = g > 0.54, g > 0.60, g < 0.44
+        sub("grassland", vhi, "tall_grass")
+        sub("grassland", hi & ~vhi, "meadow")
+        sub("grassland", lo & (m > 0.55), "wheat_soil")
+        sub("savanna", vhi, "acacia_scrub")
+        sub("desert", vhi & (m > 0.19), "oasis")       # rare wet pockets first
+        sub("desert", hi & (m > 0.13), "shrub_steppe")
+        sub("desert", hi, "reg_rock")
+        sub("desert", lo, "dunes")
+        sub("forest", vhi, "glade")
+        sub("forest", lo, "dark_forest")
+        sub("jungle", g > 0.62, "jungle_clear")
+        sub("tundra", hi, "rocky_tundra")
+        sub("mountain", lo, "scree")
+    return bid
 
 
 def temperature_t(elev, lat, lat_signed, sea_eff, season_off):
@@ -944,6 +965,12 @@ class WorldSlice:
         self.height = (self.elev * SHADOW_RELIEF_WORLD).astype(np.float32)
         slope = np.sqrt(nx * nx + ny * ny)
         self.shade = np.clip(1.05 - slope * 0.28, 0.74, 1.08).astype(np.float32)
+        # ground-detail channel for sub-biome classification: the same
+        # windowed octave noise as the terrain, so patch borders gain fractal
+        # detail with zoom instead of blurring (a wheat field keeps a crisp,
+        # ever-finer edge at tile level)
+        self.ground = noise_window(self.seed + 7777, self.cx, self.cy,
+                                   self.span, size, base_period=24)
         # the flow ramp is normalized by a PLANET-WIDE constant, not the window
         # max: otherwise the whole flow map re-brightens whenever a big river
         # enters or leaves the view (one of the "pixels changed" flickers).
@@ -1009,7 +1036,12 @@ class WorldSlice:
         size = self.size if size is None else max(8, int(size))
         if span >= 0.999 and size == self.size:
             return self
-        if zoom > self.planet_size or size > self.size:
+        # Bilinear planet sampling is only honest while the planet grid still
+        # covers the output pixels (allow a 2x stretch). Past that, hand off
+        # to the octave-refining window generator — otherwise every zoom up
+        # to planet_size was serving BLUR instead of the finer octaves, and
+        # tile-level detail was lost.
+        if zoom * size > 2.0 * self.planet_size or size > self.size:
             return self.view(cx, cy, zoom)
 
         # PIXEL-SNAP the streaming window to the output tile lattice. Each output
@@ -1493,7 +1525,9 @@ def state(ws, t, sea_level, river_thr, season_amp, tide_amp, day_night):
     re-derived per layer."""
     sea_eff, season_off, sun_x = frame_params(t, sea_level, tide_amp, season_amp)
     e = ws.elev
-    tf = temperature_t(e, ws.lat, ws.lat_signed, sea_eff, season_off)
+    # climate references the GEOGRAPHIC sea level: the tide moves the
+    # waterline, not the snowline (mountains don't cool at high tide)
+    tf = temperature_t(e, ws.lat, ws.lat_signed, sea_level, season_off)
     clouds = clouds_field(ws, t)
     st = {
         "ws": ws, "t": t, "sea_level": sea_level, "river_thr": river_thr,
@@ -1501,8 +1535,9 @@ def state(ws, t, sea_level, river_thr, season_amp, tide_amp, day_night):
         "sea_eff": sea_eff, "season_off": season_off, "sun_x": sun_x,
         "e": e, "land": e >= sea_eff, "tf": tf,
         "biome_id": biome_ids(e, tf, ws.moist, sea_level, tide_amp,
-                              getattr(ws, "lake_lv", None)),
-        "veg": flora_field(ws, tf, sea_eff),
+                              getattr(ws, "lake_lv", None),
+                              getattr(ws, "ground", None)),
+        "veg": flora_field(ws, tf, sea_level),
         "moist": ws.moist, "log_accum": ws.log_accum,
         "clouds": clouds,
     }
@@ -1545,7 +1580,7 @@ def colorize(st, layer):
         img[..., 0] = 16 + 70 * f
         img[..., 1] = 34 + 106 * f
         img[..., 2] = 78 + 108 * f
-        g = np.clip((e - sea_eff) / max(1 - sea_eff, 1e-6), 0, 1)
+        g = np.clip((e - sea_level) / max(1 - sea_level, 1e-6), 0, 1)
         land_rgb = color_ramp(g, [0.0, 0.55, 1.0],
                               [(88, 140, 80), (168, 150, 96), (245, 245, 248)])
         img[~sea_m] = land_rgb[~sea_m]
