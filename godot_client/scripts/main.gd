@@ -3,9 +3,7 @@ extends Node2D
 const TerrainChunkScene = preload("res://scripts/terrain_chunk.gd")
 const PixelArt = preload("res://scripts/pixel_art.gd")
 
-var bridge_url_binary := "http://127.0.0.1:8765/frame.bin"
-var bridge_url_json := "http://127.0.0.1:8765/frame"
-var bridge_url := bridge_url_binary
+var bridge_url := "http://127.0.0.1:8765/frame.bin"
 var seed := 42
 var world_size := 192
 var civ_count := 3
@@ -343,11 +341,6 @@ func _encode_query(query: Dictionary) -> String:
 
 func _on_request_completed(_result: int, response_code: int, _headers: PackedStringArray, body: PackedByteArray) -> void:
     request_in_flight = false
-    if response_code == 404 and bridge_url == bridge_url_binary:
-        bridge_url = bridge_url_json
-        status_line = "bridge binary missing, using json fallback"
-        _request_frame(0.0, false)
-        return
     if response_code != 200:
         status_line = "bridge offline or invalid response (%d)" % response_code
         if refresh_after_response:

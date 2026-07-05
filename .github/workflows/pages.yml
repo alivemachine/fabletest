@@ -33,10 +33,19 @@ jobs:
           cp -r web/* _site/
           cp worldgen.py common.py hydrology.py lighting.py history.py \
              ecosim.py world_core.py _site/
-      - name: Vendor Pyodide runtime + numpy (self-hosted, no CDN)
+      - name: Cache the Pyodide release tarball
+        id: pyodide-cache
+        uses: actions/cache@v4
+        with:
+          path: pyodide.tar.bz2
+          key: pyodide-0.26.4
+      - name: Download Pyodide (cache miss only)
+        if: steps.pyodide-cache.outputs.cache-hit != 'true'
         run: |
           curl -sSL -o pyodide.tar.bz2 \
             https://github.com/pyodide/pyodide/releases/download/0.26.4/pyodide-0.26.4.tar.bz2
+      - name: Vendor Pyodide runtime + numpy (self-hosted, no CDN)
+        run: |
           tar xjf pyodide.tar.bz2
           mkdir -p _site/pyodide
           cp pyodide/pyodide.js pyodide/pyodide.mjs pyodide/pyodide.asm.js \

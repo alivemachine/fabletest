@@ -1,9 +1,9 @@
 """Local HTTP bridge between the Python world core and a Godot client.
 
-The bridge owns one evolving world instance. A Godot scene polls /frame with
-its current world-space center and receives a quantized, player-centered chunk
-of biome, height, vegetation, river, cloud, and lighting data.
-"""
+The bridge owns one evolving world instance. A Godot scene polls /frame.bin
+with its current world-space center and receives a quantized, player-centered
+chunk of biome, height, vegetation, river, cloud, and lighting data as a
+packed binary frame (FTB1)."""
 
 from __future__ import annotations
 
@@ -23,14 +23,6 @@ import world_core as wc
 
 def _clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
-
-
-def _q_u8(field: np.ndarray) -> list[int]:
-    return np.rint(np.clip(field, 0.0, 1.0) * 255.0).astype(np.uint8).ravel().tolist()
-
-
-def _q_i16(field: np.ndarray) -> list[int]:
-    return field.astype(np.int16).ravel().tolist()
 
 
 def _q_u8_array(field: np.ndarray) -> np.ndarray:
@@ -83,24 +75,6 @@ class WorldBridge:
             eco.step(dt_days, sea_level, season_off)
         self.t += dt_days
 
-    def _payload(self, ws: wc.WorldSlice, st: dict[str, Any], target_tiles: int) -> dict[str, Any]:
-        fields = self._payload_fields(ws, st)
-        return {
-            "seed": self.seed,
-            "planet_size": self.size,
-            "view_tiles_target": int(target_tiles),
-            "size": int(ws.size),
-            "time_days": float(st["t"]),
-            "span": float(ws.span),
-            "center": {"cx": float(ws.cx), "cy": float(ws.cy)},
-            "tile_world": float(ws.span / max(ws.size, 1)),
-            "sea_level": float(st["sea_level"]),
-            "sea_effective": float(st["sea_eff"]),
-            "sunlight_mean": _mean_u8(st["sunlight"]),
-            "cloud_mean": _mean_u8(st["clouds"]),
-            "fields": {name: arr.tolist() for name, arr in fields.items()},
-        }
-
     def _payload_fields(self, ws: wc.WorldSlice, st: dict[str, Any]) -> dict[str, np.ndarray]:
         river_alpha = getattr(ws, "river_alpha", np.zeros_like(ws.elev))
         brook_alpha = getattr(ws, "brook_alpha", np.zeros_like(ws.elev))
@@ -141,31 +115,6 @@ class WorldBridge:
         for name in ("biome_id", "height", "sunlight", "river", "vegetation", "scorch"):
             parts.append(fields[name].tobytes())
         return b"".join(parts)
-
-    def snapshot(self, *, seed: int | None = None, size: int | None = None,
-                 civ_count: int | None = None, cx: float = 0.5, cy: float = 0.5,
-                 zoom: float = 12.0, view_tiles: int = 24, dt_seconds: float = 0.0,
-                 speed: float = 0.35, playing: bool = True, sea_level: float = 0.42,
-                 river_thr: float | None = None, season_amp: float = 0.18,
-                 tide_amp: float = 0.012, day_night: float = 0.65,
-                 reset: bool = False) -> dict[str, Any]:
-        with self.lock:
-            self._rebuild(seed if seed is not None else self.seed,
-                          size if size is not None else self.size,
-                          civ_count if civ_count is not None else self.civ_count)
-            if reset:
-                eco = getattr(self.world, "eco", None)
-                if eco is not None:
-                    eco.reset()
-                self.t = 0.0
-            river_thr = (wc.default_river_threshold(self.size)
-                         if river_thr is None else float(river_thr))
-            self._advance(dt_seconds, speed, playing, sea_level, season_amp, tide_amp)
-            zoom = max(1.0, float(zoom))
-            view_tiles = max(8, int(view_tiles))
-            chunk = self.world.stream_view(cx % 1.0, cy % 1.0, zoom, view_tiles)
-            st = wc.state(chunk, self.t, sea_level, river_thr, season_amp, tide_amp, day_night)
-            return self._payload(chunk, st, view_tiles)
 
     def snapshot_binary(self, *, seed: int | None = None, size: int | None = None,
                         civ_count: int | None = None, cx: float = 0.5, cy: float = 0.5,
@@ -229,8 +178,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
         if parsed.path == "/health":
             self._send_json({"ok": True})
             return
-        if parsed.path not in {"/frame", "/frame.bin"}:
-            self._send_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
+        if parsed.path != "/frame.bin":
+            self._send_json({"error": "not found; frames are served at /frame.bin"},
+                            status=HTTPStatus.NOT_FOUND)
             return
         bridge = self.bridge
         if bridge is None:
@@ -255,11 +205,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             "day_night": _clamp(_parse_float(qs, "day_night", 0.65), 0.0, 1.0),
             "reset": _parse_bool(qs, "reset", False),
         }
-        if parsed.path == "/frame.bin":
-            self._send_binary(bridge.snapshot_binary(**args))
-            return
-        payload = bridge.snapshot(**args)
-        self._send_json(payload)
+        self._send_binary(bridge.snapshot_binary(**args))
 
     def _cors_headers(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -296,7 +242,7 @@ def main() -> None:
 
     BridgeHandler.bridge = WorldBridge(args.seed, args.size, args.civ_count)
     server = ThreadingHTTPServer((args.host, args.port), BridgeHandler)
-    print(f"serving Godot bridge at http://{args.host}:{args.port}/frame")
+    print(f"serving Godot bridge at http://{args.host}:{args.port}/frame.bin")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
