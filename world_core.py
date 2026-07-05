@@ -380,6 +380,12 @@ def _local_streams(elev, moist, trunk_alpha, lake_lv, cx, cy, span, seed,
 YEAR_DAYS = 96.0          # one year = 96 days
 TIDE_PERIOD = 0.52        # ~semi-diurnal tide
 FAUNA_PERIOD = 32.0       # predator-prey limit cycle length (days)
+NORMAL_RELIEF_WORLD = 0.018
+SHADOW_RELIEF_WORLD = 0.090
+SOLAR_TILT = np.deg2rad(47.0)   # season_off in [-0.5,0.5] -> +/-23.5 deg
+TERRAIN_SHADOW_STEPS = 56
+CLOUD_WORLD_HEIGHT = 0.010
+CLOUD_SHADOW_STRENGTH = 0.50
 
 # ---------------------------------------------------------------------------
 # History CA (M3) parameters.
@@ -476,6 +482,101 @@ def daylight_row(xn, sun_x, depth):
     s = s * s * (3 - 2 * s)
     floor = 1 - 0.72 * depth
     return floor + (1 - floor) * s
+
+
+def _sample_offset(a, ox, oy, fill):
+    """Sample `a` with a non-wrapping integer offset: out[y,x] = a[y+oy,x+ox]."""
+    out = np.full_like(a, fill)
+    h, w = a.shape
+    if abs(ox) >= w or abs(oy) >= h:
+        return out
+    sx0, sx1 = max(0, ox), min(w, w + ox)
+    sy0, sy1 = max(0, oy), min(h, h + oy)
+    dx0, dx1 = max(0, -ox), min(w, w - ox)
+    dy0, dy1 = max(0, -oy), min(h, h - oy)
+    out[dy0:dy1, dx0:dx1] = a[sy0:sy1, sx0:sx1]
+    return out
+
+
+def _sun_field(ws, sun_x, season_off):
+    """Per-pixel sun direction in local east/south/up coordinates."""
+    lat = ws.lat_signed * (0.5 * np.pi)
+    hour = (ws.xn[None, :] - sun_x) * (2 * np.pi)
+    decl = SOLAR_TILT * season_off
+    sin_lat, cos_lat = np.sin(lat), np.cos(lat)
+    sin_hour, cos_hour = np.sin(hour), np.cos(hour)
+    sin_decl, cos_decl = np.sin(decl), np.cos(decl)
+    sx = -cos_decl * sin_hour
+    sy = sin_lat * cos_decl * cos_hour - cos_lat * sin_decl
+    sz = sin_lat * sin_decl + cos_lat * cos_decl * cos_hour
+    inv = 1.0 / np.maximum(np.sqrt(sx * sx + sy * sy + sz * sz), 1e-6)
+    return ((sx * inv).astype(np.float32),
+            (sy * inv).astype(np.float32),
+            (sz * inv).astype(np.float32))
+
+
+def _terrain_shadow(height, sx, sy, sz, pixel_world):
+    """Approximate terrain cast-shadow visibility in [0,1] for one sun ray."""
+    if sz <= 1e-4:
+        return np.zeros_like(height, np.float32)
+    horiz = float(np.hypot(sx, sy))
+    if horiz <= 1e-6:
+        return np.ones_like(height, np.float32)
+    dx, dy = sx / horiz, sy / horiz
+    rise = pixel_world * sz / horiz
+    soft = max(pixel_world * SHADOW_RELIEF_WORLD * 1.8, 1e-5)
+    horizon = np.full_like(height, -1e9, np.float32)
+    steps = min(max(height.shape) - 1,
+                max(12, min(TERRAIN_SHADOW_STEPS,
+                            int(12 + 34 * horiz / max(sz, 0.12)))))
+    for step in range(1, steps + 1):
+        ox = int(round(dx * step))
+        oy = int(round(dy * step))
+        if ox == 0 and oy == 0:
+            continue
+        sample = _sample_offset(height, ox, oy, -1e9)
+        np.maximum(horizon, sample - step * rise, out=horizon)
+    return smoothstep((height - horizon + soft) / (2 * soft)).astype(np.float32)
+
+
+def _cloud_shadow(clouds, sx, sy, sz, pixel_world):
+    """Project cloud cover onto the ground along the sun ray."""
+    if sz <= 1e-4:
+        return np.ones_like(clouds, np.float32)
+    scale = CLOUD_WORLD_HEIGHT / max(sz * pixel_world, 1e-6)
+    ox = int(round(sx * scale))
+    oy = int(round(sy * scale))
+    cover = _sample_offset(clouds, ox, oy, 0.0).astype(np.float32)
+    cover = 0.65 * cover + 0.35 * _shift_max8(cover)
+    return np.clip(1.0 - CLOUD_SHADOW_STRENGTH * cover,
+                   1.0 - CLOUD_SHADOW_STRENGTH, 1.0).astype(np.float32)
+
+
+def _lighting_fields(ws, sun_x, season_off, day_night, clouds):
+    """Derived lighting payload: normals, sun visibility, and shadow masks."""
+    sx, sy, sz = _sun_field(ws, sun_x, season_off)
+    sun = np.stack((sx, sy, sz), axis=-1)
+    ndotl = np.clip(np.sum(ws.normal * sun, axis=2), 0, 1).astype(np.float32)
+    day = smoothstep((sz + 0.10) / 0.20).astype(np.float32)
+    cy = ws.size // 2
+    cx = ws.size // 2
+    sx0 = float(sx[cy, cx])
+    sy0 = float(sy[cy, cx])
+    sz0 = float(max(sz[cy, cx], 0.0))
+    terrain_vis = _terrain_shadow(ws.height, sx0, sy0, sz0, ws.pixel_world)
+    cloud_vis = _cloud_shadow(clouds, sx0, sy0, max(sz0, 0.08), ws.pixel_world)
+    direct = ndotl * terrain_vis * cloud_vis
+    lit = day * (0.28 + 0.72 * direct)
+    floor = 1.0 - 0.72 * day_night
+    sunlight = floor + (1.0 - floor) * lit
+    return {
+        "normal": ws.normal,
+        "sun_dir": np.array([sx0, sy0, sz0], np.float32),
+        "sun_up": np.clip(sz, 0, 1).astype(np.float32),
+        "terrain_shadow": terrain_vis,
+        "cloud_shadow": cloud_vis,
+        "sunlight": np.clip(sunlight, 0, 1).astype(np.float32),
+    }
 
 
 def color_ramp(v, stops, colors):
@@ -624,8 +725,16 @@ class WorldSlice:
         self.lat = (1 - np.abs(v - 0.5) * 2)[:, None]
         self.lat_signed = ((0.5 - v) * 2)[:, None]
         self.xn = u
-        gy, gx = np.gradient(self.elev)
-        self.shade = np.clip(1 - (gx + gy) * 2.2, 0.75, 1.25).astype(np.float32)
+        self.pixel_world = max(self.span / size, 1e-6)
+        gy, gx = np.gradient(self.elev, self.pixel_world, self.pixel_world)
+        nx = -gx * NORMAL_RELIEF_WORLD
+        ny = -gy * NORMAL_RELIEF_WORLD
+        nz = np.ones_like(self.elev, np.float32)
+        inv = 1.0 / np.maximum(np.sqrt(nx * nx + ny * ny + nz * nz), 1e-6)
+        self.normal = np.stack((nx * inv, ny * inv, nz * inv), axis=2).astype(np.float32)
+        self.height = (self.elev * SHADOW_RELIEF_WORLD).astype(np.float32)
+        slope = np.sqrt(nx * nx + ny * ny)
+        self.shade = np.clip(1.05 - slope * 0.28, 0.74, 1.08).astype(np.float32)
         # the flow ramp is normalized by a PLANET-WIDE constant, not the window
         # max: otherwise the whole flow map re-brightens whenever a big river
         # enters or leaves the view (one of the "pixels changed" flickers).
@@ -642,6 +751,103 @@ class WorldSlice:
         ci = (((cx + step) % 1.0) * field.shape[1]).astype(np.int64) % field.shape[1]
         ri = (((cy + step) % 1.0) * field.shape[0]).astype(np.int64) % field.shape[0]
         return field[np.ix_(ri, ci)]
+
+    def _sample_planet_linear_grid(self, width, height, cx, cy, span, size):
+        step = (np.arange(size, dtype=np.float32) / size - 0.5) * span
+        fx = ((cx + step) % 1.0) * width
+        fy = ((cy + step) % 1.0) * height
+        x0 = np.floor(fx).astype(np.int64) % width
+        y0 = np.floor(fy).astype(np.int64) % height
+        x1 = (x0 + 1) % width
+        y1 = (y0 + 1) % height
+        tx = (fx - np.floor(fx)).astype(np.float32)[None, :]
+        ty = (fy - np.floor(fy)).astype(np.float32)[:, None]
+        return x0, x1, y0, y1, tx, ty
+
+    def _sample_planet_linear(self, field, cx, cy, span, size, grid=None):
+        """Sample a planet-resolution float field with wrapped bilinear
+        filtering. This is the fast crop path used for streaming windows that
+        are still above the planet's native cell size."""
+        if grid is None:
+            grid = self._sample_planet_linear_grid(field.shape[1], field.shape[0],
+                                                   cx, cy, span, size)
+        x0, x1, y0, y1, tx, ty = grid
+        f00 = field[np.ix_(y0, x0)].astype(np.float32)
+        f01 = field[np.ix_(y0, x1)].astype(np.float32)
+        f10 = field[np.ix_(y1, x0)].astype(np.float32)
+        f11 = field[np.ix_(y1, x1)].astype(np.float32)
+        top = f00 * (1.0 - tx) + f01 * tx
+        bot = f10 * (1.0 - tx) + f11 * tx
+        return (top * (1.0 - ty) + bot * ty).astype(np.float32)
+
+    def _share_world_state(self, other):
+        other.has_history = self.has_history
+        for k in ("hist_days", "hist_pop", "hist_own", "hist_stress",
+                  "hist_unrest", "civ_cores", "eco"):
+            if hasattr(self, k):
+                setattr(other, k, getattr(self, k))
+
+    def stream_view(self, cx, cy, zoom, size=None):
+        """Return a fast sampled crop for realtime streaming.
+
+        For zoom levels that are still above the planet's native cell size, this
+        reuses the already-built planet fields and samples them directly at the
+        requested output resolution. Deep zoom still falls back to the refined
+        window generator so sub-cell terrain detail and local streams remain
+        available when you actually need them."""
+        zoom = max(1.0, float(zoom))
+        span = 1.0 / zoom
+        size = self.size if size is None else max(8, int(size))
+        if span >= 0.999 and size == self.size:
+            return self
+        if zoom > self.planet_size or size > self.size:
+            return self.view(cx, cy, zoom)
+
+        # PIXEL-SNAP the streaming window to the output tile lattice. Each output
+        # tile spans (span / size) in world units; quantizing the center to that
+        # lattice means consecutive frames either reuse the same crop or translate
+        # by whole tiles, so panning slides instead of shimmering. Without this,
+        # every sub-tile pan re-samples the planet at a shifted phase and the whole
+        # chunk pops by a fraction of a tile on each fetch.
+        step = span / size
+        cx = round((cx % 1.0) / step) * step
+        cy = round((cy % 1.0) / step) * step
+
+        key = (round(cx % 1.0, 9), round(cy % 1.0, 9), round(zoom, 6), size)
+        cached = getattr(self, "_stream_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+
+        s = WorldSlice.__new__(WorldSlice)
+        s.size, s.seed = size, self.seed
+        s.planet_size = self.planet_size
+        s.cx, s.cy, s.span = float(cx % 1.0), float(cy % 1.0), span
+        grid = self._sample_planet_linear_grid(self.elev.shape[1], self.elev.shape[0],
+                                               s.cx, s.cy, span, size)
+        s.elev = np.clip(self._sample_planet_linear(self.elev, s.cx, s.cy, span, size, grid),
+                         0.0, 1.0)
+        s.moist = np.clip(self._sample_planet_linear(self.moist, s.cx, s.cy, span, size, grid),
+                          0.0, 1.0)
+        s.accum = np.maximum(self._sample_planet_linear(self.accum, s.cx, s.cy, span, size, grid),
+                             0.0)
+        s.river_alpha = np.clip(self._sample_planet_linear(
+            self.river_alpha, s.cx, s.cy, span, size, grid), 0.0, 1.0)
+        s.river_disc = np.maximum(self._sample_planet_linear(
+            self.river_disc, s.cx, s.cy, span, size, grid), 0.0)
+        s.lake_lv = np.maximum(self._sample_planet_linear(
+            self.lake_level, s.cx, s.cy, span, size, grid), 0.0)
+        s.brook_alpha = np.zeros_like(s.river_alpha)
+        s.net = self.net
+        s.lake_level = self.lake_level
+        s.cloud1 = np.clip(self._sample_planet_linear(self.cloud1, s.cx, s.cy, span, size, grid),
+                           0.0, 1.0)
+        s.cloud2 = np.clip(self._sample_planet_linear(self.cloud2, s.cx, s.cy, span, size, grid),
+                           0.0, 1.0)
+        s.log_norm = self.log_norm
+        s._derive_grids()
+        self._share_world_state(s)
+        self._stream_cache = (key, s)
+        return s
 
     # ---- a cheap re-sampled window that SHARES this planet's history ---------
     def view(self, cx, cy, zoom):
@@ -705,11 +911,7 @@ class WorldSlice:
         s._derive_grids()
         # share the pre-integrated history + the live eco sim (both global, not
         # window-local) by reference, so zooming never rebuilds or forks them
-        s.has_history = self.has_history
-        for k in ("hist_days", "hist_pop", "hist_own", "hist_stress",
-                  "hist_unrest", "civ_cores", "eco"):
-            if hasattr(self, k):
-                setattr(s, k, getattr(self, k))
+        self._share_world_state(s)
         self._view_cache = (key, s)
         return s
 
@@ -861,7 +1063,6 @@ class WorldSlice:
         # normalized founding coords for city markers (yn, xn, faction, founded-day)
         self.civ_cores = [(cy / H, cx / H, f, float(t0s[f]))
                           for f, (cy, cx) in enumerate(cores)]
-
     def strided(self, st):
         s = WorldSlice.__new__(WorldSlice)
         size = self.size
@@ -1066,11 +1267,13 @@ def _city_dots(ws, img, t):
 def state(ws, t, sea_level, river_thr, season_amp, tide_amp, day_night):
     """Compute the per-tile world state ONCE — the data every view (and, later,
     Godot) reads. All field math lives here; the RGB renderers below are thin
-    skins over this dict. Shared fields (temperature, biome ids, vegetation) are
-    computed a single time instead of being re-derived per layer."""
+    skins over this dict. Shared fields (temperature, biome ids, vegetation,
+    clouds, normals, shadow masks) are computed a single time instead of being
+    re-derived per layer."""
     sea_eff, season_off, sun_x = frame_params(t, sea_level, tide_amp, season_amp)
     e = ws.elev
     tf = temperature_t(e, ws.lat, ws.lat_signed, sea_eff, season_off)
+    clouds = clouds_field(ws, t)
     st = {
         "ws": ws, "t": t, "sea_level": sea_level, "river_thr": river_thr,
         "tide_amp": tide_amp, "day_night": day_night,
@@ -1080,7 +1283,9 @@ def state(ws, t, sea_level, river_thr, season_amp, tide_amp, day_night):
                               getattr(ws, "lake_lv", None)),
         "veg": flora_field(ws, tf, sea_eff),
         "moist": ws.moist, "log_accum": ws.log_accum,
+        "clouds": clouds,
     }
+    st.update(_lighting_fields(ws, sun_x, season_off, day_night, clouds))
     lake_lv = getattr(ws, "lake_lv", None)
     if lake_lv is not None:
         st["veg"] = np.where(e < lake_lv, 0.0, st["veg"]).astype(np.float32)
@@ -1130,10 +1335,9 @@ def colorize(st, layer):
         img = color_ramp(ws.log_accum, *FLOW_RAMP)
     elif layer == "clouds":
         base = BIOME_LUT[st["biome_id"]] * 0.45
-        cov = clouds_field(ws, t)[..., None]
+        cov = st["clouds"][..., None]
         img = base * (1 - cov) + np.array([242, 246, 250], np.float32) * cov
-        l = daylight_row(ws.xn, sun_x, day_night)[None, :, None]
-        img *= 0.35 + 0.65 * l
+        img *= (0.30 + 0.70 * st["sunlight"])[..., None]
     elif layer == "flora":
         # LIVING vegetation = climatic baseline x ecosystem health, then scars.
         veg = st["veg"] * st["veg_health"]
@@ -1181,11 +1385,13 @@ def colorize(st, layer):
         img = img * (1 - short) + np.array([150, 70, 200], np.float32) * short
         _city_dots(ws, img, t)
     elif layer == "light":
-        l = daylight_row(ws.xn, sun_x, day_night)[None, :]
+        l = st["sunlight"]
+        sh = (1.0 - st["terrain_shadow"]) * st["sun_up"]
+        ch = (1.0 - st["cloud_shadow"]) * st["sun_up"]
         img = np.empty(e.shape + (3,), np.float32)
-        img[..., 0] = 255 * l
-        img[..., 1] = 248 * l
-        img[..., 2] = 80 + 145 * l
+        img[..., 0] = (44 + 211 * l) * (1.0 - 0.18 * ch)
+        img[..., 1] = (40 + 204 * l) * (1.0 - 0.26 * ch)
+        img[..., 2] = 62 + 154 * l + 34 * sh
     else:  # biome / composite
         # geography is cut by the SLIDER sea level (+ tidal band), so the sand
         # stays put; the instantaneous tide only sweeps a waterline across it.
@@ -1194,7 +1400,11 @@ def colorize(st, layer):
         wet = (e >= lo) & (e < sea_eff)                 # intertidal sand, now wet
         img[wet] = (70, 130, 180)
         if layer == "composite":
-            img[land] *= ws.shade[land, None]
+            img *= ws.shade[..., None]
+            l = st["sunlight"]
+            img[..., 0] *= l
+            img[..., 1] *= l * 0.96 + 0.04
+            img[..., 2] *= l * 0.84 + 0.16
             ra = getattr(ws, "river_alpha", None)
             if ra is not None:
                 # the slider fades tributaries below the threshold instead of
@@ -1211,10 +1421,6 @@ def colorize(st, layer):
                 wat = (np.array([86, 148, 205], np.float32) * (1 - depth)
                        + np.array([30, 80, 150], np.float32) * depth)
                 img = img * (1 - a) + wat * a
-            l = daylight_row(ws.xn, sun_x, day_night)[None, :]
-            img[..., 0] *= l
-            img[..., 1] *= l * 0.96 + 0.04
-            img[..., 2] *= l * 0.82 + 0.18
     return np.clip(img, 0, 255).astype(np.uint8)
 
 

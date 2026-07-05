@@ -144,11 +144,13 @@ progress.on{display:block}
   </aside>
 </main>
 
-<script src="pyodide/pyodide.js"></script>
 <script>
 "use strict";
 /* All world math is Python (worldgen.py + world_core.py) running in Pyodide.
    This script is only glue: canvas blitting, control wiring, zip download. */
+
+const PYODIDE_CDN = "https://cdn.jsdelivr.net/pyodide/v0.26.4/full/";
+let pyodideIndexURL = "pyodide/";
 
 const S = {
   seed: 42, size: 256, seaLevel: 0.42, riverThr: 120,
@@ -190,13 +192,45 @@ function syncSel(){ for (const [k] of LAYERS) thumbs[k].btn.classList.toggle("ac
 // ---------- pyodide bootstrap ----------
 let py = null, pyRender = null, pyBuild = null, pyView = null, pyEco = null, pyEcoReset = null;
 
+function loadScript(src){
+  return new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = src;
+    s.onload = resolve;
+    s.onerror = () => reject(new Error(`failed to load ${src}`));
+    document.head.appendChild(s);
+  });
+}
+
+async function ensurePyodide(){
+  if (globalThis.loadPyodide) return;
+  try {
+    await loadScript("pyodide/pyodide.js");
+    pyodideIndexURL = "pyodide/";
+  } catch (_err) {
+    busysub.textContent = "local pyodide runtime not found; loading CDN fallback…";
+    await loadScript(PYODIDE_CDN + "pyodide.js");
+    pyodideIndexURL = PYODIDE_CDN;
+  }
+}
+
+async function fetchSource(name){
+  const paths = [`${name}?v=9`, `../${name}?v=9`];
+  for (const path of paths){
+    const res = await fetch(path);
+    if (res.ok) return await res.text();
+  }
+  throw new Error(`could not fetch ${name} from local site or repo root`);
+}
+
 async function boot(){
-  const pyodide = await loadPyodide({ indexURL: "pyodide/" });
+  await ensurePyodide();
+  const pyodide = await loadPyodide({ indexURL: pyodideIndexURL });
   busysub.textContent = "loading numpy…";
   await pyodide.loadPackage("numpy");
   busysub.textContent = "fetching world code…";
   for (const f of ["worldgen.py", "world_core.py"]){
-    const src = await (await fetch(f + "?v=9")).text();
+    const src = await fetchSource(f);
     pyodide.FS.writeFile(f, src);
   }
   pyodide.runPython(`
@@ -211,7 +245,7 @@ def build(seed, size, thumb_px, civ_count):
 
 def set_view(cx, cy, zoom):
     # cheap re-sample of a window; reuses the planet's history + cores
-    _state["view"] = _state["full"].view(float(cx), float(cy), float(zoom))
+  _state["view"] = _state["full"].stream_view(float(cx), float(cy), float(zoom), _state["full"].size)
 
 def eco_step(days, sea, season_off):
     # advance the stateful ecosystem (the living world) with the clock

@@ -7,7 +7,9 @@ for the full design. This repo is the Python prototype stage of the roadmap:
   tileable noise → elevation & moisture, and D8 flow → rivers. Pure numbers.
 - `world_core.py` — the shared core. `state(ws, t, …)` computes the world's
   **per-tile data once** (elevation, temperature, biome ids, vegetation, water,
-  ecosystem health …); `colorize(state, layer)` is a thin RGB skin over it, and
+  ecosystem health, plus the Godot-facing render payload: carved height,
+  terrain normal, center sun vector, cloud cover, terrain shadow, cloud shadow,
+  and final sunlight …); `colorize(state, layer)` is a thin RGB skin over it, and
   `render()` wraps the two. Also holds the M2 time layer, the M3 history CA, and
   the M4 `EcoSim`. numpy in, data/pixels out; no UI, no I/O. `state()` is the
   seam a Godot `TileMapLayer` reads directly.
@@ -31,6 +33,20 @@ pip install -r requirements.txt
 python3 world_viewer.py                 # default: seed 42, 256² (fluid)
 python3 world_viewer.py --seed 7 --size 512   # prettier, heavier rebuilds
 ```
+
+## Godot prototype
+
+A Godot 4 prototype client now lives in `godot_client/`. It keeps simulation in
+Python and streams a player-centered chunk through `godot_bridge.py`.
+
+```bash
+python godot_bridge.py --seed 42 --size 192 --civ-count 3
+```
+
+Open `godot_client/` in Godot 4.2+ and run the main scene. The current client
+is a 3D chunk renderer with sprite-stacked props and parallax layers. If you
+later switch to an authored `TileMapLayer` terrain surface, `better-terrain`
+would be a good fit there; see `godot_client/README.md`.
 
 ## The interface
 
@@ -75,7 +91,7 @@ Time model: 1 sim day = one day/night cycle, year = 96 days, tide ≈ 12.5 h.
 | Fauna | **living** herbivore/predator biomass (Lotka–Volterra) × ecosystem health — the game map | population CA ⊕ M4 Δ |
 | Civilization | 1–6 factions from the M3 history, **dimmed where the ecosystem has collapsed** and charred where scorched | history CA ⊕ M4 Δ |
 | History | the chronicle: same territory with conflict fronts (red) and shortage/blight zones (violet) drawn on | history CA (M3) |
-| Daylight | the day/night terminator | sin(t) |
+| Light | sun-driven lighting from the current heightfield, with terrain normals and projected terrain/cloud shadows | heightfield + cloud projection |
 
 ### M3 — the history simulation
 
