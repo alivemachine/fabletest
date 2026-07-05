@@ -63,7 +63,12 @@ PLANET_KM = 4000.0      # map width; fixes the physical meaning of one cell
 RIVER_W_KM = 0.0035     # hydraulic width: w[km] ≈ this · sqrt(drainage[km²])
 CARVE_DEPTH = 0.012     # valley depth (elevation units) for a threshold river
 MEANDER = 0.30          # midpoint displacement as a fraction of segment length
-BROOK_MIN = 170         # window cells a local stream must drain to be drawn
+BROOK_MIN = 170         # brook-grid cells a local stream must drain to be drawn
+BROOK_TILE_SPAN = 0.125  # brooks are DEFINED once at this fixed world scale:
+                         # drainage has a real minimum catchment, so branches
+                         # stop multiplying past it — deeper zoom magnifies
+                         # the same brooks instead of inventing new ones
+BROOK_TILE_MC = 40       # margin cells of D8 context beyond each tile edge
 
 
 def _net_threshold(planet_size):
@@ -372,7 +377,7 @@ def _local_streams(elev, moist, trunk_alpha, lake_lv, cx, cy, span, seed,
                        0.0, 0.55)
     # drainage density follows rainfall: deserts carry few perennial brooks
     a *= np.clip((moist - 0.12) / 0.45, 0.06, 1.0).astype(np.float32)
-    return a, acc.astype(np.float32)
+    return a, acc.astype(np.float32), parent
 
 # ---------------------------------------------------------------------------
 # Time model (M2). t is measured in sim DAYS.
@@ -1023,6 +1028,96 @@ class WorldSlice:
             if hasattr(self, k):
                 setattr(other, k, getattr(self, k))
 
+    # ---- brooks at a FIXED world scale ------------------------------------
+    # The drainage below the vector tree is computed ONCE per world tile and
+    # extracted as segments, so every window at every zoom rasterizes the
+    # same geometry: branches stop multiplying at the tile scale's minimum
+    # catchment (drainage density is physically finite), and panning/zooming
+    # cannot rearrange them — deeper zoom just magnifies the same brooks.
+    def _brook_tile(self, ti, tj):
+        cache = getattr(self, "_brook_tiles", None)
+        if cache is None:
+            cache = self._brook_tiles = {}
+        nt = int(round(1.0 / BROOK_TILE_SPAN))
+        key = (int(ti) % nt, int(tj) % nt)
+        hit = cache.get(key)
+        if hit is not None:
+            return hit
+        tspan, tsize = BROOK_TILE_SPAN, self.size
+        gsize = tsize + 2 * BROOK_TILE_MC
+        gspan = tspan * gsize / tsize            # same cell size as the core
+        tcx = (key[0] + 0.5) * tspan
+        tcy = (key[1] + 0.5) * tspan
+        elev = elevation_window(gsize, self.seed, tcx, tcy, gspan)
+        alpha, _disc, carve = _stroke_field(self.net, tcx, tcy, gspan, gsize,
+                                            self.planet_size, self.seed)
+        elev = np.clip(elev - carve, 0.0, 1.0)
+        moist = moisture_window(gsize, self.seed, tcx, tcy, gspan)
+        lake = self._sample_planet(self.lake_level, tcx, tcy, gspan, gsize)
+        a, acc, parent = _local_streams(elev, moist, alpha, lake,
+                                        tcx, tcy, gspan, self.seed)
+        # cell -> parent segments for brook cells OWNED by the tile core (the
+        # margin only provides D8 context; neighbours own their own cells)
+        idx = np.nonzero(a.reshape(-1) > 0)[0]
+        par = parent[idx]
+        y0, x0 = np.divmod(idx, gsize)
+        y1, x1 = np.divmod(par, gsize)
+        own = ((x0 >= BROOK_TILE_MC) & (x0 < BROOK_TILE_MC + tsize)
+               & (y0 >= BROOK_TILE_MC) & (y0 < BROOK_TILE_MC + tsize))
+        cell = tspan / tsize
+
+        def rel(c):                              # tile-frame world coords
+            return ((c - BROOK_TILE_MC + 0.5) * cell).astype(np.float32)
+
+        val = (rel(x0[own]), rel(y0[own]), rel(x1[own]), rel(y1[own]),
+               a.reshape(-1)[idx][own].astype(np.float32),
+               acc.reshape(-1)[idx][own].astype(np.float32))
+        cache[key] = val
+        return val
+
+    def _brook_window(self, cx, cy, span, size):
+        """Rasterize the fixed-scale brook segments into a window: returns
+        (alpha, acc), render-sized. Every zoom draws the SAME brooks."""
+        alpha = np.zeros((size, size), np.float32)
+        acc = np.zeros((size, size), np.float32)
+        tspan = BROOK_TILE_SPAN
+        left, top = cx - span / 2, cy - span / 2
+        parts = []
+        for tj in range(int(np.floor(top / tspan)),
+                        int(np.floor((top + span) / tspan)) + 1):
+            for ti in range(int(np.floor(left / tspan)),
+                            int(np.floor((left + span) / tspan)) + 1):
+                x0, y0, x1, y1, av, cv = self._brook_tile(ti, tj)
+                if len(x0):
+                    parts.append((x0 + ti * tspan, y0 + tj * tspan,
+                                  x1 + ti * tspan, y1 + tj * tspan, av, cv))
+        if not parts:
+            return alpha, acc
+        x0, y0, x1, y1, av, cv = (np.concatenate([p[i] for p in parts])
+                                  for i in range(6))
+        cell = tspan / self.size
+        keep = ((np.minimum(x0, x1) < left + span + cell)
+                & (np.maximum(x0, x1) > left - cell)
+                & (np.minimum(y0, y1) < top + span + cell)
+                & (np.maximum(y0, y1) > top - cell))
+        if not keep.any():
+            return alpha, acc
+        x0, y0, x1, y1, av, cv = (v[keep] for v in (x0, y0, x1, y1, av, cv))
+        # resample each segment at ~pixel steps and splat (crisp 1px lines)
+        k = max(2, int(cell * size / span * 1.5) + 1)
+        ts = np.linspace(0.0, 1.0, k, dtype=np.float32)[:, None]
+        xi = (((x0[None, :] + (x1 - x0)[None, :] * ts) - left)
+              / span * size).astype(np.int64).ravel()
+        yi = (((y0[None, :] + (y1 - y0)[None, :] * ts) - top)
+              / span * size).astype(np.int64).ravel()
+        aa = np.broadcast_to(av[None, :], (k, len(av))).ravel()
+        cc = np.broadcast_to(cv[None, :], (k, len(cv))).ravel()
+        ok = (xi >= 0) & (xi < size) & (yi >= 0) & (yi < size)
+        xi, yi, aa, cc = xi[ok], yi[ok], aa[ok], cc[ok]
+        np.maximum.at(alpha, (yi, xi), aa)
+        np.maximum.at(acc, (yi, xi), cc)
+        return alpha, acc
+
     def stream_view(self, cx, cy, zoom, size=None):
         """Return a fast sampled crop for realtime streaming.
 
@@ -1137,11 +1232,12 @@ class WorldSlice:
         s.brook_alpha = np.zeros_like(alpha)
         s.accum = disc
         if span <= 0.14:
-            # deep zoom: the planet-res drainage has run out of detail, so run
-            # REAL local drainage on the refined, carved window elevation. The
-            # carved trunks / lakes / sea are the drains it empties into.
-            s.brook_alpha, acc_local = _local_streams(
-                s.elev, s.moist, alpha, s.lake_lv, cx, cy, span, self.seed)
+            # deep zoom: the planet-res drainage has run out of detail. The
+            # brooks come from the FIXED-scale tile network (computed once
+            # per world tile, cached), so every zoom level draws the SAME
+            # branches — they stop multiplying at the tiles' minimum
+            # catchment and cannot shift under pan/zoom.
+            s.brook_alpha, acc_local = self._brook_window(cx, cy, span, size)
             # flow layer: lift local cell counts so a just-visible brook reads
             # like the smallest vector river (display scaling only)
             lift = _net_threshold(self.planet_size) / BROOK_MIN

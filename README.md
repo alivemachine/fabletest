@@ -212,6 +212,14 @@ pixels wide as you dive in. The viewport **pixel-snaps** to the drainage
 lattice, so panning translates the exact same samples — no shimmer — and drag
 frames that snap to the same cell reuse the cached window.
 
+**Brooks stop branching.** Drainage density is physically finite — below a
+minimum catchment, water doesn't channelize — so the sub-river network is
+DEFINED once at a fixed world scale: world-aligned tiles (span 1/8, planet
+cell size, D8 with margin context, cached) whose brook cells are extracted as
+world-space segments. Every window at every zoom rasterizes those same
+segments, so zooming deeper magnifies the same brooks instead of inventing
+finer ones, and panning cannot rearrange them.
+
 **Settlements under zoom (the first M4 `expand()`):** below `SETTLE_SPAN` the
 civ summary resolves into settlements. Candidate sites live on a hashed
 lattice (16 per HIST cell); a site founds when its cell's population clears a
