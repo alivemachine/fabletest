@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - claude/map-layers-animation-prototype-j106dp
+      - claude/day-night-map-layers-7jfzgu
       - main
   workflow_dispatch:
 
