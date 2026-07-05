@@ -382,7 +382,11 @@ TIDE_PERIOD = 0.52        # ~semi-diurnal tide
 FAUNA_PERIOD = 32.0       # predator-prey limit cycle length (days)
 NORMAL_RELIEF_WORLD = 0.018
 SHADOW_RELIEF_WORLD = 0.090
-SOLAR_TILT = np.deg2rad(47.0)   # season_off in [-0.5,0.5] -> +/-23.5 deg
+SUN_LEAN = 0.35           # fixed southward lean of the sun path (flat map):
+                          # shadows always point one way and never vanish at
+                          # noon, so the cast-shadow field stays usable as a
+                          # global shadow map for sprite-stack lighting
+SUN_SEASON_LEAN = 0.30    # how far season_off (+/-0.5) swings that lean
 TERRAIN_SHADOW_STEPS = 56
 CLOUD_WORLD_HEIGHT = 0.010
 CLOUD_SHADOW_STRENGTH = 0.50
@@ -475,15 +479,6 @@ def temperature_t(elev, lat, lat_signed, sea_eff, season_off):
     return np.clip(t, 0, 1)
 
 
-def daylight_row(xn, sun_x, depth):
-    """Per-longitude light factor: 1 at noon, floor at midnight."""
-    c = np.cos(2 * np.pi * (xn - sun_x))
-    s = np.clip((c + 0.15) / 0.45, 0, 1)
-    s = s * s * (3 - 2 * s)
-    floor = 1 - 0.72 * depth
-    return floor + (1 - floor) * s
-
-
 def _sample_offset(a, ox, oy, fill):
     """Sample `a` with a non-wrapping integer offset: out[y,x] = a[y+oy,x+ox]."""
     out = np.full_like(a, fill)
@@ -499,20 +494,22 @@ def _sample_offset(a, ox, oy, fill):
 
 
 def _sun_field(ws, sun_x, season_off):
-    """Per-pixel sun direction in local east/south/up coordinates."""
-    lat = ws.lat_signed * (0.5 * np.pi)
-    hour = (ws.xn[None, :] - sun_x) * (2 * np.pi)
-    decl = SOLAR_TILT * season_off
-    sin_lat, cos_lat = np.sin(lat), np.cos(lat)
-    sin_hour, cos_hour = np.sin(hour), np.cos(hour)
-    sin_decl, cos_decl = np.sin(decl), np.cos(decl)
-    sx = -cos_decl * sin_hour
-    sy = sin_lat * cos_decl * cos_hour - cos_lat * sin_decl
-    sz = sin_lat * sin_decl + cos_lat * cos_decl * cos_hour
-    inv = 1.0 / np.maximum(np.sqrt(sx * sx + sy * sy + sz * sz), 1e-6)
-    return ((sx * inv).astype(np.float32),
-            (sy * inv).astype(np.float32),
-            (sz * inv).astype(np.float32))
+    """Per-column sun direction (east/south/up) for a FLAT map.
+
+    Local time depends only on x: the sun rises in the east, arcs overhead,
+    and sets in the west, so the day/night terminator is a straight band that
+    sweeps across the map as t advances. Every row sees the same sky — no
+    spherical/equirectangular terms, and the hillshade direction no longer
+    drifts with latitude or pan."""
+    hour = (ws.xn - sun_x) * (2 * np.pi)          # 0 at local noon
+    sx = -np.sin(hour)                            # east at dawn -> west at dusk
+    sz = np.cos(hour)                             # up: +1 noon, -1 midnight
+    sy = np.full_like(sx, SUN_LEAN + SUN_SEASON_LEAN * season_off)
+    inv = 1.0 / np.sqrt(sx * sx + sy * sy + sz * sz)
+    rows = np.ones((ws.size, 1), np.float32)      # broadcast to the full grid
+    return ((rows * (sx * inv)).astype(np.float32),
+            (rows * (sy * inv)).astype(np.float32),
+            (rows * (sz * inv)).astype(np.float32))
 
 
 def _terrain_shadow(height, sx, sy, sz, pixel_world):
