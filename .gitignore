@@ -1,4 +1,9 @@
 exports/
 __pycache__/
 world_*.png
-pyodide-0.26.4.tar.bz2
+*.log
+# build output — assembled by .github/workflows/pages.yml, never committed
+_site/
+# vendored Pyodide runtime — downloaded by the Pages workflow at deploy time
+pyodide/
+pyodide-*.tar.bz2
