@@ -547,25 +547,35 @@ def _cloud_shadow(clouds, sx, sy, sz, pixel_world):
                    1.0 - CLOUD_SHADOW_STRENGTH, 1.0).astype(np.float32)
 
 
-def _lighting_fields(ws, sun_x, season_off, day_night, clouds):
+def _lighting_fields(ws, sun_x, season_off, day_night, clouds, sea_eff):
     """Derived lighting payload: normals, sun visibility, and shadow masks.
 
     One sun direction lights the whole frame; ndotl (the normal map), the
     terrain cast shadows and the cloud shadows all use that same vector, so
-    they agree by construction."""
+    they agree by construction. Lighting sees the WATER SURFACE, not the
+    seabed: elevation is clamped to sea level before deriving normals and
+    shadow heights, so the sea is a flat plane, relief flattens exactly at
+    the waterline, and mountains cast shadows onto the water."""
     sx, sy, sz = _sun_dir(sun_x, season_off)
-    ndotl = np.clip(ws.normal[..., 0] * sx + ws.normal[..., 1] * sy
-                    + ws.normal[..., 2] * sz, 0, 1).astype(np.float32)
+    e_lit = np.maximum(ws.elev, np.float32(sea_eff))
+    gy, gx = np.gradient(e_lit, ws.pixel_world, ws.pixel_world)
+    nx = -gx * NORMAL_RELIEF_WORLD
+    ny = -gy * NORMAL_RELIEF_WORLD
+    inv = 1.0 / np.sqrt(nx * nx + ny * ny + 1.0)
+    ndotl = np.clip((nx * sx + ny * sy + sz) * inv, 0, 1).astype(np.float32)
+    height = (e_lit * SHADOW_RELIEF_WORLD).astype(np.float32)
     day = float(smoothstep((sz + 0.10) / 0.20))   # whole-map dusk/dawn fade
-    terrain_vis = _terrain_shadow(ws.height, sx, sy, max(sz, 0.0),
+    terrain_vis = _terrain_shadow(height, sx, sy, max(sz, 0.0),
                                   ws.pixel_world)
     cloud_vis = _cloud_shadow(clouds, sx, sy, max(sz, 0.08), ws.pixel_world)
     direct = ndotl * terrain_vis * cloud_vis
     lit = day * (0.28 + 0.72 * direct)
     floor = 1.0 - 0.72 * day_night
     sunlight = floor + (1.0 - floor) * lit
+    nz = np.ones_like(e_lit, np.float32)
     return {
-        "normal": ws.normal,
+        "normal": np.stack((nx * inv, ny * inv, nz * inv),
+                           axis=2).astype(np.float32),
         "sun_dir": np.array([sx, sy, sz], np.float32),
         "sun_up": np.float32(max(sz, 0.0)),
         "terrain_shadow": terrain_vis,
@@ -612,8 +622,10 @@ def fauna_field(flora, t):
 
 
 def clouds_field(ws, t):
-    """Cloud cover in [0,1]: two noise sheets advected by the wind, gated by
-    moisture, piled up on windward slopes. Pure, seekable function of t."""
+    """Cloud cover in [0,1]: two noise sheets drifting with the wind at
+    different speeds. Pure, seekable function of t, and fully decoupled from
+    the terrain below — no moisture gating, no orographic (slope) term, so
+    the cover is just a mask that moves."""
     size = ws.elev.shape[0]
     ox1 = int((t * size / 6.0)) % size
     ox2 = int((t * size / 11.0)) % size
@@ -621,8 +633,7 @@ def clouds_field(ws, t):
     c1 = np.roll(ws.cloud1, ox1, axis=1)
     c2 = np.roll(np.roll(ws.cloud2, ox2, axis=1), oy2, axis=0)
     sheet = 0.6 * c1 + 0.4 * c2
-    density = sheet * (0.45 + 0.55 * ws.moist) + 0.35 * ws.orographic
-    return smoothstep((density - 0.42) / 0.35).astype(np.float32)
+    return smoothstep((sheet - 0.46) / 0.30).astype(np.float32)
 
 
 # ===========================================================================
@@ -1280,7 +1291,8 @@ def state(ws, t, sea_level, river_thr, season_amp, tide_amp, day_night):
         "moist": ws.moist, "log_accum": ws.log_accum,
         "clouds": clouds,
     }
-    st.update(_lighting_fields(ws, sun_x, season_off, day_night, clouds))
+    st.update(_lighting_fields(ws, sun_x, season_off, day_night, clouds,
+                               sea_eff))
     lake_lv = getattr(ws, "lake_lv", None)
     if lake_lv is not None:
         st["veg"] = np.where(e < lake_lv, 0.0, st["veg"]).astype(np.float32)
@@ -1329,10 +1341,10 @@ def colorize(st, layer):
     elif layer == "flow":
         img = color_ramp(ws.log_accum, *FLOW_RAMP)
     elif layer == "clouds":
-        base = BIOME_LUT[st["biome_id"]] * 0.45
-        cov = st["clouds"][..., None]
-        img = base * (1 - cov) + np.array([242, 246, 250], np.float32) * cov
-        img *= (0.30 + 0.70 * st["sunlight"])[..., None]
+        # pure black & white cover mask: white = cloud, black = clear sky.
+        # No terrain underlay, no lighting — this is the raw occlusion input
+        # the shadow pass consumes.
+        img = np.repeat((st["clouds"] * 255.0)[..., None], 3, axis=2)
     elif layer == "flora":
         # LIVING vegetation = climatic baseline x ecosystem health, then scars.
         veg = st["veg"] * st["veg_health"]
