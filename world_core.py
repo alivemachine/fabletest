@@ -663,6 +663,24 @@ def _window_indices(ws, n=HIST_SIZE):
     return np.ix_(ri, ci)
 
 
+def _history_coarse(ws, t):
+    """Interpolate the coarse HIST timeline at day t. Returns
+    (pop, faction_id, stress, unrest) at HIST_SIZE x HIST_SIZE — the summary
+    grids both the upsampled layers and the M4 settlement expand() read."""
+    days = ws.hist_days
+    tc = float(np.clip(t, days[0], days[-1]))
+    i = int(np.searchsorted(days, tc, side="right") - 1)
+    i = max(0, min(i, len(days) - 2))
+    span = days[i + 1] - days[i]
+    fr = 0.0 if span <= 0 else (tc - days[i]) / span
+    pop = ((1 - fr) * ws.hist_pop[i] + fr * ws.hist_pop[i + 1]) * (POP_MAX / 255.0)
+    stress = ((1 - fr) * ws.hist_stress[i] + fr * ws.hist_stress[i + 1]) / 255.0
+    unrest = ((1 - fr) * ws.hist_unrest[i] + fr * ws.hist_unrest[i + 1]) / 255.0
+    own = ws.hist_own[i] if fr < 0.5 else ws.hist_own[i + 1]
+    return (pop.astype(np.float32), own,
+            stress.astype(np.float32), unrest.astype(np.float32))
+
+
 def _sample_history(ws, t):
     """Interpolate the coarse history timeline at day t and upsample to the
     render grid. Returns (pop, faction_id, stress, unrest), all render-sized."""
@@ -671,23 +689,150 @@ def _sample_history(ws, t):
         z = np.zeros((size, size), np.float32)
         return z, np.full((size, size), -1, np.int16), z, z
 
-    days = ws.hist_days
-    tc = float(np.clip(t, days[0], days[-1]))
-    i = int(np.searchsorted(days, tc, side="right") - 1)
-    i = max(0, min(i, len(days) - 2))
-    span = days[i + 1] - days[i]
-    fr = 0.0 if span <= 0 else (tc - days[i]) / span
-
-    pop_c = ((1 - fr) * ws.hist_pop[i] + fr * ws.hist_pop[i + 1]) * (POP_MAX / 255.0)
-    stress_c = ((1 - fr) * ws.hist_stress[i] + fr * ws.hist_stress[i + 1]) / 255.0
-    unrest_c = ((1 - fr) * ws.hist_unrest[i] + fr * ws.hist_unrest[i + 1]) / 255.0
-    own_c = ws.hist_own[i] if fr < 0.5 else ws.hist_own[i + 1]
+    pop_c, own_c, stress_c, unrest_c = _history_coarse(ws, t)
 
     # map each render pixel to its coarse history cell via WORLD coordinates,
     # so the timeline lines up with the (possibly zoomed) window on screen.
     up = _window_indices(ws)
     return (pop_c[up].astype(np.float32), own_c[up].astype(np.int16),
             stress_c[up].astype(np.float32), unrest_c[up].astype(np.float32))
+
+
+# ---------------------------------------------------------------------------
+# M4 expand() — society. A coarse history cell's summary (faction, population,
+# stress) resolves under zoom into settlements: sites on a hashed lattice,
+# buildings laid out along hashed street lanes. Like the rivers, NOTHING is
+# stored — the same world-space geometry is re-derived for whatever window
+# looks at it, so every visit to a village finds the same village.
+# ---------------------------------------------------------------------------
+SETTLE_GRID = 192        # settlement-site lattice (16 candidate sites/HIST cell)
+SETTLE_SPAN = 0.35       # windows narrower than this resolve settlements
+SETTLE_POP_MIN = 0.05    # coarse population where the first hamlet appears
+SETTLE_MAX_SITES = 400   # budget governor: most-populous sites expand first
+BUILD_WORLD = 0.00035    # building footprint, world units
+
+
+def _settlements(ws, t, sea_level):
+    """Rasterize the settlements the coarse history implies for this window.
+
+    Returns (alpha, rgb), render-sized; alpha is 1 on building footprints.
+    Sites exist where their HIST cell's population clears a hash-staggered
+    threshold, so villages appear one by one as a region fills (and vanish if
+    it empties). All geometry is keyed on (seed, lattice cell): deterministic,
+    windowless, O(visible cells). Cached per (window, sim day)."""
+    size = ws.size
+    key = (round(ws.cx, 9), round(ws.cy, 9), round(ws.span, 9), size,
+           int(t), round(float(sea_level), 3))
+    cached = getattr(ws, "_settle_cache", None)
+    if cached is not None and cached[0] == key:
+        return cached[1], cached[2]
+    alpha = np.zeros((size, size), np.float32)
+    rgb = np.zeros((size, size, 3), np.float32)
+    if getattr(ws, "has_history", False) and ws.span < SETTLE_SPAN:
+        # summary grids at the START of the current sim day (stable per day)
+        pop_c, own_c, stress_c, _ = _history_coarse(ws, float(int(t)) + 0.5)
+        G = SETTLE_GRID
+        left, top = ws.cx - ws.span / 2, ws.cy - ws.span / 2
+        pad = 1.0 / G
+        i0 = int(np.floor((left - pad) * G))
+        i1 = int(np.ceil((left + ws.span + pad) * G))
+        j0 = int(np.floor((top - pad) * G))
+        j1 = int(np.ceil((top + ws.span + pad) * G))
+        gi = np.arange(i0, i1 + 1, dtype=np.int64)[None, :] % G   # cols (x)
+        gj = np.arange(j0, j1 + 1, dtype=np.int64)[:, None] % G   # rows (y)
+        h_ex = _corner_hash(ws.seed + 101, 0, gi, gj)
+        h_jx = _corner_hash(ws.seed + 101, 1, gi, gj)
+        h_jy = _corner_hash(ws.seed + 101, 2, gi, gj)
+        wx = (gi.astype(np.float32) + 0.2 + 0.6 * h_jx) / G       # site world x
+        wy = (gj.astype(np.float32) + 0.2 + 0.6 * h_jy) / G       # site world y
+        hi = (wy * HIST_SIZE).astype(np.int64) % HIST_SIZE
+        hj = (wx * HIST_SIZE).astype(np.int64) % HIST_SIZE
+        pop = pop_c[hi, hj]
+        own = own_c[hi, hj]
+        stress = stress_c[hi, hj]
+        # staggered founding: each site has its own hashed threshold, so a
+        # filling cell lights its hamlets up one at a time, biggest cells first
+        exists = (own >= 0) & (pop > SETTLE_POP_MIN * (0.6 + 2.8 * h_ex))
+        ys, xs = np.nonzero(exists)
+        if len(ys) > SETTLE_MAX_SITES:                 # budget governor
+            order = np.argsort(-pop[ys, xs])[:SETTLE_MAX_SITES]
+            ys, xs = ys[order], xs[order]
+        px_w = size / ws.span                          # pixels per world unit
+        bpx = max(1, int(round(BUILD_WORLD * px_w)))
+        lake = np.asarray(getattr(ws, "lake_lv", 0.0))
+        ra = getattr(ws, "river_alpha", None)
+        wall = np.array([228, 214, 186], np.float32)   # sun-dried plaster
+
+        def place(sxw, syw, p, fid, dim, hsite, hx, hy):
+            """One settlement: 2-4 street lanes, two building rows per lane.
+            Every quantity is hashed from (hsite, building index) — the same
+            village on every visit. Buildings never stand in water or on a
+            river."""
+            fx = ((sxw - left) % 1.0) / ws.span
+            fy = ((syw - top) % 1.0) / ws.span
+            if fx >= 1.0 + pad / ws.span or fy >= 1.0 + pad / ws.span:
+                return
+            exi = min(size - 1, max(0, int(fx * size)))
+            eyi = min(size - 1, max(0, int(fy * size)))
+            lakev = float(lake[eyi, exi]) if lake.ndim == 2 else float(lake)
+            if ws.elev[eyi, exi] < max(sea_level + 0.004, lakev):
+                return                                 # site must stand on land
+            n = 3 + int(min(p, 1.2) * 30)              # hamlet -> town
+            lanes = 2 + (hsite % 3)
+            rings = max(1, -(-n // (lanes * 2)))       # ceil
+            spacing = (0.42 / G) / (rings + 1)
+            base_a = 2 * np.pi * ((hsite >> 7) & 1023) / 1024.0
+            tint = CIV_COLORS[min(max(fid, 0), len(CIV_COLORS) - 1)]
+            k = 0
+            for ring in range(1, rings + 1):
+                for ln in range(lanes):
+                    for side in (-1.0, 1.0):
+                        if k >= n:
+                            break
+                        hb = float(_corner_hash(ws.seed + 505, k,
+                                                np.int64(hx), np.int64(hy)))
+                        a = base_a + ln * (2 * np.pi / lanes) + (hb - 0.5) * 0.3
+                        d = ring * spacing * (0.8 + 0.4 * hb)
+                        off = side * (1.1 + 0.9 * hb) * BUILD_WORLD
+                        bx = sxw + np.cos(a) * d - np.sin(a) * off
+                        by = syw + np.sin(a) * d + np.cos(a) * off
+                        x0 = int(((bx - left) % 1.0) / ws.span * size)
+                        y0 = int(((by - top) % 1.0) / ws.span * size)
+                        k += 1
+                        if x0 < 0 or y0 < 0 or x0 >= size or y0 >= size:
+                            continue
+                        lakev = (float(lake[y0, x0]) if lake.ndim == 2
+                                 else float(lake))
+                        if ws.elev[y0, x0] < max(sea_level + 0.003, lakev):
+                            continue                   # never build in water
+                        if ra is not None and ra[y0, x0] > 0.35:
+                            continue                   # nor on the river
+                        col = (0.42 * tint + 0.58 * wall) * (0.6 + 0.4 * hb) * dim
+                        x1, y1 = min(size, x0 + bpx), min(size, y0 + bpx)
+                        alpha[y0:y1, x0:x1] = 1.0
+                        rgb[y0:y1, x0:x1] = col
+
+        for y, x in zip(ys, xs):
+            hsite = ((int(gi[0, x]) * 73856093) ^ (int(gj[y, 0]) * 19349663)
+                     ^ (ws.seed * 83492791)) & 0x7FFFFFFF
+            place(float(wx[y, x]), float(wy[y, x]), float(pop[y, x]),
+                  int(own[y, x]), 1.0 - 0.45 * float(stress[y, x]),
+                  hsite, int(gi[0, x]), int(gj[y, 0]))
+
+        # capitals: each faction's founding core is a GUARANTEED town at its
+        # exact world position (the coarse cell around it may be mostly sea)
+        for idx, (cyn, cxn, fid, t0) in enumerate(getattr(ws, "civ_cores", [])):
+            if t <= t0:
+                continue
+            hi0 = int(cyn * HIST_SIZE) % HIST_SIZE
+            hj0 = int(cxn * HIST_SIZE) % HIST_SIZE
+            p = max(float(pop_c[hi0, hj0]), 0.55)      # a capital never decays
+            dim = 1.0 - 0.45 * float(stress_c[hi0, hj0])
+            hsite = ((997 + idx * 7919) ^ (ws.seed * 40503)) & 0x7FFFFFFF
+            place(float(cxn), float(cyn), 1.4 * p, int(fid), dim,
+                  hsite, 100000 + idx, 200000 + idx)
+    ws._settle_cache = (key, alpha, rgb)
+    return alpha, rgb
 
 
 # ===========================================================================
@@ -1066,9 +1211,21 @@ class WorldSlice:
         self.hist_own = np.stack(kf_own).astype(np.int16)
         self.hist_stress = np.stack(kf_stress)
         self.hist_unrest = np.stack(kf_unrest)
-        # normalized founding coords for city markers (yn, xn, faction, founded-day)
-        self.civ_cores = [(cy / H, cx / H, f, float(t0s[f]))
-                          for f, (cy, cx) in enumerate(cores)]
+        # normalized founding coords (yn, xn, faction, founded-day) for the
+        # city markers and the M4 capital settlements. The CA founds on
+        # COARSE cells; snap each core to the nearest fine-grid pixel of
+        # solid land so a coastal founding never leaves the capital standing
+        # in the sea (or drowning at high tide).
+        solid = np.argwhere(self.elev >= SEA_REF + 0.035)      # (y, x) pixels
+        size = self.size
+        self.civ_cores = []
+        for f, (cy, cx) in enumerate(cores):
+            py, px = (cy + 0.5) / H * size, (cx + 0.5) / H * size
+            if len(solid):
+                d2 = ((solid[:, 0] - py) ** 2 + (solid[:, 1] - px) ** 2)
+                py, px = solid[np.argmin(d2)] + 0.5
+            self.civ_cores.append((float(py) / size, float(px) / size,
+                                   f, float(t0s[f])))
     def strided(self, st):
         s = WorldSlice.__new__(WorldSlice)
         size = self.size
@@ -1376,6 +1533,10 @@ def colorize(st, layer):
             img = np.where(has[..., None], img * (1 - a) + tint * a, img)
         sc = st["scorch"][..., None]
         img = img * (1 - sc) + np.array([54, 40, 34], np.float32) * sc
+        if ws.span < SETTLE_SPAN:
+            sa, srgb = _settlements(ws, t, sea_level)
+            a = sa[..., None]
+            img = img * (1 - a) + srgb * a
         _city_dots(ws, img, t)
     elif layer == "history":
         # the chronicle: territory + where the world is thriving / in conflict / in shortage
@@ -1428,6 +1589,12 @@ def colorize(st, layer):
                 wat = (np.array([86, 148, 205], np.float32) * (1 - depth)
                        + np.array([30, 80, 150], np.float32) * depth)
                 img = img * (1 - a) + wat * a
+            if ws.span < SETTLE_SPAN:
+                # M4 expand(): settlements resolve out of the civ summary
+                # under zoom, lit by the same sun as the terrain
+                sa, srgb = _settlements(ws, t, sea_level)
+                a = sa[..., None]
+                img = img * (1 - a) + srgb * (0.25 + 0.75 * l)[..., None] * a
     return np.clip(img, 0, 255).astype(np.uint8)
 
 

@@ -212,12 +212,17 @@ pixels wide as you dive in. The viewport **pixel-snaps** to the drainage
 lattice, so panning translates the exact same samples — no shimmer — and drag
 frames that snap to the same cell reuse the cached window.
 
-**Current limit (the next task, on the road to M4):** civilization is still the
-coarse HIST grid upsampled, so zoom does not yet *expand* a cell's population
-into individual settlements and buildings. That is `expand()` work — turning a
-coarse cell's summary (faction, population, stress) into a deterministic
-settlement grammar keyed by the cell's seed — which is exactly the M4 Resolver
-this zoom pipeline is the skeleton for.
+**Settlements under zoom (the first M4 `expand()`):** below `SETTLE_SPAN` the
+civ summary resolves into settlements. Candidate sites live on a hashed
+lattice (16 per HIST cell); a site founds when its cell's population clears a
+hash-staggered threshold (villages light up one by one as a region fills, and
+vanish if it empties), and each renders by a deterministic grammar keyed by
+`(seed, cell)` — 2–4 street lanes, two building rows per lane, faction-tinted,
+dimmed by stress, never in water or on a river. Faction cores are guaranteed
+capital towns, snapped to solid land at founding. Nothing is stored (same
+village every visit, like the rivers), and a budget governor expands the most
+populous sites first. **Still open:** roads between settlements, interiors
+(WFC), and near-form herds/NPCs — the rest of the M4 Resolver.
 
 ## Turning a sequence into a video
 
