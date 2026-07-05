@@ -2,7 +2,16 @@
 world_core.py — the pure render core, shared by every interface.
 
 world(seed, x, y, t) -> layers. This module owns everything between
-worldgen.py's static fields and pixels on a screen.
+worldgen.py's static fields and pixels on a screen, delegating each concern
+to a focused module and re-exporting the public surface, so consumers keep
+importing only `world_core`:
+
+    worldgen.py    static field producers: windowed noise, D8 hydrology
+    common.py      the time model + shared grid helpers
+    hydrology.py   the vector river tree, stroking, window-local streams
+    lighting.py    sun field, terrain normals, terrain & cloud shadows
+    history.py     the M3 history CA, integrated once into a timeline
+    ecosim.py      the stateful M4 EcoSim (forward-only, has memory)
 
 The layer stack, each reading only the layers above it (per DESIGN.md):
 
@@ -21,15 +30,23 @@ keyframed timeline; render(t) then only INTERPOLATES that timeline. So the
 simulation is stateful but its consumption is not, and the exporter still
 samples any t on demand.
 
-Consumers: world_viewer.py (desktop matplotlib) and web/index.html (same code
-in the browser via Pyodide). No matplotlib, no PIL, no I/O — numpy in, RGB out.
+Consumers: world_viewer.py (desktop matplotlib), web/index.html (same code
+in the browser via Pyodide), godot_bridge.py (chunk streaming). No
+matplotlib, no PIL, no I/O — numpy in, data/pixels out.
 """
 
 import numpy as np
 
 from worldgen import (elevation_field, moisture_field, compute_hydrology,
                       elevation_window, moisture_window, noise_window,
-                      BIOME_COLORS, SEA_REF, _corner_hash)
+                      BIOME_COLORS)
+from common import YEAR_DAYS, TIDE_PERIOD, FAUNA_PERIOD, smoothstep
+from hydrology import (BROOK_MIN, _net_threshold, _extract_network,
+                       _stroke_field, _local_streams)
+from lighting import NORMAL_RELIEF_WORLD, SHADOW_RELIEF_WORLD, _lighting_fields
+from history import (HIST_SIZE, build_history, civ_population,
+                     _sample_history)
+from ecosim import EcoSim
 
 
 def _cloud_sheet(seed, cx, cy, span, size, base_period):
@@ -38,363 +55,6 @@ def _cloud_sheet(seed, cx, cy, span, size, base_period):
     f = noise_window(seed, cx, cy, span, size, base_period=base_period)
     return ((f - f.min()) / (np.ptp(f) or 1.0)).astype(np.float32)
 
-
-# ===========================================================================
-# RIVERS. The planet's drainage (worldgen.compute_hydrology) is traced ONCE
-# into a TREE of vector polylines — junction to junction, each vertex carrying
-# its discharge. Every view then renders that same world-space geometry:
-#
-#   width    real hydraulic geometry (w ≈ k·√drainage-area), so rivers are
-#            hairlines from orbit and only resolve to many pixels wide at
-#            genuinely deep zoom — never inflated "worms";
-#   shape    Chaikin-smoothed at build (kills the D8 staircase), then refined
-#            per view by deterministic midpoint displacement seeded from the
-#            segment's WORLD coordinates: zooming adds meanders exactly the
-#            way terrain adds octaves, identically for every window;
-#   valleys  the network CARVES the heightfield (in every window, at every
-#            zoom), so terrain and rivers agree and hillshade shows drainage;
-#   detail   past planet resolution, a window-local D8 runs on the refined,
-#            carved elevation — the carved trunks act as drains, so the small
-#            streams that appear are REAL drainage of the refined terrain,
-#            not decoration.
-# ===========================================================================
-
-PLANET_KM = 4000.0      # map width; fixes the physical meaning of one cell
-RIVER_W_KM = 0.0035     # hydraulic width: w[km] ≈ this · sqrt(drainage[km²])
-CARVE_DEPTH = 0.012     # valley depth (elevation units) for a threshold river
-MEANDER = 0.30          # midpoint displacement as a fraction of segment length
-BROOK_MIN = 170         # window cells a local stream must drain to be drawn
-
-
-def _net_threshold(planet_size):
-    """Min accumulation (cells) traced into the vector network. Scales with
-    cell count so it is the same PHYSICAL drainage area at any resolution."""
-    return max(12.0, 48.0 * (planet_size / 256.0) ** 2)
-
-
-def _width_world(acc, planet_size):
-    """Channel width in world units from drainage area, via w ≈ k·√A."""
-    return RIVER_W_KM * np.sqrt(np.maximum(acc, 1.0)) / planet_size
-
-
-def _chaikin(x, y, a, passes=2):
-    """Corner-cutting smoothing; endpoints pinned so junctions stay connected."""
-    for _ in range(passes):
-        if x.size < 3:
-            break
-        def one(v):
-            out = np.empty(2 * v.size, v.dtype)
-            out[0], out[-1] = v[0], v[-1]
-            out[1:-1:2] = 0.75 * v[:-1] + 0.25 * v[1:]
-            out[2:-1:2] = 0.25 * v[:-1] + 0.75 * v[1:]
-            return out
-        x, y, a = one(x), one(y), one(a)
-    return x, y, a
-
-
-def _extract_network(parent, accum, size, thr, sea):
-    """Trace the D8 forest into junction-to-junction polylines. Returns a list
-    of (x, y, acc) arrays in UNWRAPPED world coords (a polyline may run past
-    [0,1) across the torus seam; the rasterizer tests wrapped copies)."""
-    n = size * size
-    acc = accum.reshape(-1)
-    sea_f = sea.reshape(-1)
-    chan = (acc > thr) & (~sea_f)
-    node = np.arange(n)
-    moving = chan & (parent != node)
-    inflow = np.bincount(parent[moving], minlength=n)   # channel tributaries in
-    junc = chan & (inflow >= 2)
-    starts = np.where((chan & (inflow == 0)) | junc)[0]
-    edges = []
-    for s0 in starts:
-        cur = int(s0)
-        xs = [(cur % size + 0.5) / size]
-        ys = [(cur // size + 0.5) / size]
-        aa = [float(acc[cur])]
-        for _ in range(4 * n):
-            nxt = int(parent[cur])
-            if nxt == cur:
-                break
-            ddx = ((nxt % size) - (cur % size) + size // 2) % size - size // 2
-            ddy = ((nxt // size) - (cur // size) + size // 2) % size - size // 2
-            xs.append(xs[-1] + ddx / size)
-            ys.append(ys[-1] + ddy / size)
-            aa.append(float(acc[nxt]))
-            cur = nxt
-            if sea_f[cur] or junc[cur] or not chan[cur]:
-                break
-        if len(xs) >= 2:
-            x, y, a = _chaikin(np.asarray(xs), np.asarray(ys),
-                               np.asarray(aa, np.float64))
-            edges.append((x.astype(np.float32), y.astype(np.float32),
-                          a.astype(np.float32)))
-    return edges
-
-
-def _refine_polyline(x, y, a, levels, planet_size, seed):
-    """Deterministic fractal meanders: midpoints displaced perpendicular by a
-    hash of their WORLD position, recursively. The same world curve falls out
-    of every window and zoom; deeper zoom just reveals more levels."""
-    for lvl in range(levels):
-        dx, dy = np.diff(x), np.diff(y)
-        q = np.float64(planet_size) * (2 << lvl)
-        mx, my = x[:-1] + dx * 0.5, y[:-1] + dy * 0.5
-        h = _corner_hash(seed + 13, 91 + lvl,
-                         np.round(mx * q).astype(np.int64),
-                         np.round(my * q).astype(np.int64)) - 0.5
-        mx = mx - dy * h * MEANDER
-        my = my + dx * h * MEANDER
-        def weave(v, m):
-            out = np.empty(v.size + m.size, v.dtype)
-            out[0::2], out[1::2] = v, m
-            return out
-        x = weave(x, mx)
-        y = weave(y, my)
-        a = weave(a, 0.5 * (a[:-1] + a[1:]))
-    return x, y, a
-
-
-def _stroke_capsule(alpha, disc, x0, y0, x1, y1, rad, a_vis, value, size):
-    """One wide river segment: antialiased coverage into `alpha`, discharge
-    into `disc`."""
-    x_lo = max(0, int(np.floor(min(x0, x1) - rad)))
-    x_hi = min(size, int(np.ceil(max(x0, x1) + rad)) + 1)
-    y_lo = max(0, int(np.floor(min(y0, y1) - rad)))
-    y_hi = min(size, int(np.ceil(max(y0, y1) + rad)) + 1)
-    if x_hi <= x_lo or y_hi <= y_lo:
-        return
-    ys = np.arange(y_lo, y_hi)[:, None].astype(np.float32)
-    xs = np.arange(x_lo, x_hi)[None, :].astype(np.float32)
-    dx, dy = x1 - x0, y1 - y0
-    ll = dx * dx + dy * dy
-    if ll < 1e-9:
-        t = np.zeros((1, 1), np.float32)
-    else:
-        t = np.clip(((xs - x0) * dx + (ys - y0) * dy) / ll, 0.0, 1.0)
-    dist = np.sqrt((xs - (x0 + t * dx)) ** 2 + (ys - (y0 + t * dy)) ** 2)
-    cover = np.clip(rad - dist + 0.5, 0.0, 1.0)
-    sub_a = alpha[y_lo:y_hi, x_lo:x_hi]
-    np.maximum(sub_a, a_vis * cover, out=sub_a)
-    sub_d = disc[y_lo:y_hi, x_lo:x_hi]
-    np.maximum(sub_d, np.where(cover > 0.2, value, 0.0).astype(np.float32),
-               out=sub_d)
-
-
-def _splat_thin(alpha, disc, carve, segs, size):
-    """Batch-draw thin (≲1.5px) stroke segments and ALL carve centerlines as
-    resampled points with bilinear max-splat — one vectorized pass for the
-    whole network instead of a Python loop per segment."""
-    X0, Y0, X1, Y1, A, V, D, W = (np.concatenate(s) for s in zip(*segs))
-    L = np.hypot(X1 - X0, Y1 - Y0)
-    m = np.maximum(1, np.ceil(L / 0.6).astype(np.int32))
-    eid = np.repeat(np.arange(m.size), m)
-    base = np.repeat(np.cumsum(m) - m, m)
-    t = (np.arange(eid.size) - base + 0.5) / m[eid]
-    xs = X0[eid] + t * (X1 - X0)[eid]
-    ys = Y0[eid] + t * (Y1 - Y0)[eid]
-    av, vv = A[eid], V[eid]
-    dv, thin = D[eid], (W[eid] <= 1.5)
-    xi = np.floor(xs - 0.5).astype(np.int64)
-    yi = np.floor(ys - 0.5).astype(np.int64)
-    fx, fy = xs - 0.5 - xi, ys - 0.5 - yi
-    af, df_, cf = alpha.reshape(-1), disc.reshape(-1), carve.reshape(-1)
-    for ddx, ddy in ((0, 0), (1, 0), (0, 1), (1, 1)):
-        w = (fx if ddx else 1 - fx) * (fy if ddy else 1 - fy)
-        gx, gy = xi + ddx, yi + ddy
-        ok = (gx >= 0) & (gx < size) & (gy >= 0) & (gy < size)
-        idx = gy[ok] * size + gx[ok]
-        wk = w[ok]
-        np.maximum.at(cf, idx, (wk * dv[ok]).astype(np.float32))
-        tm = thin[ok]
-        np.maximum.at(af, idx[tm], (wk[tm] * av[ok][tm]).astype(np.float32))
-        hit = tm & (wk > 0.25)
-        np.maximum.at(df_, idx[hit], vv[ok][hit].astype(np.float32))
-
-
-def _shift_max8(a):
-    """8-neighbor max WITHOUT torus wrap (windows are not periodic)."""
-    p = np.pad(a, 1)
-    m = a
-    for dy in (0, 1, 2):
-        for dx in (0, 1, 2):
-            if dy == 1 and dx == 1:
-                continue
-            m = np.maximum(m, p[dy:dy + a.shape[0], dx:dx + a.shape[1]])
-    return m
-
-
-def _stroke_field(net, cx, cy, span, size, planet_size, seed):
-    """Render the vector network for window (cx,cy,span) at size².
-    Returns (alpha, disc, carve):
-      alpha  stroke coverage in [0,1] (already faded for sub-pixel widths)
-      disc   discharge (planet cells) under the stroke, for gating/color
-      carve  valley depth to SUBTRACT from the window's elevation."""
-    alpha = np.zeros((size, size), np.float32)
-    disc = np.zeros((size, size), np.float32)
-    carve = np.zeros((size, size), np.float32)
-    if not net:
-        return alpha, disc, carve
-    inv = size / span
-    left, top = cx - span / 2.0, cy - span / 2.0
-    ppp = inv / planet_size                     # screen px per planet cell
-    # refine until segments are ~0.8px (build segments are ~0.25 planet cells),
-    # so meanders start appearing as soon as a channel spans multiple pixels
-    levels = int(np.clip(np.ceil(np.log2(max(ppp / 3.2, 1e-9))), 0, 6))
-    thr = _net_threshold(planet_size)
-    pad = 14.0 / inv
-    thin_segs = []
-    for bx, by, ba in net:
-        o0 = int(np.ceil(left - pad - bx.max()))
-        o1 = int(np.floor(left + span + pad - bx.min()))
-        p0 = int(np.ceil(top - pad - by.max()))
-        p1 = int(np.floor(top + span + pad - by.min()))
-        if o1 < o0 or p1 < p0:
-            continue
-        rx, ry, ra = _refine_polyline(bx.astype(np.float64),
-                                      by.astype(np.float64),
-                                      ba.astype(np.float64),
-                                      levels, planet_size, seed)
-        w_px = (_width_world(ra, planet_size) * inv).astype(np.float64)
-        dep = np.clip(CARVE_DEPTH * (ra / thr) ** 0.25, 0.0,
-                      3.0 * CARVE_DEPTH)
-        for ox in range(o0, o1 + 1):
-            for oy in range(p0, p1 + 1):
-                X = ((rx + ox - left) * inv)
-                Y = ((ry + oy - top) * inv)
-                sw = np.maximum(w_px[:-1], w_px[1:])
-                sv = np.maximum(ra[:-1], ra[1:])
-                sa = 0.32 + 0.68 * np.clip(sw / 0.9, 0.0, 1.0)
-                sd = np.maximum(dep[:-1], dep[1:])
-                mgn = 2.0 + sw
-                vis = ((np.minimum(X[:-1], X[1:]) < size + mgn) &
-                       (np.maximum(X[:-1], X[1:]) > -mgn) &
-                       (np.minimum(Y[:-1], Y[1:]) < size + mgn) &
-                       (np.maximum(Y[:-1], Y[1:]) > -mgn))
-                if not vis.any():
-                    continue
-                thin_segs.append((X[:-1][vis], Y[:-1][vis],
-                                  X[1:][vis], Y[1:][vis],
-                                  sa[vis], sv[vis], sd[vis], sw[vis]))
-                for k in np.where(vis & (sw > 1.5))[0]:
-                    _stroke_capsule(alpha, disc, X[k], Y[k], X[k + 1],
-                                    Y[k + 1], sw[k] * 0.5, 1.0, sv[k], size)
-    if thin_segs:
-        _splat_thin(alpha, disc, carve, thin_segs, size)
-    # widen the carved centerline into a valley: world-anchored radius
-    # (~1.5 planet cells on screen), exponential cross-profile
-    r = int(np.clip(round(1.5 * ppp), 1, 12))
-    for _ in range(r):
-        carve = np.maximum(carve, 0.78 * _shift_max8(carve))
-    return alpha, disc, carve
-
-
-# ---------------------------------------------------------------------------
-# Window-local drainage: past planet resolution the vector net has no more
-# detail, so run the SAME hydrology (fill -> D8 -> accumulation) on the
-# window's refined, valley-carved elevation. Trunk channels, lakes, the sea
-# and the window border are the drains; anything ≥ BROOK_MIN cells becomes a
-# visible brook. Pixel-snapped viewports (see WorldSlice.view) make this a
-# pure function of the window, so panning slides it rigidly.
-# ---------------------------------------------------------------------------
-
-def _shift_min8(a):
-    p = np.pad(a, 1, constant_values=np.inf)
-    m = np.full_like(a, np.inf)
-    for dy in (0, 1, 2):
-        for dx in (0, 1, 2):
-            if dy == 1 and dx == 1:
-                continue
-            m = np.minimum(m, p[dy:dy + a.shape[0], dx:dx + a.shape[1]])
-    return m
-
-
-def _box3(a):
-    p = np.pad(a, 1, mode="edge")
-    return (p[:-2, :-2] + p[:-2, 1:-1] + p[:-2, 2:] +
-            p[1:-1, :-2] + p[1:-1, 1:-1] + p[1:-1, 2:] +
-            p[2:, :-2] + p[2:, 1:-1] + p[2:, 2:]) / 9.0
-
-
-def _local_streams(elev, moist, trunk_alpha, lake_lv, cx, cy, span, seed,
-                   max_iters=96):
-    size = elev.shape[0]
-    e = elev.astype(np.float64)
-    # de-bias the local D8 exactly like the planet's: a per-cell hash jitter,
-    # keyed by the cell's WORLD coordinate (the viewport is pixel-snapped, so
-    # panning sees the same jitter and the brooks slide rigidly). Amplitude
-    # tracks the LOCAL relief so broad uniform slopes wander too, instead of
-    # locking into parallel 45° runs.
-    q = size / span
-    step = (np.arange(size, dtype=np.float64) / size - 0.5) * span
-    qx = np.round((cx + step) * q).astype(np.int64)[None, :]
-    qy = np.round((cy + step) * q).astype(np.int64)[:, None]
-    gy, gx = np.gradient(e)
-    relief = _box3(_box3(np.abs(gx) + np.abs(gy)))
-    amp = 1.4 * relief + 0.25 * float(relief.mean())
-    e = e + (_corner_hash(seed + 77, 37, qx, qy).astype(np.float64) - 0.5) * amp
-    seeds = (trunk_alpha > 0.30) | (e < SEA_REF) | ((lake_lv > 0) & (e < lake_lv))
-    seeds[0, :] = seeds[-1, :] = seeds[:, 0] = seeds[:, -1] = True
-    f = np.where(seeds, e, np.inf)
-    for _ in range(max_iters):                       # bounded local pit fill
-        nf = np.maximum(e, np.minimum(f, _shift_min8(f) + 1e-7))
-        if np.array_equal(nf, f):
-            break
-        f = nf
-    f = np.where(np.isinf(f), e, f)
-    # local D8 (non-torus)
-    yy, xx = np.divmod(np.arange(size * size), size)
-    parent = np.arange(size * size)
-    best = f.reshape(-1).copy()
-    p = np.pad(f, 1, constant_values=np.inf)
-    for dy in (-1, 0, 1):
-        for dx in (-1, 0, 1):
-            if dy == 0 and dx == 0:
-                continue
-            nval = p[1 + dy:1 + dy + size, 1 + dx:1 + dx + size].reshape(-1)
-            nidx = np.clip(yy + dy, 0, size - 1) * size + np.clip(xx + dx, 0, size - 1)
-            better = nval < best
-            parent = np.where(better, nidx, parent)
-            best = np.where(better, nval, best)
-    node = np.arange(size * size)
-    stop = seeds.reshape(-1)                    # water stops at its drains
-    src = node[(parent != node) & ~stop]
-    dst = parent[src]
-    acc = np.ones(size * size, np.float64)
-    for i in range(max_iters):
-        new = 1.0 + np.bincount(dst, weights=acc[src], minlength=size * size)
-        if i % 8 == 7 and np.array_equal(new, acc):
-            break
-        acc = new
-    acc = acc.reshape(size, size)
-    brook = (acc >= BROOK_MIN) & ~seeds
-    a = np.zeros((size, size), np.float32)
-    a[brook] = np.clip(0.20 + 0.13 * np.log2(acc[brook] / BROOK_MIN + 1.0),
-                       0.0, 0.55)
-    # drainage density follows rainfall: deserts carry few perennial brooks
-    a *= np.clip((moist - 0.12) / 0.45, 0.06, 1.0).astype(np.float32)
-    return a, acc.astype(np.float32)
-
-# ---------------------------------------------------------------------------
-# Time model (M2). t is measured in sim DAYS.
-# ---------------------------------------------------------------------------
-YEAR_DAYS = 96.0          # one year = 96 days
-TIDE_PERIOD = 0.52        # ~semi-diurnal tide
-FAUNA_PERIOD = 32.0       # predator-prey limit cycle length (days)
-NORMAL_RELIEF_WORLD = 0.018
-SHADOW_RELIEF_WORLD = 0.090
-SOLAR_TILT = np.deg2rad(47.0)   # season_off in [-0.5,0.5] -> +/-23.5 deg
-TERRAIN_SHADOW_STEPS = 56
-CLOUD_WORLD_HEIGHT = 0.010
-CLOUD_SHADOW_STRENGTH = 0.50
-
-# ---------------------------------------------------------------------------
-# History CA (M3) parameters.
-# ---------------------------------------------------------------------------
-HIST_SIZE = 48            # coarse simulation grid (cells per side)
-WEEK_DAYS = 7.0           # one CA step = one week
-HIST_YEARS = 24.0         # how much history to pre-integrate
-KF_WEEKS = 3              # record a keyframe every N weeks
-POP_MAX = 1.2             # population value that maps to a full uint8
 
 LAYERS = [
     ("composite", "World"),
@@ -426,13 +86,8 @@ CIV_COLORS = np.array([
 ], dtype=np.float32)
 
 
-def smoothstep(x):
-    x = np.clip(x, 0, 1)
-    return x * x * (3 - 2 * x)
-
-
 def biome_ids(e, t, m, sea, tide=0.0, lake_lv=None):
-    """Vectorized version of worldgen.classify_biomes -> int16 ids.
+    """Vectorized biome classification -> int16 ids.
 
     `sea` is the GEOGRAPHIC sea level (the slider, no instantaneous tide), so
     the coastline/beach terrain only moves when you change the slider. `tide`
@@ -473,110 +128,6 @@ def biome_ids(e, t, m, sea, tide=0.0, lake_lv=None):
 def temperature_t(elev, lat, lat_signed, sea_eff, season_off):
     t = lat + season_off * lat_signed - np.clip(elev - sea_eff, 0, None) * 0.9
     return np.clip(t, 0, 1)
-
-
-def daylight_row(xn, sun_x, depth):
-    """Per-longitude light factor: 1 at noon, floor at midnight."""
-    c = np.cos(2 * np.pi * (xn - sun_x))
-    s = np.clip((c + 0.15) / 0.45, 0, 1)
-    s = s * s * (3 - 2 * s)
-    floor = 1 - 0.72 * depth
-    return floor + (1 - floor) * s
-
-
-def _sample_offset(a, ox, oy, fill):
-    """Sample `a` with a non-wrapping integer offset: out[y,x] = a[y+oy,x+ox]."""
-    out = np.full_like(a, fill)
-    h, w = a.shape
-    if abs(ox) >= w or abs(oy) >= h:
-        return out
-    sx0, sx1 = max(0, ox), min(w, w + ox)
-    sy0, sy1 = max(0, oy), min(h, h + oy)
-    dx0, dx1 = max(0, -ox), min(w, w - ox)
-    dy0, dy1 = max(0, -oy), min(h, h - oy)
-    out[dy0:dy1, dx0:dx1] = a[sy0:sy1, sx0:sx1]
-    return out
-
-
-def _sun_field(ws, sun_x, season_off):
-    """Per-pixel sun direction in local east/south/up coordinates."""
-    lat = ws.lat_signed * (0.5 * np.pi)
-    hour = (ws.xn[None, :] - sun_x) * (2 * np.pi)
-    decl = SOLAR_TILT * season_off
-    sin_lat, cos_lat = np.sin(lat), np.cos(lat)
-    sin_hour, cos_hour = np.sin(hour), np.cos(hour)
-    sin_decl, cos_decl = np.sin(decl), np.cos(decl)
-    sx = -cos_decl * sin_hour
-    sy = sin_lat * cos_decl * cos_hour - cos_lat * sin_decl
-    sz = sin_lat * sin_decl + cos_lat * cos_decl * cos_hour
-    inv = 1.0 / np.maximum(np.sqrt(sx * sx + sy * sy + sz * sz), 1e-6)
-    return ((sx * inv).astype(np.float32),
-            (sy * inv).astype(np.float32),
-            (sz * inv).astype(np.float32))
-
-
-def _terrain_shadow(height, sx, sy, sz, pixel_world):
-    """Approximate terrain cast-shadow visibility in [0,1] for one sun ray."""
-    if sz <= 1e-4:
-        return np.zeros_like(height, np.float32)
-    horiz = float(np.hypot(sx, sy))
-    if horiz <= 1e-6:
-        return np.ones_like(height, np.float32)
-    dx, dy = sx / horiz, sy / horiz
-    rise = pixel_world * sz / horiz
-    soft = max(pixel_world * SHADOW_RELIEF_WORLD * 1.8, 1e-5)
-    horizon = np.full_like(height, -1e9, np.float32)
-    steps = min(max(height.shape) - 1,
-                max(12, min(TERRAIN_SHADOW_STEPS,
-                            int(12 + 34 * horiz / max(sz, 0.12)))))
-    for step in range(1, steps + 1):
-        ox = int(round(dx * step))
-        oy = int(round(dy * step))
-        if ox == 0 and oy == 0:
-            continue
-        sample = _sample_offset(height, ox, oy, -1e9)
-        np.maximum(horizon, sample - step * rise, out=horizon)
-    return smoothstep((height - horizon + soft) / (2 * soft)).astype(np.float32)
-
-
-def _cloud_shadow(clouds, sx, sy, sz, pixel_world):
-    """Project cloud cover onto the ground along the sun ray."""
-    if sz <= 1e-4:
-        return np.ones_like(clouds, np.float32)
-    scale = CLOUD_WORLD_HEIGHT / max(sz * pixel_world, 1e-6)
-    ox = int(round(sx * scale))
-    oy = int(round(sy * scale))
-    cover = _sample_offset(clouds, ox, oy, 0.0).astype(np.float32)
-    cover = 0.65 * cover + 0.35 * _shift_max8(cover)
-    return np.clip(1.0 - CLOUD_SHADOW_STRENGTH * cover,
-                   1.0 - CLOUD_SHADOW_STRENGTH, 1.0).astype(np.float32)
-
-
-def _lighting_fields(ws, sun_x, season_off, day_night, clouds):
-    """Derived lighting payload: normals, sun visibility, and shadow masks."""
-    sx, sy, sz = _sun_field(ws, sun_x, season_off)
-    sun = np.stack((sx, sy, sz), axis=-1)
-    ndotl = np.clip(np.sum(ws.normal * sun, axis=2), 0, 1).astype(np.float32)
-    day = smoothstep((sz + 0.10) / 0.20).astype(np.float32)
-    cy = ws.size // 2
-    cx = ws.size // 2
-    sx0 = float(sx[cy, cx])
-    sy0 = float(sy[cy, cx])
-    sz0 = float(max(sz[cy, cx], 0.0))
-    terrain_vis = _terrain_shadow(ws.height, sx0, sy0, sz0, ws.pixel_world)
-    cloud_vis = _cloud_shadow(clouds, sx0, sy0, max(sz0, 0.08), ws.pixel_world)
-    direct = ndotl * terrain_vis * cloud_vis
-    lit = day * (0.28 + 0.72 * direct)
-    floor = 1.0 - 0.72 * day_night
-    sunlight = floor + (1.0 - floor) * lit
-    return {
-        "normal": ws.normal,
-        "sun_dir": np.array([sx0, sy0, sz0], np.float32),
-        "sun_up": np.clip(sz, 0, 1).astype(np.float32),
-        "terrain_shadow": terrain_vis,
-        "cloud_shadow": cloud_vis,
-        "sunlight": np.clip(sunlight, 0, 1).astype(np.float32),
-    }
 
 
 def color_ramp(v, stops, colors):
@@ -631,60 +182,6 @@ def clouds_field(ws, t):
 
 
 # ===========================================================================
-# Society — the M3 history simulation (integrated once, sampled as a timeline).
-# ===========================================================================
-def _neigh4(a):
-    """4-neighbor mean on the torus (works for 2D or leading-axis stacks)."""
-    ax = a.ndim - 2
-    return 0.25 * (np.roll(a, 1, ax) + np.roll(a, -1, ax)
-                   + np.roll(a, 1, ax + 1) + np.roll(a, -1, ax + 1))
-
-
-def civ_population(ws, t):
-    """Per-cell settled population in [0,1] and faction id (-1 = none), read
-    from the pre-integrated history timeline and upsampled to render size."""
-    pop, own, _stress, _unrest = _sample_history(ws, t)
-    return pop, own
-
-
-def _window_indices(ws, n=HIST_SIZE):
-    """np.ix_ that maps each render pixel of `ws` to its coarse (n x n) cell via
-    world coordinates, honouring the slice's viewport (pan/zoom)."""
-    size = ws.size
-    step = (np.arange(size, dtype=np.float32) / size - 0.5) * ws.span
-    ci = (((ws.cx + step) % 1.0) * n).astype(np.int64) % n
-    ri = (((ws.cy + step) % 1.0) * n).astype(np.int64) % n
-    return np.ix_(ri, ci)
-
-
-def _sample_history(ws, t):
-    """Interpolate the coarse history timeline at day t and upsample to the
-    render grid. Returns (pop, faction_id, stress, unrest), all render-sized."""
-    size = ws.elev.shape[0]
-    if not getattr(ws, "has_history", False):
-        z = np.zeros((size, size), np.float32)
-        return z, np.full((size, size), -1, np.int16), z, z
-
-    days = ws.hist_days
-    tc = float(np.clip(t, days[0], days[-1]))
-    i = int(np.searchsorted(days, tc, side="right") - 1)
-    i = max(0, min(i, len(days) - 2))
-    span = days[i + 1] - days[i]
-    fr = 0.0 if span <= 0 else (tc - days[i]) / span
-
-    pop_c = ((1 - fr) * ws.hist_pop[i] + fr * ws.hist_pop[i + 1]) * (POP_MAX / 255.0)
-    stress_c = ((1 - fr) * ws.hist_stress[i] + fr * ws.hist_stress[i + 1]) / 255.0
-    unrest_c = ((1 - fr) * ws.hist_unrest[i] + fr * ws.hist_unrest[i + 1]) / 255.0
-    own_c = ws.hist_own[i] if fr < 0.5 else ws.hist_own[i + 1]
-
-    # map each render pixel to its coarse history cell via WORLD coordinates,
-    # so the timeline lines up with the (possibly zoomed) window on screen.
-    up = _window_indices(ws)
-    return (pop_c[up].astype(np.float32), own_c[up].astype(np.int16),
-            stress_c[up].astype(np.float32), unrest_c[up].astype(np.float32))
-
-
-# ===========================================================================
 class WorldSlice:
     """Static per-resolution data + grids (full res, or strided for thumbs)."""
 
@@ -713,7 +210,7 @@ class WorldSlice:
         self.cloud1, self.cloud2 = cloud1, cloud2
         self._derive_grids()
         self.has_history = False
-        self._build_history(civ_count, seed)
+        build_history(self, civ_count, seed)
 
     def _derive_grids(self):
         """Per-pixel grids from the window's WORLD coordinates (so latitude,
@@ -920,149 +417,6 @@ class WorldSlice:
         idx = (np.arange(HIST_SIZE) * self.size) // HIST_SIZE
         return field[np.ix_(idx, idx)].astype(np.float32)
 
-    # ---- M3: seed factions, generate events, integrate the timeline --------
-    def _build_history(self, civ_count, seed):
-        if civ_count <= 0:
-            self.civ_cores = []
-            return
-        H = HIST_SIZE
-        e = self._coarse(self.elev)
-        m = self._coarse(self.moist)
-        sea0 = 0.42
-        yn = (np.arange(H, dtype=np.float32) / H)[:, None]
-        lat = np.repeat(1 - np.abs(yn - 0.5) * 2, H, axis=1)
-        land = e >= sea0
-        temp = np.clip(lat - np.clip(e - sea0, 0, 1) * 0.9, 0, 1)
-        warmth = np.clip((temp - 0.26) / 0.55, 0, 1)
-        wet = smoothstep((m - 0.1) / 0.8)
-        flora0 = warmth * (0.30 + 0.70 * wet) * land
-        water = np.clip(self._coarse(self.log_accum) * 0.7, 0, 1)
-        temperate = np.clip(1 - np.abs(temp - 0.62) / 0.45, 0, 1)
-        hab = (0.42 * flora0 + 0.30 * water + 0.28 * temperate) * land
-        hab *= np.clip(1 - (e - 0.75) / 0.25, 0, 1)
-        cap0 = np.clip(0.15 + 0.95 * hab, 0.0, 1.2) * land       # food capacity
-        passable = land * np.clip(1 - np.clip((e - 0.7) / 0.3, 0, 1) * 0.7, 0.1, 1)
-
-        # ---- pick faction cores: habitability maxima, spaced apart ----------
-        rng = np.random.default_rng((seed ^ 0x50C1A1) & 0x7FFFFFFF)
-        order = np.argsort(-hab.reshape(-1))
-        cores, min_sep = [], H * 0.16
-        for idx in order:
-            if hab.reshape(-1)[idx] < 0.30:
-                break
-            cy, cx = divmod(int(idx), H)
-            if all(min((cy - py) % H, (py - cy) % H) ** 2
-                   + min((cx - px) % H, (px - cx) % H) ** 2 >= min_sep ** 2
-                   for py, px in cores):
-                cores.append((cy, cx))
-                if len(cores) >= civ_count:
-                    break
-        if not cores:
-            self.civ_cores = []
-            return
-        nf = len(cores)
-
-        # ---- generate deterministic shock events over the horizon ----------
-        weeks = int(HIST_YEARS * YEAR_DAYS / WEEK_DAYS)
-        yy = np.arange(H)[:, None]
-        xx = np.arange(H)[None, :]
-
-        def blob(cy, cx, radius):
-            dy = np.minimum((yy - cy) % H, (cy - yy) % H)
-            dx = np.minimum((xx - cx) % H, (cx - xx) % H)
-            return np.exp(-(dy * dy + dx * dx) / (2 * radius * radius))
-
-        events = []
-        arid = m < 0.4
-        for _ in range(int(HIST_YEARS * 0.7)):        # pests / blights
-            ly = int(rng.integers(0, H)); lx = int(rng.integers(0, H))
-            events.append(("pest", blob(ly, lx, H * 0.10),
-                           int(rng.integers(0, weeks)),
-                           int(rng.integers(4, 12)), float(rng.uniform(0.20, 0.5))))
-        for _ in range(int(HIST_YEARS * 0.25)):       # droughts (arid, long)
-            cand = np.argwhere(arid)
-            ly, lx = cand[rng.integers(len(cand))] if len(cand) else (H // 2, H // 2)
-            events.append(("drought", blob(int(ly), int(lx), H * 0.18),
-                           int(rng.integers(0, weeks)),
-                           int(rng.integers(24, 44)), float(rng.uniform(0.45, 0.7))))
-        polar = (lat < 0.45)
-        for _ in range(max(1, int(HIST_YEARS * 0.12))):  # cold spells / ice
-            events.append(("ice", polar.astype(np.float32),
-                           int(rng.integers(0, weeks)),
-                           int(rng.integers(20, 40)), float(rng.uniform(0.4, 0.65))))
-
-        def event_mult(week):
-            mult = np.ones((H, H), np.float32)
-            for _kind, shape, t0, dur, strength in events:
-                if t0 <= week < t0 + dur:
-                    env = np.sin(np.pi * (week - t0) / dur)   # ramp up then down
-                    mult *= 1 - (1 - strength) * env * shape
-            return mult
-
-        # ---- integrate the coarse CA week by week --------------------------
-        rP, col, src_gain = 0.09, 0.012, 0.55
-        decay, diff, mig, conflict_mort = 0.986, 0.34, 0.12, 0.07
-        own_thresh, tiny = 0.02, 1e-3
-
-        P = np.zeros((H, H), np.float32)
-        I = np.zeros((nf, H, H), np.float32)
-        for f, (cy, cx) in enumerate(cores):
-            P[cy, cx] = 0.06
-            I[f, cy, cx] = 1.0
-        t0s = np.sort(rng.uniform(0, 1.6 * YEAR_DAYS, nf)) if nf else np.array([])
-
-        kf_pop, kf_own, kf_stress, kf_unrest, kf_days = [], [], [], [], []
-        for w in range(weeks):
-            emult = event_mult(w)
-            cap = np.maximum(cap0 * emult, 1e-3)
-
-            maxI = I.max(0)
-            own = np.where(land & (maxI > own_thresh), I.argmax(0), -1)
-
-            # population: logistic toward capacity + slow colonization of land
-            owned = own >= 0
-            P += (rP * P + col * owned) * (1 - P / cap)
-            P = np.clip(P, 0, POP_MAX)
-
-            # influence: sourced by population, diffuses, decays, blocked by sea
-            for f in range(nf):
-                I[f] += src_gain * P * (own == f)
-            I = decay * ((1 - diff) * I + diff * _neigh4(I)) * passable[None]
-
-            # re-resolve ownership and contested borders -> attrition term
-            maxI = I.max(0)
-            if nf >= 2:
-                secondI = np.sort(I, axis=0)[-2]
-            else:
-                secondI = np.zeros_like(maxI)
-            owned = land & (maxI > own_thresh)
-            own = np.where(owned, I.argmax(0), -1)
-            contest = np.where(maxI > tiny, secondI / (maxI + 1e-6), 0.0) * owned
-            P *= 1 - conflict_mort * contest
-
-            # migration + drop population the state can no longer reach
-            P = (1 - mig) * P + mig * _neigh4(P)
-            P *= (maxI > tiny)
-
-            unrest = np.clip(np.clip(P / cap - 1, 0, 1) + contest, 0, 1)
-            stress = np.clip(1 - emult, 0, 1)
-
-            if w % KF_WEEKS == 0 or w == weeks - 1:
-                kf_days.append(w * WEEK_DAYS)
-                kf_pop.append((np.clip(P / POP_MAX, 0, 1) * 255).astype(np.uint8))
-                kf_own.append(own.astype(np.int8))
-                kf_stress.append((stress * 255).astype(np.uint8))
-                kf_unrest.append((unrest * 255).astype(np.uint8))
-
-        self.has_history = True
-        self.hist_days = np.array(kf_days, np.float32)
-        self.hist_pop = np.stack(kf_pop)
-        self.hist_own = np.stack(kf_own).astype(np.int16)
-        self.hist_stress = np.stack(kf_stress)
-        self.hist_unrest = np.stack(kf_unrest)
-        # normalized founding coords for city markers (yn, xn, faction, founded-day)
-        self.civ_cores = [(cy / H, cx / H, f, float(t0s[f]))
-                          for f, (cy, cx) in enumerate(cores)]
     def strided(self, st):
         s = WorldSlice.__new__(WorldSlice)
         size = self.size
@@ -1084,136 +438,6 @@ class WorldSlice:
             s.river_alpha, s.river_disc = a, d
             s.brook_alpha = np.zeros_like(a)
         return s
-
-
-# ===========================================================================
-# EcoSim — the STATEFUL near-form substrate (M4). Everything else in this file
-# is a pure, seekable function of t. This one is not: it integrates forward and
-# has MEMORY, so events leave lasting consequences. A flood salinates the soil;
-# a drought dries the forest; recovery is slow and only spreads inward from
-# neighbouring cells, so an isolated barren zone stays barren until life reaches
-# it again — which is how a world can fail to recover. Driven live by the
-# sliders (sea level, seasons); reset() returns it to the pristine world. It is
-# deliberately NOT scrubbable backward (that is what "consequences" means) — it
-# only runs forward or resets. Coarse (HIST_SIZE) and cheap.
-# ===========================================================================
-class EcoSim:
-    def __init__(self, ws, seed=0):
-        H = HIST_SIZE
-        self.H = H
-        self.e = ws._coarse(ws.elev).astype(np.float32)
-        self.m = ws._coarse(ws.moist).astype(np.float32)
-        yn = (np.arange(H, dtype=np.float32) / H)[:, None]
-        self.lat = np.repeat(1 - np.abs(yn - 0.5) * 2, H, axis=1).astype(np.float32)
-        self.lat_signed = np.repeat((0.5 - yn) * 2, H, axis=1).astype(np.float32)
-        self.sea0 = 0.42
-        self.reset()
-
-    def _climate(self, season_off):
-        temp = np.clip(self.lat + season_off * self.lat_signed
-                       - np.clip(self.e - self.sea_ref, 0, 1) * 0.9, 0, 1)
-        warmth = np.clip((temp - 0.26) / 0.55, 0, 1)
-        wet = smoothstep((self.m - 0.1) / 0.8)
-        return warmth, wet
-
-    def reset(self):
-        """Back to the pristine, climax-state world (day 0): full soil, and
-        vegetation/fauna at the climate's potential, so health == 1 everywhere
-        and the flora/fauna layers look exactly like their pure baseline until
-        something happens to them."""
-        self.sea_ref = float(self.sea0)
-        self.t = 0.0
-        land = (self.e >= self.sea0).astype(np.float32)
-        warmth, wet = self._climate(0.0)
-        clim = warmth * (0.30 + 0.70 * wet) * land          # climatic potential
-        self.clim = clim.astype(np.float32)
-        self.fert = land.copy()                             # climax soil = 1 on land
-        self.veg = clim.astype(np.float32)                  # at full potential
-        self.fauna = (0.6 * clim).astype(np.float32)
-        self.civ = ((clim > 0.55) * 0.35).astype(np.float32)   # some seed settlements
-        self.scorch = np.zeros((self.H, self.H), np.float32)
-
-    def step(self, dt_days, sea_level, season_off):
-        """Advance the ecosystem by dt_days under the current sliders."""
-        if dt_days <= 0:
-            return
-        n = int(min(48, max(1, np.ceil(dt_days / 4.0))))    # sub-step for stability
-        h = min(dt_days / n, 6.0)
-        for _ in range(n):
-            self._micro(h, float(sea_level), float(season_off))
-        self.t += dt_days
-
-    def _micro(self, h, sea_level, season_off):
-        e = self.e
-        warmth, wet = self._climate(season_off)
-        under = e < sea_level
-        land = ~under
-        submerged = under & (e >= self.sea_ref)        # land the sea just covered
-        clim = warmth * (0.30 + 0.70 * wet) * land       # climatic potential
-        self.clim = clim.astype(np.float32)              # (for health readout)
-        cap = clim * self.fert * (1 - self.scorch)
-        dry = np.clip(warmth - 0.75 * wet - 0.05, 0, 1)  # hot & dry -> fire/desert
-
-        veg, fauna, civ, fert, scorch = (self.veg, self.fauna, self.civ,
-                                         self.fert, self.scorch)
-
-        # --- flood: submerged biota declines, soil salinates ---
-        veg = np.where(under, veg * np.exp(-0.6 * h), veg)
-        fauna = np.where(under, fauna * np.exp(-0.5 * h), fauna)
-        civ = np.where(under, civ * np.exp(-0.7 * h), civ)
-        fert = np.where(submerged, fert - 0.008 * h, fert)
-        scorch = np.where(submerged, scorch + 0.020 * h, scorch)
-
-        # --- fire / drought: needs both heat-dryness AND fuel (vegetation), so
-        #     it strikes grass/savanna in hot summers, not bare desert ---
-        burn = np.clip(dry - 0.40, 0, 1) * veg * land
-        ignite = burn * (burn > 0.03)
-        veg = veg - 0.70 * ignite * h
-        fauna = fauna - 0.45 * ignite * h
-        scorch = scorch + 0.40 * ignite * h
-        desert = land & (dry > 0.45) & (veg < 0.10)     # bare hot ground erodes
-        fert = np.where(desert, fert - 0.004 * h, fert)
-
-        # --- recovery on dry land: growth needs a seed (self or neighbour), so
-        #     cleared, isolated cells cannot restart until life spreads back in ---
-        cap_pos = cap > 0.02
-        vseed = 0.015 + 0.85 * veg + 0.5 * _neigh4(veg)
-        veg = np.where(land, veg + 0.045 * h * vseed
-                       * np.clip(1 - veg / (cap + 1e-3), 0, 1) * cap_pos, veg)
-        fcap = 0.9 * veg
-        fseed = 0.02 + 0.85 * fauna + 0.5 * _neigh4(fauna)
-        fauna = np.where(land, fauna + 0.06 * h * fseed
-                         * np.clip(1 - fauna / (fcap + 1e-3), 0, 1) * (fcap > 0.02), fauna)
-        # slow soil rebuild (needs life nearby) and scar fade — the "much time
-        # must pass" knobs, on a timescale of years not days
-        fert = fert + h * (0.0016 * veg + 0.0009 * _neigh4(veg)) * (1 - fert) * land
-        scorch = scorch - 0.0025 * h
-
-        # --- civilization: grows on food, collapses without it, recolonises
-        #     only from surviving neighbours ---
-        food = 0.5 * veg + 0.5 * fauna
-        cseed = 0.55 * civ + 0.35 * _neigh4(civ)
-        ok = land & (food > 0.28)
-        civ = civ + np.where(ok, 0.02 * h * (0.04 + cseed) * (1 - civ), 0)
-        civ = civ - np.where(~ok, 0.05 * h * civ, 0)
-        civ = np.where(food < 0.14, civ * np.exp(-0.12 * h), civ)  # food-collapse decline
-        fauna = fauna - 0.03 * h * civ * fauna          # hunting pressure
-        veg = veg - 0.01 * h * civ * veg                # land clearing
-
-        self.veg = np.clip(veg, 0, 1).astype(np.float32)
-        self.fauna = np.clip(fauna, 0, 1).astype(np.float32)
-        self.civ = np.clip(civ, 0, 1).astype(np.float32)
-        self.fert = np.clip(fert, 0.02, 1).astype(np.float32)
-        self.scorch = np.clip(scorch, 0, 1).astype(np.float32)
-        # the coastline the ecosystem is adapted to drifts toward the imposed
-        # level (slowly), so a held sea level becomes the new normal
-        self.sea_ref += 0.02 * h * (sea_level - self.sea_ref)
-
-    def sample(self, ws):
-        """Upsample the coarse state to the render window (honours pan/zoom)."""
-        up = _window_indices(ws)
-        return {k: getattr(self, k)[up] for k in
-                ("veg", "fauna", "fert", "civ", "scorch", "clim")}
 
 
 def build_world(seed, size, civ_count=3):

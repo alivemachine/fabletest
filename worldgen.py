@@ -275,10 +275,3 @@ def compute_hydrology(elev, seed, sea_level=SEA_REF):
     lake_level = _dilate_max8(lake_level)
     return {"accum": accum, "parent": parent,
             "lake_level": lake_level, "sea": water}
-
-
-def compute_rivers(elevation, sea_level, river_threshold=350):
-    """Back-compat wrapper: boolean river mask + accumulation field."""
-    h = compute_hydrology(elevation, 0, sea_level)
-    rivers = (h["accum"] > river_threshold) & (elevation >= sea_level)
-    return rivers, h["accum"]

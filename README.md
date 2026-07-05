@@ -10,9 +10,15 @@ for the full design. This repo is the Python prototype stage of the roadmap:
   ecosystem health, plus the Godot-facing render payload: carved height,
   terrain normal, center sun vector, cloud cover, terrain shadow, cloud shadow,
   and final sunlight …); `colorize(state, layer)` is a thin RGB skin over it, and
-  `render()` wraps the two. Also holds the M2 time layer, the M3 history CA, and
-  the M4 `EcoSim`. numpy in, data/pixels out; no UI, no I/O. `state()` is the
-  seam a Godot `TileMapLayer` reads directly.
+  `render()` wraps the two. numpy in, data/pixels out; no UI, no I/O. `state()`
+  is the seam a Godot `TileMapLayer` reads directly. Each concern lives in its
+  own module and `world_core` re-exports the public surface: `common.py` (time
+  model + shared grid helpers), `hydrology.py` (the vector river tree and
+  window-local streams), `lighting.py` (sun, normals, shadows), `history.py`
+  (the M3 history CA), `ecosim.py` (the stateful M4 `EcoSim`).
+- `tests/` — invariant tests (determinism goldens, exact zoom coherence,
+  drainage-reaches-the-sea, per-layer render smoke); run with `pytest`, and run
+  in CI on every push by `.github/workflows/tests.yml`.
 - `world_viewer.py` — **the desktop layer console** (matplotlib) around the
   core: every layer animating, sliders, PNG-sequence exporter.
 - `web/` — **the same console in the browser** (works on a phone):

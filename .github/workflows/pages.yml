@@ -31,7 +31,8 @@ jobs:
         run: |
           mkdir -p _site
           cp -r web/* _site/
-          cp worldgen.py world_core.py _site/
+          cp worldgen.py common.py hydrology.py lighting.py history.py \
+             ecosim.py world_core.py _site/
       - name: Vendor Pyodide runtime + numpy (self-hosted, no CDN)
         run: |
           curl -sSL -o pyodide.tar.bz2 \

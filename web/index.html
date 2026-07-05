@@ -215,7 +215,7 @@ async function ensurePyodide(){
 }
 
 async function fetchSource(name){
-  const paths = [`${name}?v=9`, `../${name}?v=9`];
+  const paths = [`${name}?v=10`, `../${name}?v=10`];
   for (const path of paths){
     const res = await fetch(path);
     if (res.ok) return await res.text();
@@ -229,7 +229,8 @@ async function boot(){
   busysub.textContent = "loading numpy…";
   await pyodide.loadPackage("numpy");
   busysub.textContent = "fetching world code…";
-  for (const f of ["worldgen.py", "world_core.py"]){
+  for (const f of ["worldgen.py", "common.py", "hydrology.py", "lighting.py",
+                   "history.py", "ecosim.py", "world_core.py"]){
     const src = await fetchSource(f);
     pyodide.FS.writeFile(f, src);
   }
