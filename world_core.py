@@ -812,6 +812,64 @@ def _settlements(ws, t, sea_level):
                         alpha[y0:y1, x0:x1] = 1.0
                         rgb[y0:y1, x0:x1] = col
 
+        # --- roads (deep zoom only): lattice-adjacent settlements of the same
+        # faction link east & south (each pair draws once) with a hashed bend;
+        # roads ford rivers but never cross the sea, and buildings paint over
+        # them. Drawn first so villages sit ON their roads.
+        if ws.span < 0.15:
+            road_col = np.array([124, 104, 78], np.float32)
+
+            def road(ax, ay, bx, by, hh):
+                mx = (ax + bx) / 2 + (hh - 0.5) * 0.30 / G
+                my = (ay + by) / 2 + (0.5 - hh) * 0.30 / G
+                for (p0x, p0y), (p1x, p1y) in (((ax, ay), (mx, my)),
+                                               ((mx, my), (bx, by))):
+                    seg = np.hypot(p1x - p0x, p1y - p0y)
+                    ts = np.linspace(0, 1, max(2, int(seg * px_w * 1.6)))
+                    xi = ((((p0x + (p1x - p0x) * ts) - left) % 1.0)
+                          / ws.span * size).astype(np.int64)
+                    yi = ((((p0y + (p1y - p0y) * ts) - top) % 1.0)
+                          / ws.span * size).astype(np.int64)
+                    ok = (xi >= 0) & (xi < size) & (yi >= 0) & (yi < size)
+                    xi, yi = xi[ok], yi[ok]
+                    if not len(xi):
+                        continue
+                    lv = lake[yi, xi] if lake.ndim == 2 else lake
+                    ok = ws.elev[yi, xi] >= np.maximum(sea_level + 0.001, lv)
+                    ok &= alpha[yi, xi] < 0.5          # don't repaint buildings
+                    xi, yi = xi[ok], yi[ok]
+                    alpha[yi, xi] = np.maximum(alpha[yi, xi], 0.75)
+                    rgb[yi, xi] = road_col
+
+            ex_set = {(int(y), int(x)) for y, x in zip(*np.nonzero(exists))}
+            for y, x in sorted(ex_set):
+                for dy, dx in ((0, 1), (1, 0)):
+                    y2, x2 = y + dy, x + dx
+                    if ((y2, x2) not in ex_set
+                            or own[y, x] != own[y2, x2]):
+                        continue
+                    hh = float(_corner_hash(ws.seed + 707, dy * 2 + dx,
+                                            gi[0, x], gj[y, 0]))
+                    if hh > 0.72:                      # thin the mesh: not
+                        continue                       # every neighbour links
+                    road(float(wx[y, x]), float(wy[y, x]),
+                         float(wx[y2, x2]), float(wy[y2, x2]), hh / 0.72)
+            # each capital links to its nearest expanded sites (up to 3)
+            for idx, (cyn, cxn, fid, t0) in enumerate(
+                    getattr(ws, "civ_cores", [])):
+                if t <= t0 or not ex_set:
+                    continue
+                cand = sorted(
+                    ex_set,
+                    key=lambda yx: (float(wx[yx]) - cxn) ** 2
+                                   + (float(wy[yx]) - cyn) ** 2)[:3]
+                for (y, x) in cand:
+                    d2 = (float(wx[y, x]) - cxn) ** 2 + (float(wy[y, x]) - cyn) ** 2
+                    if d2 > (2.5 / G) ** 2:
+                        continue
+                    road(float(cxn), float(cyn),
+                         float(wx[y, x]), float(wy[y, x]), 0.3 + 0.4 * (idx % 2))
+
         for y, x in zip(ys, xs):
             hsite = ((int(gi[0, x]) * 73856093) ^ (int(gj[y, 0]) * 19349663)
                      ^ (ws.seed * 83492791)) & 0x7FFFFFFF

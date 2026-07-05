@@ -221,8 +221,11 @@ vanish if it empties), and each renders by a deterministic grammar keyed by
 dimmed by stress, never in water or on a river. Faction cores are guaranteed
 capital towns, snapped to solid land at founding. Nothing is stored (same
 village every visit, like the rivers), and a budget governor expands the most
-populous sites first. **Still open:** roads between settlements, interiors
-(WFC), and near-form herds/NPCs — the rest of the M4 Resolver.
+populous sites first. At deep zoom (`span < 0.15`) a hash-thinned road mesh
+links lattice-adjacent settlements of the same faction (and capitals to their
+nearest sites), bending at a hashed midpoint, fording rivers, never crossing
+the sea. **Still open:** interiors (WFC) and near-form herds/NPCs — the rest
+of the M4 Resolver.
 
 ## Turning a sequence into a video
 
