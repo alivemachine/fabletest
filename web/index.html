@@ -196,7 +196,7 @@ async function boot(){
   await pyodide.loadPackage("numpy");
   busysub.textContent = "fetching world code…";
   for (const f of ["worldgen.py", "world_core.py"]){
-    const src = await (await fetch(f + "?v=9")).text();
+    const src = await (await fetch(f + "?v=10")).text();
     pyodide.FS.writeFile(f, src);
   }
   pyodide.runPython(`

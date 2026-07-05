@@ -186,7 +186,9 @@ def _splat_thin(alpha, disc, carve, segs, size):
     whole network instead of a Python loop per segment."""
     X0, Y0, X1, Y1, A, V, D, W = (np.concatenate(s) for s in zip(*segs))
     L = np.hypot(X1 - X0, Y1 - Y0)
-    m = np.maximum(1, np.ceil(L / 0.6).astype(np.int64))
+    # np.intp, not int64: under Pyodide (wasm32) numpy's index type is int32
+    # and repeat/fancy-index with int64 raises a safe-cast TypeError
+    m = np.maximum(1, np.ceil(L / 0.6).astype(np.intp))
     eid = np.repeat(np.arange(m.size), m)
     base = np.repeat(np.cumsum(m) - m, m)
     t = (np.arange(eid.size) - base + 0.5) / m[eid]
@@ -194,8 +196,8 @@ def _splat_thin(alpha, disc, carve, segs, size):
     ys = Y0[eid] + t * (Y1 - Y0)[eid]
     av, vv = A[eid], V[eid]
     dv, thin = D[eid], (W[eid] <= 1.5)
-    xi = np.floor(xs - 0.5).astype(np.int64)
-    yi = np.floor(ys - 0.5).astype(np.int64)
+    xi = np.floor(xs - 0.5).astype(np.intp)
+    yi = np.floor(ys - 0.5).astype(np.intp)
     fx, fy = xs - 0.5 - xi, ys - 0.5 - yi
     af, df_, cf = alpha.reshape(-1), disc.reshape(-1), carve.reshape(-1)
     for ddx, ddy in ((0, 0), (1, 0), (0, 1), (1, 1)):
