@@ -1,6 +1,10 @@
-[gd_scene load_steps=2 format=3]
+[gd_scene format=3 uid="uid://ccwy1uggul8tr"]
 
-[ext_resource type="Script" path="res://scripts/main.gd" id="1_main"]
+[ext_resource type="Script" uid="uid://dr8ky3fc025xf" path="res://scripts/main.gd" id="1_main"]
 
-[node name="Main" type="Node2D"]
+[node name="Main" type="Node2D" unique_id=257245491]
 script = ExtResource("1_main")
+seed = 43
+sim_speed = 0.03
+sea_level = 0.495
+day_night = 3.115

@@ -1,3 +1,5 @@
 .godot/
 .import/
 export_presets.cfg
+*.import
+*.uid
