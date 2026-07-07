@@ -442,14 +442,25 @@ const texSearch = document.getElementById("texSearch");
 const texSubject = document.getElementById("texSubject");
 const texMore = document.getElementById("texMore");
 const TEX_PAGE = 120;
-let texAssets = [], texMatches = [], texShown = 0, texGen = "";
+let texAssets = [], texMatches = [], texShown = 0, texGen = "", texBase = "textures";
 
 async function loadTexGallery(){
   if (!texGrid) return;
   try {
-    const res = await fetch("textures/index.json?v=" + Date.now());
+    // textures/config.json (written by export_texture_gallery.py --publish
+    // supabase) points at the Supabase bucket holding the full texture
+    // database; without it we use the files committed next to the page.
+    try {
+      const cfg = await fetch("textures/config.json?v=" + Date.now());
+      if (cfg.ok) {
+        const c = await cfg.json();
+        if (c.base_url) texBase = c.base_url;
+      }
+    } catch (_e) { /* no config -> local files */ }
+    const res = await fetch(texBase + "/index.json?v=" + Date.now());
     if (!res.ok) throw new Error("index missing");
     const idx = await res.json();
+    if (idx.base_url) texBase = idx.base_url;
     texAssets = Array.isArray(idx.assets) ? idx.assets : [];
     // Same keys keep the same filenames when regenerated (e.g. placeholder
     // art upgraded to real SDXL art), so version the image URLs too.
@@ -487,7 +498,7 @@ function texRenderMore(){
     for (const f of a.files){
       const img = document.createElement("img");
       img.loading = "lazy";
-      img.src = "textures/img/" + f + "?v=" + texGen;
+      img.src = texBase + "/img/" + f + "?v=" + texGen;
       img.alt = a.key;
       vars.append(img);
     }

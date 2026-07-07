@@ -88,13 +88,9 @@ def populate(svc: texgen.TextureService, seed: int, size: int,
           f"(concurrency={concurrency})")
 
 
-def export(svc: texgen.TextureService, out_dir: Path) -> int:
-    img_dir = out_dir / "img"
-    if img_dir.exists():
-        shutil.rmtree(img_dir)
-    img_dir.mkdir(parents=True, exist_ok=True)
-
-    entries = []
+def collect_entries(svc: texgen.TextureService):
+    """All ready assets with their variation files: [(entry_dict, [paths])]."""
+    out = []
     with svc.store.lock:
         rows = svc.store.db.execute(
             "SELECT key, key_hash, subject, lod, tags, status, backend, px"
@@ -107,18 +103,17 @@ def export(svc: texgen.TextureService, out_dir: Path) -> int:
                     "SELECT path FROM variations WHERE key=? ORDER BY idx", (key,)
                 )
             ]
-            files = []
+            srcs, files = [], []
             for i, p in enumerate(paths):
                 src = Path(p)
                 if not src.is_absolute():
                     src = ROOT / src
                 if not src.exists():
                     continue
-                name = f"{key_hash}_v{i}.png"
-                shutil.copyfile(src, img_dir / name)
-                files.append(name)
+                srcs.append(src)
+                files.append(f"{key_hash}_v{i}.png")
             if files:
-                entries.append(
+                out.append((
                     {
                         "key": key,
                         "hash": key_hash,
@@ -128,9 +123,13 @@ def export(svc: texgen.TextureService, out_dir: Path) -> int:
                         "backend": backend,
                         "px": px,
                         "files": files,
-                    }
-                )
+                    },
+                    srcs,
+                ))
+    return out
 
+
+def build_index(entries: list, base_url: str | None = None) -> dict:
     index = {
         "generated_at": dt.datetime.now(dt.timezone.utc)
         .isoformat(timespec="milliseconds")
@@ -138,8 +137,53 @@ def export(svc: texgen.TextureService, out_dir: Path) -> int:
         "count": len(entries),
         "assets": entries,
     }
+    if base_url:
+        index["base_url"] = base_url
+    return index
+
+
+def export(svc: texgen.TextureService, out_dir: Path) -> int:
+    """Local export: copy ready art into web/textures/ for file: / Pages use."""
+    img_dir = out_dir / "img"
+    if img_dir.exists():
+        shutil.rmtree(img_dir)
+    img_dir.mkdir(parents=True, exist_ok=True)
+
+    entries = []
+    for entry, srcs in collect_entries(svc):
+        for name, src in zip(entry["files"], srcs):
+            shutil.copyfile(src, img_dir / name)
+        entries.append(entry)
+
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "index.json").write_text(json.dumps(index, indent=1) + "\n")
+    (out_dir / "index.json").write_text(
+        json.dumps(build_index(entries), indent=1) + "\n")
+    return len(entries)
+
+
+def publish_supabase(svc: texgen.TextureService, out_dir: Path) -> int:
+    """Publish ready art to the Supabase bucket: img/<hash>_v<i>.png +
+    index.json, and point the web page at it via web/textures/config.json."""
+    import supabase_store
+
+    store = supabase_store.SupabaseStorage()
+    store.ensure_bucket()
+    base_url = store.public_url("")[:-1]  # bucket root, no trailing slash
+
+    entries, uploaded = [], 0
+    todo = collect_entries(svc)
+    for n, (entry, srcs) in enumerate(todo, 1):
+        for name, src in zip(entry["files"], srcs):
+            store.upload_png(f"img/{name}", src.read_bytes())
+            uploaded += 1
+        entries.append(entry)
+        print(f"[upload {n}/{len(todo)}] {entry['key']}", flush=True)
+
+    store.upload_json("index.json", build_index(entries, base_url))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "config.json").write_text(
+        json.dumps({"base_url": base_url}, indent=1) + "\n")
+    print(f"published {uploaded} files + index.json -> {base_url}/")
     return len(entries)
 
 
@@ -157,13 +201,22 @@ def main() -> int:
         help="generation jobs to keep in flight at once (lets several "
              "RunPod workers run in parallel)",
     )
+    ap.add_argument(
+        "--publish", choices=["local", "supabase"], default="local",
+        help="local: copy files into web/textures/; supabase: upload the "
+             "database to the Supabase bucket and write web/textures/config.json",
+    )
     args = ap.parse_args()
 
     svc = texgen.TextureService(args.store, backend=make_backend(args.backend))
     reset_stranded(svc)
     populate(svc, args.seed, args.size, concurrency=args.concurrency)
-    n = export(svc, args.out.resolve())
-    print(f"exported {n} assets -> {args.out}/index.json")
+    if args.publish == "supabase":
+        n = publish_supabase(svc, args.out.resolve())
+        print(f"published {n} assets to Supabase")
+    else:
+        n = export(svc, args.out.resolve())
+        print(f"exported {n} assets -> {args.out}/index.json")
     return 0
 
 

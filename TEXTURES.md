@@ -288,6 +288,52 @@ count. Three implementations ship:
   Ensure the SDXL base checkpoint configured via `RUNPOD_SDXL_CHECKPOINT`
   exists on the worker (typically in `ComfyUI/models/checkpoints/`).
 
+### Supabase Storage — the published texture/sprite database
+
+Generated art does NOT live in git (binary blobs bloat history forever).
+The system of record for published art is a public Supabase Storage bucket:
+
+```
+<bucket>/index.json                 manifest (same schema as the local
+                                    export, plus "base_url")
+<bucket>/img/<key_hash>_v<i>.png    one file per variation
+```
+
+Readers need no credentials — the browser gallery reads
+`web/textures/config.json` (committed, written by the publish step) to find
+the bucket, and the Godot client (`godot_client/scripts/texture_db.gd`)
+downloads the manifest, fetches sprites on demand, and caches them under
+`user://texture_cache/<generation>/`, evicting old generations when the
+manifest's `generated_at` stamp changes.
+
+Setup (one time):
+
+1. Create a Supabase project. Copy the project URL and the `service_role`
+   key (Settings → API).
+2. Export for the pipeline:
+   - `SUPABASE_URL=https://<project-ref>.supabase.co`
+   - `SUPABASE_SERVICE_KEY=<service_role key>`
+   - `SUPABASE_BUCKET=textures` (optional, this is the default)
+3. `python supabase_store.py check` — creates the public bucket and
+   round-trips a test file.
+4. Generate + publish:
+   `python export_texture_gallery.py --backend runpod-comfyui --publish supabase`
+
+Optional — RunPod worker uploads straight to Supabase (no base64 through
+RunPod): Supabase Storage is S3-compatible. In the Supabase dashboard create
+S3 access keys (Storage → Settings → S3 access keys), then set on the RunPod
+endpoint (Environment Variables):
+
+```
+BUCKET_ENDPOINT_URL      = https://<project-ref>.storage.supabase.co/storage/v1/s3
+BUCKET_ACCESS_KEY_ID     = <s3 access key id>
+BUCKET_SECRET_ACCESS_KEY = <s3 secret access key>
+```
+
+The worker then returns image URLs instead of base64; the pipeline fetches
+them, downscales, and publishes the canonical files as above. Both response
+shapes are handled automatically, so this is purely an optimization.
+
 Prompts come from `build_prompt()` — one table maps tags to phrases
 (`season=winter` → "winter, snow-dusted"; `lod=group3` → "a small cluster of
 three …"), with a global style prefix (`isometric pixel art, 16-bit …`).

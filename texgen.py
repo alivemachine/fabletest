@@ -1084,18 +1084,24 @@ class RunPodComfyUIBackend(Backend):
         out = []
         for item in imgs:
             if isinstance(item, dict):
-                if item.get("url") or item.get("image_url"):
-                    raise RuntimeError(
-                        "runpod returned image URLs (bucket storage is configured on the "
-                        "endpoint); unset BUCKET_ENDPOINT_URL on the endpoint to get base64, "
-                        f"or fetch manually: {item.get('url') or item.get('image_url')}"
-                    )
-                item = item.get("image") or item.get("base64")
-            if isinstance(item, str) and not item.startswith("http"):
+                item = (item.get("url") or item.get("image_url")
+                        or item.get("image") or item.get("base64"))
+            if not isinstance(item, str):
+                continue
+            if item.startswith("http"):
+                # worker uploaded straight to bucket storage (e.g. Supabase
+                # via BUCKET_ENDPOINT_URL) and returned the URL — fetch it
+                out.append(self._fetch_url(item))
+            else:
                 out.append(base64.b64decode(item.split(",", 1)[-1]))
         if len(out) != want:
             raise RuntimeError(f"runpod returned {len(out)} images, wanted {want}: {data.get('status')}")
         return out
+
+    def _fetch_url(self, url: str) -> bytes:
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            return resp.read()
 
     def _downscale(self, images: list, px: int) -> list:
         """Resize generated PNGs down to the store's requested size (no-op

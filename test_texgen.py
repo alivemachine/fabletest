@@ -275,12 +275,10 @@ def test_runpod_decode_images_variants():
     out = b._decode_images(
         {"output": {"images": [b64, f"data:image/png;base64,{b64}"]}}, 2)
     assert out == [png, png]
-    # bucket-storage URLs should raise a clear error, not decode garbage
-    try:
-        b._decode_images({"output": {"images": [{"url": "https://x/y.png"}]}}, 1)
-        assert False, "url output should raise"
-    except RuntimeError as e:
-        assert "bucket" in str(e).lower() or "url" in str(e).lower()
+    # bucket-storage URLs are fetched, not base64-decoded
+    b._fetch_url = lambda url: png
+    out = b._decode_images({"output": {"images": [{"url": "https://x/y.png"}]}}, 1)
+    assert out == [png]
 
 
 def test_runpod_backend_dry_run_works_without_credentials():
