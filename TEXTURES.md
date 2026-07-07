@@ -218,6 +218,19 @@ count. Three implementations ship:
   }
   ```
 
+  **Workflow template**: when `runpod_workflow_template.json` exists at the
+  repo root (or `RUNPOD_WORKFLOW_TEMPLATE` points at one), the backend
+  deep-copies that known-good graph and patches prompt/seed/size/batch into
+  it by node role, instead of building a graph from scratch — so checkpoint
+  and VAE filenames always match what the worker actually has installed.
+  The checked-in template was captured from the live endpoint (checkpoint
+  `stable-diffusion-xl-base-1.0.safetensors`, VAE `sdxl_vae.safetensors`,
+  `CLIPTextEncodeSDXL` + `KSamplerAdvanced`).
+
+  **Sizing**: SDXL degrades badly below ~768px, so jobs smaller than
+  `RUNPOD_MIN_PX` (default 1024) generate at that floor and are
+  LANCZOS-downscaled locally to the store's requested size.
+
   For RunPod's quick-deploy SDXL worker (no ComfyUI), set
   `RUNPOD_INPUT_FORMAT=prompt` to send instead:
 
@@ -252,6 +265,8 @@ count. Three implementations ship:
   - `RUNPOD_INPUT_FORMAT` (`comfyui` default; `prompt` for quick-deploy SDXL workers)
   - `RUNPOD_POLL_TIMEOUT_SEC` (default 600 — total wait incl. cold start),
     `RUNPOD_POLL_INTERVAL_SEC` (default 3)
+  - `RUNPOD_WORKFLOW_TEMPLATE` (path; default `runpod_workflow_template.json`)
+  - `RUNPOD_MIN_PX` (default 1024 — SDXL generation floor, downscaled locally)
   - `RUNPOD_TIMEOUT_SEC`, `RUNPOD_RETRIES`, `RUNPOD_RETRY_BACKOFF_SEC`
   - `RUNPOD_SDXL_CHECKPOINT` (default `sd_xl_base_1.0.safetensors`)
   - `RUNPOD_LORA_NAME` (default `stylized-setting-isometric-sdxl-and-sd15.safetensors`)

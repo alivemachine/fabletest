@@ -1,0 +1,86 @@
+{
+  "input": {
+    "workflow": {
+      "4": {
+        "class_type": "CheckpointLoaderSimple",
+        "inputs": {
+          "ckpt_name": "stable-diffusion-xl-base-1.0.safetensors"
+        }
+      },
+      "8": {
+        "class_type": "VAEDecode",
+        "inputs": {
+          "samples": ["118", 0],
+          "vae": ["676", 0]
+        }
+      },
+      "118": {
+        "class_type": "KSamplerAdvanced",
+        "inputs": {
+          "add_noise": "enable",
+          "noise_seed": 9419741727,
+          "steps": 20,
+          "cfg": 7,
+          "sampler_name": "euler",
+          "scheduler": "normal",
+          "start_at_step": 0,
+          "end_at_step": 10000,
+          "return_with_leftover_noise": "disable",
+          "model": ["4", 0],
+          "positive": ["999", 0],
+          "negative": ["1167", 0],
+          "latent_image": ["1066", 0]
+        }
+      },
+      "676": {
+        "class_type": "VAELoader",
+        "inputs": {
+          "vae_name": "sdxl_vae.safetensors"
+        }
+      },
+      "999": {
+        "class_type": "CLIPTextEncodeSDXL",
+        "inputs": {
+          "width": 1024,
+          "height": 768,
+          "crop_w": 0,
+          "crop_h": 0,
+          "target_width": 1024,
+          "target_height": 1024,
+          "text_g": "storyboard sketch of a MEDIUM SHOT - THE CLEARING, two figures, golden hour light",
+          "text_l": "storyboard sketch of a MEDIUM SHOT - THE CLEARING, two figures, golden hour light",
+          "clip": ["4", 1]
+        }
+      },
+      "1066": {
+        "class_type": "EmptyLatentImage",
+        "inputs": {
+          "width": 1024,
+          "height": 768,
+          "batch_size": 1
+        }
+      },
+      "1167": {
+        "class_type": "CLIPTextEncodeSDXL",
+        "inputs": {
+          "width": 1024,
+          "height": 768,
+          "crop_w": 0,
+          "crop_h": 0,
+          "target_width": 1024,
+          "target_height": 1024,
+          "text_g": "blurry, low quality, watermark, text",
+          "text_l": "blurry, low quality, watermark, text",
+          "clip": ["4", 1]
+        }
+      },
+      "1292": {
+        "class_type": "SaveImage",
+        "inputs": {
+          "filename_prefix": "sdxl-test",
+          "images": ["8", 0]
+        }
+      }
+    }
+  }
+}

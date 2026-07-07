@@ -702,6 +702,12 @@ RUNPOD_DEFAULT_LORA_PAGE_URL = (
 )
 RUNPOD_DEFAULT_LORA_DIR = "/workspace/ComfyUI/models/loras/"
 RUNPOD_DEFAULT_SDXL_CKPT = "sd_xl_base_1.0.safetensors"
+# A known-good workflow captured from the live endpoint; when present the
+# backend patches prompt/seed/size into it instead of building a graph from
+# scratch (so checkpoint/VAE names always match what the worker has installed).
+RUNPOD_DEFAULT_WORKFLOW_TEMPLATE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "runpod_workflow_template.json"
+)
 
 
 def _env_str(name: str, default: str | None = None) -> str | None:
@@ -819,6 +825,63 @@ def build_runpod_runsync_payload(workflow: dict) -> dict:
     return {"input": {"workflow": workflow}}
 
 
+def load_runpod_workflow_template(path: str) -> dict | None:
+    """Load a workflow template JSON (either a bare graph or a full
+    {"input": {"workflow": ...}} payload). Returns the graph, or None."""
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data.get("input", {}).get("workflow") or (
+        data if any(isinstance(v, dict) and "class_type" in v for v in data.values()) else None
+    )
+
+
+def patch_runpod_workflow(
+    template: dict, *, prompt: str, negative_prompt: str, seed: int,
+    width: int, height: int, batch_size: int = 1, filename_prefix: str = "fabletest",
+) -> dict:
+    """Deep-copy a ComfyUI graph and patch job fields into it by node role.
+
+    Positive/negative text nodes are found by following the sampler's own
+    links, so any exported graph works regardless of node numbering. Both
+    plain CLIPTextEncode ("text") and CLIPTextEncodeSDXL ("text_g"/"text_l")
+    are handled; latent + SDXL conditioning sizes are set to the job size.
+    """
+    wf = json.loads(json.dumps(template))
+    samplers = []
+    for node in wf.values():
+        ct, ins = node.get("class_type", ""), node.get("inputs", {})
+        if ct == "EmptyLatentImage":
+            ins["width"], ins["height"] = int(width), int(height)
+            ins["batch_size"] = int(batch_size)
+        elif ct.startswith("KSampler"):
+            if "seed" in ins:
+                ins["seed"] = int(seed)
+            if "noise_seed" in ins:
+                ins["noise_seed"] = int(seed)
+            samplers.append(node)
+        elif ct == "SaveImage":
+            ins["filename_prefix"] = filename_prefix
+    for s in samplers:
+        for role, text in (("positive", prompt), ("negative", negative_prompt)):
+            ref = s["inputs"].get(role)
+            if not (isinstance(ref, list) and ref and str(ref[0]) in wf):
+                continue
+            tins = wf[str(ref[0])].get("inputs", {})
+            for k in ("text", "text_g", "text_l"):
+                if k in tins:
+                    tins[k] = text
+            for k in ("width", "target_width"):
+                if k in tins:
+                    tins[k] = int(width)
+            for k in ("height", "target_height"):
+                if k in tins:
+                    tins[k] = int(height)
+    return wf
+
+
 class RunPodComfyUIBackend(Backend):
     """RunPod serverless backend for SDXL image generation.
 
@@ -854,6 +917,7 @@ class RunPodComfyUIBackend(Backend):
         input_format: str | None = None,
         poll_timeout: float | None = None,
         poll_interval: float | None = None,
+        workflow_template: str | dict | None = None,
     ):
         self.endpoint_id = endpoint_id or _env_str("RUNPOD_ENDPOINT_ID")
         self.api_key = api_key or _env_str("RUNPOD_API_KEY")
@@ -872,6 +936,7 @@ class RunPodComfyUIBackend(Backend):
         self.prompt_prefix = prompt_prefix or _env_str("RUNPOD_PROMPT_PREFIX", RUNPOD_DEFAULT_PROMPT)
         self.dry_run = bool(_env_bool("RUNPOD_DRY_RUN", False) if dry_run is None else dry_run)
         self.filename_prefix = _env_str("RUNPOD_FILENAME_PREFIX", "fabletest")
+        self.min_px = int(_env_int("RUNPOD_MIN_PX", 1024))
         self.mode = (mode or _env_str("RUNPOD_MODE", "run")).lower()
         if self.mode not in ("run", "runsync"):
             raise ValueError(f"RUNPOD_MODE must be 'run' or 'runsync', got {self.mode!r}")
@@ -886,6 +951,13 @@ class RunPodComfyUIBackend(Backend):
         self.poll_interval = float(
             poll_interval if poll_interval is not None else _env_float("RUNPOD_POLL_INTERVAL_SEC", 3.0)
         )
+        if isinstance(workflow_template, dict):
+            self.workflow_template = workflow_template
+        else:
+            tpl_path = workflow_template or _env_str(
+                "RUNPOD_WORKFLOW_TEMPLATE", RUNPOD_DEFAULT_WORKFLOW_TEMPLATE
+            )
+            self.workflow_template = load_runpod_workflow_template(tpl_path)
         self.base_url = (f"https://api.runpod.ai/v2/{self.endpoint_id}"
                          if self.endpoint_id else None)
         self.url = f"{self.base_url}/{self.mode}" if self.base_url else None
@@ -897,23 +969,41 @@ class RunPodComfyUIBackend(Backend):
             f"{self.lora_path}{self.lora_name}" if self.lora_path and "/" not in self.lora_name else self.lora_name
         )
 
+    def _gen_px(self, px: int) -> int:
+        """SDXL degrades badly below ~768px; generate at min_px and let
+        generate() downscale to the store's requested size."""
+        return max(int(px), self.min_px)
+
     def build_payload(self, job: GenJob) -> dict:
         prompt = f"{self.prompt_prefix}, {job.prompt}" if self.prompt_prefix else job.prompt
+        px = self._gen_px(job.px)
         if self.input_format == "prompt":
             return {"input": {
                 "prompt": prompt,
                 "negative_prompt": job.negative,
-                "width": job.px,
-                "height": job.px,
+                "width": px,
+                "height": px,
                 "seed": job.seed,
                 "num_images": job.n,
             }}
+        if self.workflow_template:
+            workflow = patch_runpod_workflow(
+                self.workflow_template,
+                prompt=prompt,
+                negative_prompt=job.negative,
+                seed=job.seed,
+                width=px,
+                height=px,
+                batch_size=job.n,
+                filename_prefix=self.filename_prefix,
+            )
+            return build_runpod_runsync_payload(workflow)
         workflow = build_runpod_comfyui_workflow(
             prompt=prompt,
             negative_prompt=job.negative,
             seed=job.seed,
-            width=job.px,
-            height=job.px,
+            width=px,
+            height=px,
             checkpoint_name=self.checkpoint_name,
             lora_name=self.full_lora_name,
             lora_strength_model=self.lora_strength_model,
@@ -975,7 +1065,12 @@ class RunPodComfyUIBackend(Backend):
     def _decode_images(self, data: dict, want: int) -> list:
         output = data.get("output", {})
         if isinstance(output, dict):
+            # worker variants: {"images": [...]} or {"message": ["<b64>", ...]}
             imgs = output.get("images")
+            if imgs is None:
+                imgs = output.get("message")
+            if isinstance(imgs, str):
+                imgs = [imgs]
             if imgs is None:
                 single = output.get("image_url") or output.get("image")
                 imgs = [single] if single else []
@@ -999,6 +1094,23 @@ class RunPodComfyUIBackend(Backend):
             raise RuntimeError(f"runpod returned {len(out)} images, wanted {want}: {data.get('status')}")
         return out
 
+    def _downscale(self, images: list, px: int) -> list:
+        """Resize generated PNGs down to the store's requested size (no-op
+        when the job was already at or above generation size)."""
+        if px >= self._gen_px(px):
+            return images
+        import io
+        from PIL import Image
+        out = []
+        for png in images:
+            img = Image.open(io.BytesIO(png))
+            if img.size != (px, px):
+                img = img.resize((px, px), Image.LANCZOS)
+            buf = io.BytesIO()
+            img.save(buf, "PNG")
+            out.append(buf.getvalue())
+        return out
+
     def generate(self, job: GenJob) -> list:
         if self.dry_run:
             return PlaceholderBackend().generate(job)
@@ -1019,7 +1131,7 @@ class RunPodComfyUIBackend(Backend):
                     if not job_id:
                         raise RuntimeError(f"runpod /run returned no job id: {sub}")
                     data = self._poll(job_id)
-                return self._decode_images(data, job.n)
+                return self._downscale(self._decode_images(data, job.n), job.px)
             except (TimeoutError, urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError,
                     KeyError, RuntimeError, ValueError) as e:
                 last_err = e

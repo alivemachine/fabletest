@@ -187,6 +187,7 @@ def test_runpod_backend_build_payload_includes_prompt_prefix_and_lora_path():
         checkpoint_name="sd_xl_base_1.0.safetensors",
         lora_name="foo.safetensors",
         lora_path="/workspace/ComfyUI/models/loras/",
+        workflow_template="/nonexistent",  # force the from-scratch builder
     )
     job = tg.GenJob("k", "tree sprite", "bad", 11, 640, 2)
     payload = b.build_payload(job)
@@ -194,6 +195,42 @@ def test_runpod_backend_build_payload_includes_prompt_prefix_and_lora_path():
     assert wf["1"]["inputs"]["ckpt_name"] == "sd_xl_base_1.0.safetensors"
     assert wf["2"]["inputs"]["lora_name"] == "/workspace/ComfyUI/models/loras/foo.safetensors"
     assert "isometric stylized setting" in wf["3"]["inputs"]["text"]
+
+
+def test_runpod_workflow_template_patching():
+    # the checked-in template is the endpoint's known-good graph
+    tpl = tg.load_runpod_workflow_template(tg.RUNPOD_DEFAULT_WORKFLOW_TEMPLATE)
+    assert tpl is not None and "118" in tpl
+    b = tg.RunPodComfyUIBackend(endpoint_id="ep", api_key="key",
+                                prompt_prefix="iso style")
+    job = tg.GenJob("k", "oak tree", "bad stuff", 77, 512, 3)
+    wf = b.build_payload(job)["input"]["workflow"]
+    # checkpoint/VAE names untouched (must match what the worker has)
+    assert wf["4"]["inputs"]["ckpt_name"] == "stable-diffusion-xl-base-1.0.safetensors"
+    assert wf["676"]["inputs"]["vae_name"] == "sdxl_vae.safetensors"
+    # job fields patched in; small jobs generate at min_px (SDXL floor),
+    # then generate() downscales the PNGs back to job.px
+    assert wf["118"]["inputs"]["noise_seed"] == 77
+    assert wf["1066"]["inputs"] == {"width": 1024, "height": 1024, "batch_size": 3}
+    assert wf["999"]["inputs"]["text_g"] == "iso style, oak tree"
+    assert wf["999"]["inputs"]["text_l"] == "iso style, oak tree"
+    assert wf["999"]["inputs"]["target_width"] == 1024
+    assert wf["1167"]["inputs"]["text_g"] == "bad stuff"
+    assert wf["1292"]["inputs"]["filename_prefix"] == "fabletest"
+    # original template not mutated
+    assert tpl["118"]["inputs"]["noise_seed"] == 9419741727
+
+
+def test_runpod_decode_message_output():
+    import base64
+    b = tg.RunPodComfyUIBackend(endpoint_id="ep", api_key="key")
+    png = b"\x89PNG fake"
+    b64 = base64.b64encode(png).decode()
+    # the live endpoint returns {"output": {"message": ["<b64>", ...]}}
+    out = b._decode_images({"output": {"message": [b64]}}, 1)
+    assert out == [png]
+    out = b._decode_images({"output": {"message": b64}}, 1)
+    assert out == [png]
 
 
 def test_runpod_backend_prompt_input_format():
@@ -207,7 +244,8 @@ def test_runpod_backend_prompt_input_format():
     assert "workflow" not in inp
     assert inp["prompt"].startswith("isometric stylized setting")
     assert inp["negative_prompt"] == "bad"
-    assert inp["width"] == inp["height"] == 640
+    # 640 < min_px, so generation runs at the SDXL floor (downscaled after)
+    assert inp["width"] == inp["height"] == 1024
     assert inp["seed"] == 11 and inp["num_images"] == 2
 
 
