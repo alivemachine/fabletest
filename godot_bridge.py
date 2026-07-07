@@ -23,6 +23,7 @@ from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 
+import texgen
 import world_core as wc
 
 
@@ -53,13 +54,15 @@ def _mean_u8(field: np.ndarray) -> int:
 
 
 class WorldBridge:
-    def __init__(self, seed: int, size: int, civ_count: int):
+    def __init__(self, seed: int, size: int, civ_count: int,
+                 textures: "texgen.TextureService | None" = None):
         self.seed = int(seed)
         self.size = int(size)
         self.civ_count = int(civ_count)
         self.t = 0.0
         self.lock = threading.Lock()
         self.world = wc.build_world(self.seed, self.size, self.civ_count)
+        self.textures = textures
 
     def _rebuild(self, seed: int, size: int, civ_count: int) -> None:
         seed = int(seed)
@@ -269,55 +272,103 @@ class WorldBridge:
             bitmaps["data_map"].tobytes(),      # N*N*4 bytes
         ])
 
-    def snapshot(self, *, seed: int | None = None, size: int | None = None,
-                 civ_count: int | None = None, cx: float = 0.5, cy: float = 0.5,
-                 zoom: float = 12.0, view_tiles: int = 24, dt_seconds: float = 0.0,
-                 speed: float = 0.35, playing: bool = True, sea_level: float = 0.42,
-                 river_thr: float | None = None, season_amp: float = 0.18,
-                 tide_amp: float = 0.012, day_night: float = 0.65,
-                 reset: bool = False) -> dict[str, Any]:
+    def _chunk_state(self, *, seed: int | None = None, size: int | None = None,
+                     civ_count: int | None = None, cx: float = 0.5, cy: float = 0.5,
+                     zoom: float = 12.0, view_tiles: int = 24, dt_seconds: float = 0.0,
+                     speed: float = 0.35, playing: bool = True, sea_level: float = 0.42,
+                     river_thr: float | None = None, season_amp: float = 0.18,
+                     tide_amp: float = 0.012, day_night: float = 0.65,
+                     reset: bool = False):
+        """Shared prologue of every endpoint: rebuild if params changed,
+        advance the clock, cut the player-centered chunk, compute its state.
+        Caller must hold self.lock."""
+        self._rebuild(seed if seed is not None else self.seed,
+                      size if size is not None else self.size,
+                      civ_count if civ_count is not None else self.civ_count)
+        if reset:
+            eco = getattr(self.world, "eco", None)
+            if eco is not None:
+                eco.reset()
+            self.t = 0.0
+        river_thr = (wc.default_river_threshold(self.size)
+                     if river_thr is None else float(river_thr))
+        self._advance(dt_seconds, speed, playing, sea_level, season_amp, tide_amp)
+        zoom = max(1.0, float(zoom))
+        view_tiles = max(8, int(view_tiles))
+        chunk = self.world.stream_view(cx % 1.0, cy % 1.0, zoom, view_tiles)
+        st = wc.state(chunk, self.t, sea_level, river_thr, season_amp, tide_amp, day_night)
+        return chunk, st
+
+    def snapshot(self, **kw: Any) -> dict[str, Any]:
         with self.lock:
-            self._rebuild(seed if seed is not None else self.seed,
-                          size if size is not None else self.size,
-                          civ_count if civ_count is not None else self.civ_count)
-            if reset:
-                eco = getattr(self.world, "eco", None)
-                if eco is not None:
-                    eco.reset()
-                self.t = 0.0
-            river_thr = (wc.default_river_threshold(self.size)
-                         if river_thr is None else float(river_thr))
-            self._advance(dt_seconds, speed, playing, sea_level, season_amp, tide_amp)
-            zoom = max(1.0, float(zoom))
-            view_tiles = max(8, int(view_tiles))
-            chunk = self.world.stream_view(cx % 1.0, cy % 1.0, zoom, view_tiles)
-            st = wc.state(chunk, self.t, sea_level, river_thr, season_amp, tide_amp, day_night)
+            view_tiles = max(8, int(kw.get("view_tiles", 24)))
+            chunk, st = self._chunk_state(**kw)
             return self._payload(chunk, st, view_tiles)
 
-    def snapshot_binary(self, *, seed: int | None = None, size: int | None = None,
-                        civ_count: int | None = None, cx: float = 0.5, cy: float = 0.5,
-                        zoom: float = 12.0, view_tiles: int = 24, dt_seconds: float = 0.0,
-                        speed: float = 0.35, playing: bool = True, sea_level: float = 0.42,
-                        river_thr: float | None = None, season_amp: float = 0.18,
-                        tide_amp: float = 0.012, day_night: float = 0.65,
-                        reset: bool = False) -> bytes:
+    def snapshot_binary(self, **kw: Any) -> bytes:
         with self.lock:
-            self._rebuild(seed if seed is not None else self.seed,
-                          size if size is not None else self.size,
-                          civ_count if civ_count is not None else self.civ_count)
-            if reset:
-                eco = getattr(self.world, "eco", None)
-                if eco is not None:
-                    eco.reset()
-                self.t = 0.0
-            river_thr = (wc.default_river_threshold(self.size)
-                         if river_thr is None else float(river_thr))
-            self._advance(dt_seconds, speed, playing, sea_level, season_amp, tide_amp)
-            zoom = max(1.0, float(zoom))
-            view_tiles = max(8, int(view_tiles))
-            chunk = self.world.stream_view(cx % 1.0, cy % 1.0, zoom, view_tiles)
-            st = wc.state(chunk, self.t, sea_level, river_thr, season_amp, tide_amp, day_night)
+            view_tiles = max(8, int(kw.get("view_tiles", 24)))
+            chunk, st = self._chunk_state(**kw)
             return self._payload_binary(chunk, st, view_tiles)
+
+    def tiles(self, prewarm: bool = True, **kw: Any) -> dict[str, Any]:
+        """The texture-descriptor view of the same chunk /frame streams: which
+        distinct appearances are on screen, which sprite files serve them NOW
+        (exact / nearest fallback / placeholder while the real art generates),
+        and where each multi-tile prop instance anchors. Godot renders from
+        this and simply re-asks next frame — art upgrades in place as the
+        generation queue drains."""
+        svc = self.textures
+        if svc is None:
+            return {"error": "texture service disabled"}
+        with self.lock:
+            chunk, st = self._chunk_state(**kw)
+            df = texgen.derive(chunk, st, n_variations=svc.variations)
+            var = texgen.variation_grid(chunk, svc.variations, df.lod)
+        res = svc.resolve_field(df)
+        if prewarm:
+            svc.prewarm_neighbors(df)
+        legend = {}
+        for code, r in res.items():
+            legend[str(code)] = {
+                "key": r.key, "key_hash": r.key_hash, "subject": r.subject,
+                "status": r.status, "served": r.served, "tags": r.tags,
+                "footprint": r.footprint,
+                "urls": [f"/texture/{r.key_hash}/{i}.png"
+                         for i in range(len(r.paths))],
+            }
+        return {
+            "seed": self.seed, "time_days": float(st["t"]),
+            "size": int(chunk.size), "span": float(chunk.span),
+            "center": {"cx": float(chunk.cx), "cy": float(chunk.cy)},
+            "lod": df.lod,
+            "lod_name": texgen.LOD_NAMES[df.lod - texgen.LOD_MIN],
+            "ground_codes": df.ground.ravel().tolist(),
+            "ground_variations": var.ravel().tolist(),
+            "props": [[p.i, p.j, p.code, p.variation, p.footprint]
+                      for p in df.props],
+            "legend": legend,
+            "queue": svc.pending_count(),
+        }
+
+    def texture_png(self, key_hash: str, idx: int) -> bytes | None:
+        """Serve variation `idx` of the asset behind `key_hash` — always the
+        best art that exists right now for that key."""
+        svc = self.textures
+        if svc is None:
+            return None
+        key = svc.store.key_for_hash(key_hash)
+        if key is None:
+            return None
+        r = svc.resolve(texgen._desc_from_key(key), enqueue=False)
+        if not r.paths:
+            return None
+        path = r.paths[max(0, min(idx, len(r.paths) - 1))]
+        try:
+            with open(path, "rb") as f:
+                return f.read()
+        except OSError:
+            return None
 
 
 def _parse_bool(values: dict[str, list[str]], name: str, default: bool) -> bool:
@@ -356,12 +407,30 @@ class BridgeHandler(BaseHTTPRequestHandler):
         if parsed.path == "/health":
             self._send_json({"ok": True})
             return
-        if parsed.path not in {"/frame", "/frame.bin"}:
-            self._send_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
-            return
         bridge = self.bridge
         if bridge is None:
             self._send_json({"error": "bridge unavailable"}, status=HTTPStatus.SERVICE_UNAVAILABLE)
+            return
+        if parsed.path.startswith("/texture/"):
+            # /texture/<key_hash>/<idx>.png — the sprite files /tiles points at
+            parts = parsed.path.strip("/").split("/")
+            if len(parts) == 3 and parts[2].endswith(".png"):
+                try:
+                    idx = int(parts[2][:-4])
+                except ValueError:
+                    idx = 0
+                png = bridge.texture_png(parts[1], idx)
+                if png is not None:
+                    self._send_binary(png, content_type="image/png")
+                    return
+            self._send_json({"error": "unknown texture"}, status=HTTPStatus.NOT_FOUND)
+            return
+        if parsed.path == "/texture_stats":
+            svc = bridge.textures
+            self._send_json(svc.stats() if svc else {"error": "texture service disabled"})
+            return
+        if parsed.path not in {"/frame", "/frame.bin", "/tiles"}:
+            self._send_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
             return
         qs = parse_qs(parsed.query)
         args = {
@@ -385,6 +454,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
         if parsed.path == "/frame.bin":
             self._send_binary(bridge.snapshot_binary(**args))
             return
+        if parsed.path == "/tiles":
+            args["prewarm"] = _parse_bool(qs, "prewarm", True)
+            self._send_json(bridge.tiles(**args))
+            return
         payload = bridge.snapshot(**args)
         self._send_json(payload)
 
@@ -403,10 +476,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_binary(self, body: bytes, status: HTTPStatus = HTTPStatus.OK) -> None:
+    def _send_binary(self, body: bytes, status: HTTPStatus = HTTPStatus.OK,
+                     content_type: str = "application/octet-stream") -> None:
         self.send_response(status)
         self._cors_headers()
-        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -459,9 +533,27 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--size", type=int, default=192)
     parser.add_argument("--civ-count", type=int, default=3)
+    parser.add_argument("--texture-store", default="texture_store",
+                        help="root dir for the generated-texture store")
+    parser.add_argument("--texture-backend", choices=["placeholder", "rest"],
+                        default="placeholder",
+                        help="image generator: built-in painter, or a REST "
+                             "endpoint (see texgen.RestBackend contract)")
+    parser.add_argument("--texture-url", default=None,
+                        help="URL of the REST image-gen endpoint")
+    parser.add_argument("--texture-variations", type=int, default=3)
+    parser.add_argument("--tile-px", type=int, default=64)
     args = parser.parse_args()
 
-    BridgeHandler.bridge = WorldBridge(args.seed, args.size, args.civ_count)
+    backend = (texgen.RestBackend(args.texture_url)
+               if args.texture_backend == "rest" and args.texture_url
+               else texgen.PlaceholderBackend())
+    textures = texgen.TextureService(args.texture_store, backend=backend,
+                                     variations=args.texture_variations,
+                                     tile_px=args.tile_px)
+    textures.start_worker()
+    BridgeHandler.bridge = WorldBridge(args.seed, args.size, args.civ_count,
+                                       textures=textures)
     _evict_port(args.port)
     server = ThreadingHTTPServer((args.host, args.port), BridgeHandler)
     print(f"serving Godot bridge at http://{args.host}:{args.port}/frame")
