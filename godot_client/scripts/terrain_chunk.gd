@@ -1,7 +1,15 @@
 extends Node2D
 
+const PixelArt = preload("res://scripts/pixel_art.gd")
+
 const FRAME_PACKET_HEADER_BYTES := 48
-const FRAME_PACKET_VERSION := 3
+const FRAME_PACKET_VERSION := 4
+const YEAR_DAYS := 96.0  # must match world_core.YEAR_DAYS
+
+# Sprites whose leaves follow the seasons (tinted green→orange→bare).
+const DECIDUOUS := [PixelArt.SPR_OAK, PixelArt.SPR_ACACIA, PixelArt.SPR_BUSH, PixelArt.SPR_BERRY]
+const FACTION_COLORS := [Color8(214, 69, 65), Color8(232, 184, 58), Color8(58, 176, 168),
+	Color8(150, 96, 210), Color8(232, 128, 52), Color8(96, 178, 84)]
 
 # ---------------------------------------------------------------------------
 # TILE PALETTE — the single source of truth for what each color means in-game.
@@ -123,6 +131,8 @@ var anchor := Vector2.ZERO
 var _mesh_node: MeshInstance2D
 var _mesh_front: ArrayMesh
 var _mesh_back: ArrayMesh
+var _uv: Array = []          # atlas cell -> normalized UV Rect2
+var _uv_white := Vector2.ZERO  # solid-white texel terrain quads sample
 var _mesh_base := Vector2i(-99999, -99999)
 var _mesh_buf_radius := 8
 var _mesh_thread: Thread
@@ -377,11 +387,13 @@ func _setup_mesh_renderer() -> void:
 	_mesh_back = ArrayMesh.new()
 	_mesh_node = MeshInstance2D.new()
 	_mesh_node.mesh = _mesh_front
-	var shader := Shader.new()
-	shader.code = "shader_type canvas_item;\nvoid fragment() { COLOR = COLOR; }"
-	var mat := ShaderMaterial.new()
-	mat.shader = shader
-	_mesh_node.material = mat
+	# One atlas texture for everything: terrain quads UV into the solid-white
+	# cell, sprites into their own cells — a single surface, a single draw call.
+	var atlas: Dictionary = PixelArt.make_sprite_atlas()
+	_uv = atlas["uv"]
+	_uv_white = (_uv[PixelArt.SPR_WHITE] as Rect2).position
+	_mesh_node.texture = atlas["texture"]
+	_mesh_node.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
 	add_child(_mesh_node)
 
 
@@ -402,11 +414,11 @@ func _request_mesh_rebuild() -> void:
 			if rec != null:
 				cache_snap[Vector2i(tx, ty)] = rec
 	_mesh_thread = Thread.new()
-	_mesh_thread.start(Callable(self, "_build_mesh_thread_func").bind(new_base, cache_snap, gn))
+	_mesh_thread.start(Callable(self, "_build_mesh_thread_func").bind(new_base, cache_snap, gn, _time_days))
 
 
-func _build_mesh_thread_func(new_base: Vector2i, cache: Dictionary, gn: int) -> void:
-	var result := _build_mesh_data(new_base.x, new_base.y, cache, gn)
+func _build_mesh_thread_func(new_base: Vector2i, cache: Dictionary, gn: int, t_days: float) -> void:
+	var result := _build_mesh_data(new_base.x, new_base.y, cache, gn, t_days)
 	result["base"] = new_base
 	_mesh_mutex.lock()
 	_mesh_result = result
@@ -414,12 +426,33 @@ func _build_mesh_thread_func(new_base: Vector2i, cache: Dictionary, gn: int) -> 
 	_mesh_mutex.unlock()
 
 
-func _build_mesh_data(base_x: int, base_y: int, cache: Dictionary, gn: int) -> Dictionary:
+func _season_tints(t_days: float) -> Dictionary:
+	# Season phase: 0 = spring equinox, .25 midsummer, .5 autumn, .75 midwinter
+	# (matches world_core.frame_params: season_off = sin(TAU * t / YEAR_DAYS)).
+	var ph := fposmod(t_days / YEAR_DAYS, 1.0) * TAU
+	var spring := maxf(cos(ph), 0.0)
+	var autumn := maxf(-cos(ph), 0.0)
+	var winter := maxf(-sin(ph), 0.0)
+	# Deciduous leaves: fresh green -> deep summer -> orange -> bare brown.
+	var leaf := Color.WHITE.lerp(Color(1.30, 0.74, 0.40), autumn)
+	leaf = leaf.lerp(Color(0.70, 0.60, 0.54), winter)
+	leaf = leaf.lerp(Color(0.90, 1.10, 0.74), spring * 0.5)
+	# Crops (wheat sprite is harvest-gold): green shoots in spring, dead in winter.
+	var crop := Color.WHITE.lerp(Color(0.58, 0.96, 0.52), spring)
+	crop = crop.lerp(Color(0.62, 0.56, 0.50), winter)
+	return {"leaf": leaf, "crop": crop}
+
+
+func _build_mesh_data(base_x: int, base_y: int, cache: Dictionary, gn: int, t_days: float) -> Dictionary:
 	var r := render_radius + _mesh_buf_radius
 	var hw := tile_width * 0.5
 	var hh := tile_height * 0.5
 	var verts_arr := []
 	var colors_arr := []
+	var uvs_arr := []
+	var season := _season_tints(t_days)
+	var leaf: Color = season["leaf"]
+	var crop: Color = season["crop"]
 	# Diagonal sweep gives iso back-to-front order (d = ox+oy ascending).
 	for d in range(-2 * r, 2 * r + 1):
 		for ox in range(-r, r + 1):
@@ -441,56 +474,48 @@ func _build_mesh_data(base_x: int, base_y: int, cache: Dictionary, gn: int) -> D
 			var cy := float(ox + oy) * hh
 			var tyv := cy - hp  # Y of top-center
 			# Left face
-			_arr_quad(verts_arr, colors_arr,
+			_arr_quad(verts_arr, colors_arr, uvs_arr,
 				cx - hw, tyv,      cx, tyv + hh,
 				cx, cy + hh,       cx - hw, cy, lc)
 			# Right face
-			_arr_quad(verts_arr, colors_arr,
+			_arr_quad(verts_arr, colors_arr, uvs_arr,
 				cx + hw, tyv,      cx, tyv + hh,
 				cx, cy + hh,       cx + hw, cy, rc_c)
 			# Top face
-			_arr_quad(verts_arr, colors_arr,
+			_arr_quad(verts_arr, colors_arr, uvs_arr,
 				cx, tyv - hh,      cx + hw, tyv,
 				cx, tyv + hh,      cx - hw, tyv, tc)
-			# Tree canopy
-			if rec["tree_biome"] >= 0:
-				var veg: float = rec["tree_veg"]
-				var sun: float = rec["tree_sun"]
-				var cc: Color = rec["canopy_color"].lerp(Color.WHITE, sun * 0.10)
-				var trunk_h := 10.0 + veg * 12.0
-				var cw := 12.0 + veg * 10.0
-				var ch_v := 8.0 + veg * 8.0
-				var trunk_c: Color = Color8(92, 64, 44).lerp(Color.WHITE, sun * 0.12)
-				_arr_quad(verts_arr, colors_arr,
-					cx - 2.0, tyv - trunk_h + 6.0,   cx + 2.0, tyv - trunk_h + 6.0,
-					cx + 2.0, tyv + 6.0,              cx - 2.0, tyv + 6.0, trunk_c)
-				var cp := tyv - trunk_h + 4.0
-				_arr_quad(verts_arr, colors_arr,
-					cx, cp - ch_v,   cx + cw, cp,
-					cx, cp + ch_v,   cx - cw, cp, cc)
-			# Building
+			# Sprites, back-to-front on the tile: resource, fauna, tree, house.
+			# All are lit by the tile's sunlight (day/night + terrain + clouds).
+			var lv: float = rec.get("light", 0.8)
+			var lit := Color(lv, lv, lv)
+			var res_id: int = rec.get("spr_res", -1)
+			if res_id >= 0:
+				var rt := lit
+				if res_id == PixelArt.SPR_WHEAT:
+					rt = crop * lit
+				elif res_id == PixelArt.SPR_BERRY:
+					rt = leaf * lit
+				_spr_quad(verts_arr, colors_arr, uvs_arr, res_id, cx, tyv, 15.0, rt)
+			var fauna_id: int = rec.get("spr_fauna", -1)
+			if fauna_id >= 0:
+				_spr_quad(verts_arr, colors_arr, uvs_arr, fauna_id, cx, tyv, 14.0, lit)
+			var tree_id: int = rec.get("spr_tree", -1)
+			if tree_id >= 0:
+				var s: float = 18.0 + float(rec.get("tree_veg", 0.5)) * 16.0
+				var tt := leaf * lit if tree_id in DECIDUOUS else lit
+				_spr_quad(verts_arr, colors_arr, uvs_arr, tree_id, cx, tyv, s, tt)
 			if int(rec.get("structure", 0)) == 2:
-				var wall: Color = rec.get("wall", Color8(200, 190, 170))
-				var fw := tile_width * 0.30
-				var fh_b := tile_height * 0.30
-				var wh := 22.0
-				_arr_quad(verts_arr, colors_arr,
-					cx - fw, tyv,          cx, tyv + fh_b,
-					cx, tyv + fh_b - wh,   cx - fw, tyv - wh, wall.darkened(0.30))
-				_arr_quad(verts_arr, colors_arr,
-					cx + fw, tyv,          cx, tyv + fh_b,
-					cx, tyv + fh_b - wh,   cx + fw, tyv - wh, wall.darkened(0.14))
-				_arr_quad(verts_arr, colors_arr,
-					cx, tyv - fh_b - wh,   cx + fw, tyv - wh,
-					cx, tyv + fh_b - wh,   cx - fw, tyv - wh,
-					wall.lerp(Color8(96, 62, 52), 0.5).lightened(0.04))
+				var wall: Color = rec.get("wall", Color.WHITE)
+				_spr_quad(verts_arr, colors_arr, uvs_arr, PixelArt.SPR_HOUSE, cx, tyv, 30.0, wall * lit)
 	return {
 		"verts": PackedVector2Array(verts_arr),
 		"colors": PackedColorArray(colors_arr),
+		"uvs": PackedVector2Array(uvs_arr),
 	}
 
 
-func _arr_quad(verts: Array, colors: Array,
+func _arr_quad(verts: Array, colors: Array, uvs: Array,
 		x0: float, y0: float, x1: float, y1: float,
 		x2: float, y2: float, x3: float, y3: float,
 		color: Color) -> void:
@@ -500,6 +525,26 @@ func _arr_quad(verts: Array, colors: Array,
 	verts.append(Vector2(x0, y0)); colors.append(color)
 	verts.append(Vector2(x2, y2)); colors.append(color)
 	verts.append(Vector2(x3, y3)); colors.append(color)
+	for _i in range(6):  # untextured quads sample the solid-white atlas texel
+		uvs.append(_uv_white)
+
+
+func _spr_quad(verts: Array, colors: Array, uvs: Array, id: int,
+		cx: float, ground_y: float, size: float, tint: Color) -> void:
+	# Square sprite quad anchored bottom-center a hair below the tile top.
+	var rect: Rect2 = _uv[id]
+	var x0 := cx - size * 0.5
+	var x1 := cx + size * 0.5
+	var y1 := ground_y + tile_height * 0.25
+	var y0 := y1 - size
+	var u0 := rect.position
+	var u1 := rect.position + rect.size
+	verts.append(Vector2(x0, y0)); colors.append(tint); uvs.append(u0)
+	verts.append(Vector2(x1, y0)); colors.append(tint); uvs.append(Vector2(u1.x, u0.y))
+	verts.append(Vector2(x1, y1)); colors.append(tint); uvs.append(u1)
+	verts.append(Vector2(x0, y0)); colors.append(tint); uvs.append(u0)
+	verts.append(Vector2(x1, y1)); colors.append(tint); uvs.append(u1)
+	verts.append(Vector2(x0, y1)); colors.append(tint); uvs.append(Vector2(u0.x, u1.y))
 
 
 func _upload_mesh(result: Dictionary) -> void:
@@ -514,6 +559,7 @@ func _upload_mesh(result: Dictionary) -> void:
 	arrays.resize(Mesh.ARRAY_MAX)
 	arrays[Mesh.ARRAY_VERTEX] = verts
 	arrays[Mesh.ARRAY_COLOR] = colors
+	arrays[Mesh.ARRAY_TEX_UV] = result.get("uvs", PackedVector2Array())
 	# Write into the back buffer — never touch the front mesh while GPU uses it.
 	_mesh_back.clear_surfaces()
 	_mesh_back.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
@@ -647,7 +693,7 @@ func _has_field_s16(field, index: int) -> bool:
 
 
 func _build_snapshot(payload: Dictionary) -> Dictionary:
-	# v3 bitmap path: payload has color_map, property_map, data_map as raw bytes.
+	# v4 bitmap path: payload has color/property/data/detail maps as raw bytes.
 	# Fall back to legacy field path if bitmaps are absent (e.g. offline grid).
 	if payload.has("color_map"):
 		return _build_snapshot_bitmaps(payload)
@@ -655,10 +701,11 @@ func _build_snapshot(payload: Dictionary) -> Dictionary:
 
 
 func _build_snapshot_bitmaps(payload: Dictionary) -> Dictionary:
-	# Decode the v3 three-bitmap payload. No world-model knowledge needed here:
+	# Decode the v4 four-bitmap payload. No world-model knowledge needed here:
 	# color_map   -> palette lookup -> tile definition (physics, walkability, ...)
 	# property_map-> height_px, water flag, structure, faction
-	# data_map    -> vegetation, flow direction/speed, fauna
+	# data_map    -> sunlight, vegetation, flow direction/speed
+	# detail_map  -> fauna densities, temperature, cloud cover (sprite variation)
 	var size: int = int(payload.get("size", 0))
 	var seed: int = int(payload.get("seed", 0))
 	var tile_world: float = max(float(payload.get("tile_world", 0.001)), 1e-6)
@@ -667,6 +714,7 @@ func _build_snapshot_bitmaps(payload: Dictionary) -> Dictionary:
 	var color_map: PackedByteArray = payload["color_map"]   # N*N*3 bytes RGB
 	var prop_map: PackedByteArray  = payload["property_map"] # N*N*4 bytes RGBA
 	var data_map: PackedByteArray  = payload["data_map"]     # N*N*4 bytes RGBA
+	var detail_map: PackedByteArray = payload.get("detail_map", PackedByteArray())  # v4: herb/pred/temp/cloud
 	var grid_n: int = max(1, int(round(1.0 / tile_world)))
 	var origin_x := int(floor(center_uv.x / tile_world + 0.5)) - size / 2
 	var origin_y := int(floor(center_uv.y / tile_world + 0.5)) - size / 2
@@ -717,26 +765,40 @@ func _build_snapshot_bitmaps(payload: Dictionary) -> Dictionary:
 				# Water flag: top face gets animated shimmer tint in _draw().
 				var water_scale := 1.0 if surf_flag > 0 else 0.0
 
-				# Tree placement: use hash on global tile coords for stability
+				# --- detail_map (v4): R=herbivore G=predator B=temperature A=clouds
+				var ei := i * 4
+				var herb := float(detail_map[ei])     / 255.0 if ei   < detail_map.size() else 0.0
+				var pred := float(detail_map[ei + 1]) / 255.0 if ei+1 < detail_map.size() else 0.0
+				var temp := float(detail_map[ei + 2]) / 255.0 if ei+2 < detail_map.size() else 0.5
+				var cloud := float(detail_map[ei + 3]) / 255.0 if ei+3 < detail_map.size() else 0.0
+
+				# Sprite light: the tile's sunlight already carries day/night,
+				# terrain and cloud shadows; extra cloud attenuation makes the
+				# drifting cover read on the sprites themselves.
+				var light := clampf(sun * (1.0 - 0.30 * cloud), 0.06, 1.0)
+
+				# Sprite placement: hash on global tile coords for stability.
 				var gtx := origin_x + gx
 				var gty := origin_y + gy
-				var tree_biome := -1
-				var tree_sun   := 0.8
-				var tree_veg   := veg
-				var canopy_color := Color.TRANSPARENT
-				if structure == 0 and foliage and veg > 0.26 and _hash01(gtx, gty, seed) > 0.55:
-					tree_biome = 6  # grassland index as generic foliage fallback
-					canopy_color = lit_color.lightened(0.12)
+				var biome_name: String = tile_def["name"]
+				var spr_tree := -1
+				if structure == 0 and surf_flag == 0:
+					if foliage and veg > 0.26 and _hash01(gtx, gty, seed) > 0.55:
+						spr_tree = _tree_sprite(biome_name, temp)
+					elif biome_name in ["desert", "dunes", "reg_rock"] and _hash01(gtx, gty, seed + 9) > 0.94:
+						spr_tree = PixelArt.SPR_CACTUS
+				var spr_fauna := -1
+				if structure == 0 and surf_flag == 0 and tile_def["walkable"]:
+					spr_fauna = _fauna_sprite(biome_name, temp, herb, pred, gtx, gty, seed)
+				var spr_res := -1
+				if structure == 0 and spr_tree < 0 and spr_fauna < 0:
+					spr_res = _resource_sprite(tile_def["resource"], biome_name, gtx, gty, seed)
 
-				# Building wall color from faction tint
-				var wall_color := Color(0.0, 0.0, 0.0, 0.0)
-				if structure == 2:
-					wall_color = lit_color.lerp(Color8(228, 214, 186), 0.55)
-					if faction >= 0:
-						var fi := faction % 6
-						const FAC := [Color8(214,69,65),Color8(232,184,58),Color8(58,176,168),
-									  Color8(150,96,210),Color8(232,128,52),Color8(96,178,84)]
-						wall_color = FAC[fi].lerp(Color8(228, 214, 186), 0.58)
+				# Building tint: near-white (house sprite has its own colors),
+				# pulled toward the owning faction's hue.
+				var wall_color := Color.WHITE
+				if structure == 2 and faction >= 0:
+					wall_color = FACTION_COLORS[faction % 6].lerp(Color.WHITE, 0.60)
 
 				var key := Vector2i(((gtx % grid_n) + grid_n) % grid_n,
 					((gty % grid_n) + grid_n) % grid_n)
@@ -748,10 +810,11 @@ func _build_snapshot_bitmaps(payload: Dictionary) -> Dictionary:
 					"left":         left_color,
 					"right":        right_color,
 					"water_scale":  water_scale,
-					"tree_biome":   tree_biome,
-					"tree_sun":     tree_sun,
-					"tree_veg":     tree_veg,
-					"canopy_color": canopy_color,
+					"spr_tree":     spr_tree,
+					"spr_fauna":    spr_fauna,
+					"spr_res":      spr_res,
+					"tree_veg":     veg,
+					"light":        light,
 					"structure":    structure,
 					"wall":         wall_color,
 					"env": {
@@ -761,6 +824,10 @@ func _build_snapshot_bitmaps(payload: Dictionary) -> Dictionary:
 						"flow":      Vector2(cos(f_dir * TAU), sin(f_dir * TAU)) * f_spd,
 						"sunlight":  sun,
 						"vegetation":veg,
+						"temperature": temp,
+						"fauna_herb": herb,
+						"fauna_pred": pred,
+						"cloud":     cloud,
 						"structure": structure,
 						"faction":   faction,
 						"height":    height_norm,
@@ -780,6 +847,64 @@ func _build_snapshot_bitmaps(payload: Dictionary) -> Dictionary:
 		"cloud_mean":   int(payload.get("cloud_mean", 110)),
 		"tiles":        tiles,
 	}
+
+
+func _tree_sprite(biome: String, temp: float) -> int:
+	# Biome (with temperature tiebreak) -> tree species.
+	match biome:
+		"beach", "oasis":
+			return PixelArt.SPR_PALM
+		"savanna", "acacia_scrub":
+			return PixelArt.SPR_ACACIA
+		"jungle", "jungle_clear":
+			return PixelArt.SPR_JUNGLE
+		"taiga":
+			return PixelArt.SPR_PINE
+		"dark_forest":
+			return PixelArt.SPR_FIR
+		"shrub_steppe", "tundra", "rocky_tundra":
+			return PixelArt.SPR_BUSH
+		"forest", "glade":
+			return PixelArt.SPR_PINE if temp < 0.34 else PixelArt.SPR_OAK
+	return PixelArt.SPR_BUSH if temp < 0.30 else PixelArt.SPR_OAK
+
+
+func _fauna_sprite(biome: String, temp: float, herb: float, pred: float,
+		gtx: int, gty: int, seed: int) -> int:
+	# Spawn odds follow the fauna layer's densities; species follow climate.
+	if _hash01(gtx, gty, seed + 202) > 1.0 - pred * 0.05:
+		return PixelArt.SPR_WOLF if temp < 0.42 else PixelArt.SPR_LION
+	if _hash01(gtx, gty, seed + 101) > 1.0 - herb * 0.12:
+		if temp < 0.30:
+			return PixelArt.SPR_SHEEP
+		if biome in ["desert", "dunes", "shrub_steppe", "reg_rock", "savanna", "acacia_scrub"]:
+			return PixelArt.SPR_CAMEL
+		return PixelArt.SPR_DEER
+	return -1
+
+
+func _resource_sprite(resource: String, biome: String, gtx: int, gty: int, seed: int) -> int:
+	# Resources come in FIELDS: a coarse hash on 6x6-tile cells picks which
+	# patches exist, a fine hash fills them densely -> contiguous wheat fields,
+	# berry groves, rock scatters, fish schools.
+	if resource == "":
+		return -1
+	var fx := int(floor(float(gtx) / 6.0))
+	var fy := int(floor(float(gty) / 6.0))
+	if _hash01(fx, fy, seed + 303) < 0.55 or _hash01(gtx, gty, seed + 71) < 0.45:
+		return -1
+	match resource:
+		"food":
+			if biome in ["wheat_soil", "meadow", "tall_grass"]:
+				return PixelArt.SPR_WHEAT
+			return PixelArt.SPR_BERRY
+		"stone":
+			return PixelArt.SPR_ROCK
+		"ore":
+			return PixelArt.SPR_ORE
+		"fish":
+			return PixelArt.SPR_FISH
+	return -1
 
 
 func _build_snapshot_legacy(payload: Dictionary) -> Dictionary:
@@ -823,9 +948,9 @@ func _build_snapshot_legacy(payload: Dictionary) -> Dictionary:
 					"key": key, "height": elev, "height_px": height_px,
 					"top": top_color, "left": left_color, "right": right_color,
 					"water_scale": 0.94 if water else 0.0,
-						"tree_biome": -1, "tree_sun": sun, "tree_veg": 0.0,
-						"canopy_color": Color.TRANSPARENT,
-					"structure": 0, "wall": Color(0,0,0,0), "env": {},
+					"spr_tree": -1, "spr_fauna": -1, "spr_res": -1,
+					"tree_veg": 0.0, "light": sun,
+					"structure": 0, "wall": Color.WHITE, "env": {},
 				})
 	return {
 		"size": size, "seed": seed, "sea_effective": sea_effective,
@@ -861,10 +986,11 @@ func _decode_frame_packet(body: PackedByteArray) -> Dictionary:
 	var target_tiles := int(body.decode_u16(14))
 	var cells := size * size
 	var offset := FRAME_PACKET_HEADER_BYTES
-	# v3: three packed bitmaps
+	# v4: four packed bitmaps
 	var color_map   := _copy_bytes(body, offset, cells * 3);  offset += cells * 3
 	var prop_map    := _copy_bytes(body, offset, cells * 4);  offset += cells * 4
-	var data_map    := _copy_bytes(body, offset, cells * 4)
+	var data_map    := _copy_bytes(body, offset, cells * 4);  offset += cells * 4
+	var detail_map  := _copy_bytes(body, offset, cells * 4)
 	if color_map.size() != cells * 3 or prop_map.size() != cells * 4:
 		return {}
 	return {
@@ -886,6 +1012,7 @@ func _decode_frame_packet(body: PackedByteArray) -> Dictionary:
 		"color_map":     color_map,
 		"property_map":  prop_map,
 		"data_map":      data_map,
+		"detail_map":    detail_map,
 	}
 
 

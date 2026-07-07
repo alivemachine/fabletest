@@ -1,0 +1,70 @@
+{
+  "generated_at": "2026-07-07T16:22:35.271Z",
+  "seed": 42,
+  "size": 192,
+  "civ_count": 3,
+  "width": 1920,
+  "height": 1080,
+  "screenshots": [
+    {
+      "file": "frame_00.png",
+      "kind": "near_settlement",
+      "cx": 0.55751,
+      "cy": 0.377874
+    },
+    {
+      "file": "frame_01.png",
+      "kind": "near_settlement",
+      "cx": 0.069481,
+      "cy": 0.444853
+    },
+    {
+      "file": "frame_02.png",
+      "kind": "near_settlement",
+      "cx": 0.040863,
+      "cy": 0.471946
+    },
+    {
+      "file": "frame_03.png",
+      "kind": "random",
+      "cx": 0.063923,
+      "cy": 0.985279
+    },
+    {
+      "file": "frame_04.png",
+      "kind": "random",
+      "cx": 0.031048,
+      "cy": 0.94122
+    },
+    {
+      "file": "frame_05.png",
+      "kind": "random",
+      "cx": 0.710209,
+      "cy": 0.013403
+    },
+    {
+      "file": "frame_06.png",
+      "kind": "random",
+      "cx": 0.393135,
+      "cy": 0.832143
+    },
+    {
+      "file": "frame_07.png",
+      "kind": "near_settlement",
+      "cx": 0.55971,
+      "cy": 0.369978
+    },
+    {
+      "file": "frame_08.png",
+      "kind": "near_settlement",
+      "cx": 0.89385,
+      "cy": 0.413662
+    },
+    {
+      "file": "frame_09.png",
+      "kind": "random",
+      "cx": 0.044241,
+      "cy": 0.965603
+    }
+  ]
+}

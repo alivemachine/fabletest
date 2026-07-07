@@ -43,10 +43,40 @@ Python and streams a player-centered chunk through `godot_bridge.py`.
 python godot_bridge.py --seed 42 --size 192 --civ-count 3
 ```
 
+RunPod ComfyUI SDXL backend (with dry-run support) is available via:
+
+```bash
+RUNPOD_ENDPOINT_ID=... RUNPOD_API_KEY=... \
+python godot_bridge.py --texture-backend runpod-comfyui
+```
+
+For full RunPod/LoRA setup, env vars, and `input.workflow` payload shape, see
+`TEXTURES.md` section "The far side of the API".
+
+The bridge also runs the **tag-driven texture pipeline** (`texgen.py`): every
+tile's continuous state (biome, season, time of day, temperature, growth,
+ecosystem condition, zoom lod) quantizes into a canonical tag key; distinct
+keys — not tiles — are generated once through a pluggable image-gen backend,
+cached in a content-addressed store, and served via `/tiles` +
+`/texture/<hash>/<i>.png` with instant placeholder/nearest-neighbor fallbacks
+while real art generates. `python3 texgen.py` renders a contact sheet of a
+real world's distinct keys; `python3 test_texgen.py` runs the test suite.
+Full design and strategy: **`TEXTURES.md`**.
+
 Open `godot_client/` in Godot 4.2+ and run the main scene. The current client
 is a 3D chunk renderer with sprite-stacked props and parallax layers. If you
 later switch to an authored `TileMapLayer` terrain surface, `better-terrain`
 would be a good fit there; see `godot_client/README.md`.
+
+To refresh the web gallery with current Godot gameplay captures (10 random /
+settlement-near Full HD teleports), run:
+
+```bash
+python3 generate_godot_screenshots.py
+```
+
+Run that script after any Python or Godot-client change so `web/index.html`
+always shows an up-to-date Godot experience.
 
 ## The interface
 

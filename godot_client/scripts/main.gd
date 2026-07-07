@@ -446,3 +446,19 @@ func _update_hud() -> void:
 	hud_label.text = "Fabletest Godot client\n" \
 		+ "WASD move  |  [ ] zoom  |  Space pause  |  R reset  |  G grid test\n" \
 		+ "seed %d  |  day %.1f  |  view %d / chunk %d  |  zoom %.1fx  |  fps %d  |  %s" % [seed, day, view_tiles, chunk, zoom, Engine.get_frames_per_second(), mode_line] 
+
+
+func has_live_payload() -> bool:
+	return terrain != null and terrain.has_payload()
+
+
+func is_request_pending() -> bool:
+	return request_in_flight
+
+
+func teleport_to(center_uv: Vector2, force_refresh: bool = true) -> void:
+	world_uv = Vector2(wrapf(center_uv.x, 0.0, 1.0), wrapf(center_uv.y, 0.0, 1.0))
+	last_move_input = Vector2.ZERO
+	walk_phase = 0.0
+	if force_refresh:
+		_request_frame(0.0, false, world_uv)
