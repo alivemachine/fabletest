@@ -196,6 +196,55 @@ def test_runpod_backend_build_payload_includes_prompt_prefix_and_lora_path():
     assert "isometric stylized setting" in wf["3"]["inputs"]["text"]
 
 
+def test_runpod_backend_prompt_input_format():
+    b = tg.RunPodComfyUIBackend(
+        endpoint_id="ep", api_key="key", input_format="prompt",
+        prompt_prefix="isometric stylized setting",
+    )
+    job = tg.GenJob("k", "tree sprite", "bad", 11, 640, 2)
+    payload = b.build_payload(job)
+    inp = payload["input"]
+    assert "workflow" not in inp
+    assert inp["prompt"].startswith("isometric stylized setting")
+    assert inp["negative_prompt"] == "bad"
+    assert inp["width"] == inp["height"] == 640
+    assert inp["seed"] == 11 and inp["num_images"] == 2
+
+
+def test_runpod_backend_urls_and_modes():
+    b = tg.RunPodComfyUIBackend(endpoint_id="ep", api_key="key")
+    assert b.mode == "run"
+    assert b.base_url == "https://api.runpod.ai/v2/ep"
+    assert b.url == "https://api.runpod.ai/v2/ep/run"
+    bs = tg.RunPodComfyUIBackend(endpoint_id="ep", api_key="key", mode="runsync")
+    assert bs.url == "https://api.runpod.ai/v2/ep/runsync"
+    try:
+        tg.RunPodComfyUIBackend(endpoint_id="ep", api_key="key", mode="bogus")
+        assert False, "bogus mode should raise"
+    except ValueError:
+        pass
+
+
+def test_runpod_decode_images_variants():
+    import base64
+    b = tg.RunPodComfyUIBackend(endpoint_id="ep", api_key="key")
+    png = b"\x89PNG fake"
+    b64 = base64.b64encode(png).decode()
+    # worker-comfyui shape: list of dicts with "image"
+    out = b._decode_images({"output": {"images": [{"image": b64}]}}, 1)
+    assert out == [png]
+    # bare base64 strings, with and without data: prefix
+    out = b._decode_images(
+        {"output": {"images": [b64, f"data:image/png;base64,{b64}"]}}, 2)
+    assert out == [png, png]
+    # bucket-storage URLs should raise a clear error, not decode garbage
+    try:
+        b._decode_images({"output": {"images": [{"url": "https://x/y.png"}]}}, 1)
+        assert False, "url output should raise"
+    except RuntimeError as e:
+        assert "bucket" in str(e).lower() or "url" in str(e).lower()
+
+
 def test_runpod_backend_dry_run_works_without_credentials():
     b = tg.RunPodComfyUIBackend(dry_run=True, endpoint_id=None, api_key=None)
     d = tg.descriptor("tree.oak", lod="single", season="summer", tod="day",

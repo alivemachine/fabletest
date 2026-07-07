@@ -820,7 +820,20 @@ def build_runpod_runsync_payload(workflow: dict) -> dict:
 
 
 class RunPodComfyUIBackend(Backend):
-    """RunPod runsync backend for worker-comfyui SDXL custom workflows."""
+    """RunPod serverless backend for SDXL image generation.
+
+    Two submit modes (RUNPOD_MODE):
+      "run"      (default) POST /run then poll GET /status/{id} — survives
+                 multi-minute cold starts while the pod spins up.
+      "runsync"  POST /runsync — single blocking call, only safe when a
+                 worker is already warm (~90s server-side cap).
+
+    Two input formats (RUNPOD_INPUT_FORMAT):
+      "comfyui"  (default) {"input": {"workflow": <ComfyUI graph JSON>}}
+                 for the worker-comfyui image.
+      "prompt"   {"input": {"prompt", "negative_prompt", "width", "height",
+                 "seed", "num_images"}} for RunPod's quick-deploy SDXL worker.
+    """
     name = "runpod-comfyui"
 
     def __init__(
@@ -837,6 +850,10 @@ class RunPodComfyUIBackend(Backend):
         lora_strength_clip: float = 0.8,
         prompt_prefix: str | None = None,
         dry_run: bool | None = None,
+        mode: str | None = None,
+        input_format: str | None = None,
+        poll_timeout: float | None = None,
+        poll_interval: float | None = None,
     ):
         self.endpoint_id = endpoint_id or _env_str("RUNPOD_ENDPOINT_ID")
         self.api_key = api_key or _env_str("RUNPOD_API_KEY")
@@ -855,8 +872,23 @@ class RunPodComfyUIBackend(Backend):
         self.prompt_prefix = prompt_prefix or _env_str("RUNPOD_PROMPT_PREFIX", RUNPOD_DEFAULT_PROMPT)
         self.dry_run = bool(_env_bool("RUNPOD_DRY_RUN", False) if dry_run is None else dry_run)
         self.filename_prefix = _env_str("RUNPOD_FILENAME_PREFIX", "fabletest")
-        self.url = (f"https://api.runpod.ai/v2/{self.endpoint_id}/runsync"
-                    if self.endpoint_id else None)
+        self.mode = (mode or _env_str("RUNPOD_MODE", "run")).lower()
+        if self.mode not in ("run", "runsync"):
+            raise ValueError(f"RUNPOD_MODE must be 'run' or 'runsync', got {self.mode!r}")
+        self.input_format = (input_format or _env_str("RUNPOD_INPUT_FORMAT", "comfyui")).lower()
+        if self.input_format not in ("comfyui", "prompt"):
+            raise ValueError(
+                f"RUNPOD_INPUT_FORMAT must be 'comfyui' or 'prompt', got {self.input_format!r}"
+            )
+        self.poll_timeout = float(
+            poll_timeout if poll_timeout is not None else _env_float("RUNPOD_POLL_TIMEOUT_SEC", 600.0)
+        )
+        self.poll_interval = float(
+            poll_interval if poll_interval is not None else _env_float("RUNPOD_POLL_INTERVAL_SEC", 3.0)
+        )
+        self.base_url = (f"https://api.runpod.ai/v2/{self.endpoint_id}"
+                         if self.endpoint_id else None)
+        self.url = f"{self.base_url}/{self.mode}" if self.base_url else None
         if not self.checkpoint_name:
             raise ValueError("RUNPOD_SDXL_CHECKPOINT must be configured for SDXL.")
         if self.lora_path and not self.lora_path.endswith("/"):
@@ -867,6 +899,15 @@ class RunPodComfyUIBackend(Backend):
 
     def build_payload(self, job: GenJob) -> dict:
         prompt = f"{self.prompt_prefix}, {job.prompt}" if self.prompt_prefix else job.prompt
+        if self.input_format == "prompt":
+            return {"input": {
+                "prompt": prompt,
+                "negative_prompt": job.negative,
+                "width": job.px,
+                "height": job.px,
+                "seed": job.seed,
+                "num_images": job.n,
+            }}
         workflow = build_runpod_comfyui_workflow(
             prompt=prompt,
             negative_prompt=job.negative,
@@ -882,19 +923,78 @@ class RunPodComfyUIBackend(Backend):
         )
         return build_runpod_runsync_payload(workflow)
 
+    def _headers(self) -> dict:
+        return {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + self.api_key,
+        }
+
+    def _request_json(self, url: str, body: bytes | None = None) -> dict:
+        req = urllib.request.Request(url, data=body, headers=self._headers())
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            return json.loads(resp.read().decode())
+
+    def health(self) -> dict:
+        """GET /health — worker/queue counts; useful to see cold-start state."""
+        if not self.base_url or not self.api_key:
+            raise ValueError("health() requires RUNPOD_ENDPOINT_ID and RUNPOD_API_KEY.")
+        return self._request_json(f"{self.base_url}/health")
+
+    def _poll(self, job_id: str) -> dict:
+        """Poll /status/{id} until the job leaves the queue, tolerating a few
+        transient network errors. Cold starts keep jobs IN_QUEUE for minutes."""
+        deadline = time.monotonic() + self.poll_timeout
+        url = f"{self.base_url}/status/{job_id}"
+        net_errors = 0
+        while True:
+            try:
+                data = self._request_json(url)
+                net_errors = 0
+            except (TimeoutError, urllib.error.URLError, json.JSONDecodeError) as e:
+                net_errors += 1
+                if net_errors > 5:
+                    raise RuntimeError(f"status polling failed repeatedly for job {job_id}: {e}") from e
+                data = None
+            if data is not None:
+                status = data.get("status")
+                if status == "COMPLETED":
+                    return data
+                if status in ("FAILED", "CANCELLED", "TIMED_OUT"):
+                    raise RuntimeError(f"runpod job {job_id} {status}: {data.get('error')}")
+            if time.monotonic() >= deadline:
+                try:
+                    self._request_json(f"{self.base_url}/cancel/{job_id}", body=b"{}")
+                except Exception:
+                    pass
+                raise RuntimeError(
+                    f"runpod job {job_id} still not done after {self.poll_timeout:.0f}s "
+                    f"(last status: {data.get('status') if data else 'unreachable'})"
+                )
+            time.sleep(self.poll_interval)
+
     def _decode_images(self, data: dict, want: int) -> list:
         output = data.get("output", {})
-        imgs = output.get("images", output if isinstance(output, list) else [])
+        if isinstance(output, dict):
+            imgs = output.get("images")
+            if imgs is None:
+                single = output.get("image_url") or output.get("image")
+                imgs = [single] if single else []
+        elif isinstance(output, list):
+            imgs = output
+        else:
+            imgs = []
         out = []
         for item in imgs:
-            if isinstance(item, str):
-                b64 = item.split(",", 1)[-1]
-                out.append(base64.b64decode(b64))
-            elif isinstance(item, dict):
-                b64 = item.get("image") or item.get("base64")
-                if b64:
-                    b64 = b64.split(",", 1)[-1]
-                    out.append(base64.b64decode(b64))
+            if isinstance(item, dict):
+                if item.get("url") or item.get("image_url"):
+                    raise RuntimeError(
+                        "runpod returned image URLs (bucket storage is configured on the "
+                        "endpoint); unset BUCKET_ENDPOINT_URL on the endpoint to get base64, "
+                        f"or fetch manually: {item.get('url') or item.get('image_url')}"
+                    )
+                item = item.get("image") or item.get("base64")
+            if isinstance(item, str) and not item.startswith("http"):
+                out.append(base64.b64decode(item.split(",", 1)[-1]))
         if len(out) != want:
             raise RuntimeError(f"runpod returned {len(out)} images, wanted {want}: {data.get('status')}")
         return out
@@ -902,19 +1002,23 @@ class RunPodComfyUIBackend(Backend):
     def generate(self, job: GenJob) -> list:
         if self.dry_run:
             return PlaceholderBackend().generate(job)
-        if not self.url or not self.api_key:
+        if not self.base_url or not self.api_key:
             raise ValueError("RunPod backend requires RUNPOD_ENDPOINT_ID and RUNPOD_API_KEY (or dry-run mode).")
         body = json.dumps(self.build_payload(job)).encode()
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": "Bearer " + self.api_key,
-        }
         last_err = None
         for attempt in range(self.retries + 1):
             try:
-                req = urllib.request.Request(self.url, data=body, headers=headers)
-                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                    data = json.loads(resp.read().decode())
+                if self.mode == "runsync":
+                    data = self._request_json(f"{self.base_url}/runsync", body)
+                    # runsync can still hand back a queued job id under load
+                    if data.get("status") in ("IN_QUEUE", "IN_PROGRESS") and data.get("id"):
+                        data = self._poll(data["id"])
+                else:
+                    sub = self._request_json(f"{self.base_url}/run", body)
+                    job_id = sub.get("id")
+                    if not job_id:
+                        raise RuntimeError(f"runpod /run returned no job id: {sub}")
+                    data = self._poll(job_id)
                 return self._decode_images(data, job.n)
             except (TimeoutError, urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError,
                     KeyError, RuntimeError, ValueError) as e:
@@ -922,7 +1026,7 @@ class RunPodComfyUIBackend(Backend):
                 if attempt >= self.retries:
                     break
                 time.sleep(self.retry_backoff * (2 ** attempt))
-        raise RuntimeError(f"runpod runsync request failed after {self.retries + 1} attempts: {last_err}") from last_err
+        raise RuntimeError(f"runpod request failed after {self.retries + 1} attempts: {last_err}") from last_err
 
 
 def _desc_from_key(key: str) -> Descriptor:

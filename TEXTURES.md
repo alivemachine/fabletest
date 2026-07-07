@@ -198,12 +198,15 @@ count. Three implementations ship:
          "num_images", "key"}
   200   {"images": ["<base64 png>", "..."]}
   ```
-- **`RunPodComfyUIBackend`** — direct RunPod Serverless worker-comfyui SDXL
-  integration. It posts to:
+- **`RunPodComfyUIBackend`** — direct RunPod Serverless SDXL integration.
+  By default it submits asynchronously and polls (survives multi-minute
+  cold starts while the pod spins up):
 
-  `POST https://api.runpod.ai/v2/{ENDPOINT_ID}/runsync`
+  `POST https://api.runpod.ai/v2/{ENDPOINT_ID}/run` then
+  `GET  https://api.runpod.ai/v2/{ENDPOINT_ID}/status/{JOB_ID}`
 
-  with bearer auth and payload shape:
+  (`RUNPOD_MODE=runsync` switches to the single blocking call — only safe
+  when a worker is already warm.) With bearer auth and payload shape:
 
   ```json
   {
@@ -214,6 +217,22 @@ count. Three implementations ship:
    }
   }
   ```
+
+  For RunPod's quick-deploy SDXL worker (no ComfyUI), set
+  `RUNPOD_INPUT_FORMAT=prompt` to send instead:
+
+  ```json
+  {
+   "input": {
+     "prompt": "...", "negative_prompt": "...",
+     "width": 1024, "height": 1024, "seed": 42, "num_images": 1
+   }
+  }
+  ```
+
+  Run `python runpod_smoke.py` once after configuring credentials — it
+  health-checks the endpoint, tries both input formats, and saves a test
+  image so you know which format the endpoint speaks.
 
   The generated workflow uses: `CheckpointLoaderSimple`, `CLIPTextEncode`,
   `LoraLoader`, `KSampler`, `VAEDecode`, `SaveImage` (plus `EmptyLatentImage`
@@ -229,6 +248,10 @@ count. Three implementations ship:
   Useful optional env vars:
 
   - `RUNPOD_DRY_RUN=1` (returns deterministic placeholder images; no credentials)
+  - `RUNPOD_MODE` (`run` = async submit + poll, default; `runsync` = blocking)
+  - `RUNPOD_INPUT_FORMAT` (`comfyui` default; `prompt` for quick-deploy SDXL workers)
+  - `RUNPOD_POLL_TIMEOUT_SEC` (default 600 — total wait incl. cold start),
+    `RUNPOD_POLL_INTERVAL_SEC` (default 3)
   - `RUNPOD_TIMEOUT_SEC`, `RUNPOD_RETRIES`, `RUNPOD_RETRY_BACKOFF_SEC`
   - `RUNPOD_SDXL_CHECKPOINT` (default `sd_xl_base_1.0.safetensors`)
   - `RUNPOD_LORA_NAME` (default `stylized-setting-isometric-sdxl-and-sd15.safetensors`)
