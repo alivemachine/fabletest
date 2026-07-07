@@ -187,7 +187,7 @@ Next steps when volume demands (in order):
 
 `texgen.Backend` protocol: `generate(GenJob) → [png bytes]`, where `GenJob`
 carries prompt, negative, deterministic seed, pixel size, and variation
-count. Two implementations ship:
+count. Three implementations ship:
 
 - **`PlaceholderBackend`** — the procedural painter promoted to a backend;
   the whole pipeline runs end-to-end with no API attached (default).
@@ -198,6 +198,56 @@ count. Two implementations ship:
          "num_images", "key"}
   200   {"images": ["<base64 png>", "..."]}
   ```
+- **`RunPodComfyUIBackend`** — direct RunPod Serverless worker-comfyui SDXL
+  integration. It posts to:
+
+  `POST https://api.runpod.ai/v2/{ENDPOINT_ID}/runsync`
+
+  with bearer auth and payload shape:
+
+  ```json
+  {
+   "input": {
+     "workflow": {
+       "...": "ComfyUI workflow JSON"
+     }
+   }
+  }
+  ```
+
+  The generated workflow uses: `CheckpointLoaderSimple`, `CLIPTextEncode`,
+  `LoraLoader`, `KSampler`, `VAEDecode`, `SaveImage` (plus `EmptyLatentImage`
+  to provide sampler input). Default prompt prefix:
+
+  `"isometric stylized setting, tiny fantasy village on a cliff, tile-game environment, soft sunlight, clean shapes, SDXL, high detail"`
+
+  Required env vars:
+
+  - `RUNPOD_ENDPOINT_ID`
+  - `RUNPOD_API_KEY`
+
+  Useful optional env vars:
+
+  - `RUNPOD_DRY_RUN=1` (returns deterministic placeholder images; no credentials)
+  - `RUNPOD_TIMEOUT_SEC`, `RUNPOD_RETRIES`, `RUNPOD_RETRY_BACKOFF_SEC`
+  - `RUNPOD_SDXL_CHECKPOINT` (default `sd_xl_base_1.0.safetensors`)
+  - `RUNPOD_LORA_NAME` (default `stylized-setting-isometric-sdxl-and-sd15.safetensors`)
+  - `RUNPOD_LORA_PATH` (default `/workspace/ComfyUI/models/loras/`)
+  - `RUNPOD_PROMPT_PREFIX`
+
+  To fetch the Civitai LoRA into the worker path:
+
+  ```python
+  import texgen
+  texgen.download_civitai_lora(
+     source_url="https://civitai.com/models/118775/stylized-setting-isometric-sdxl-and-sd15",
+     dest_dir="/workspace/ComfyUI/models/loras/",
+     filename="stylized-setting-isometric-sdxl-and-sd15.safetensors",
+  )
+  ```
+
+  Ensure the SDXL base checkpoint configured via `RUNPOD_SDXL_CHECKPOINT`
+  exists on the worker (typically in `ComfyUI/models/checkpoints/`).
 
 Prompts come from `build_prompt()` — one table maps tags to phrases
 (`season=winter` → "winter, snow-dusted"; `lod=group3` → "a small cluster of
@@ -243,8 +293,10 @@ prefix; later, IPAdapter reference images for cross-key consistency).
 - `GET /texture/<key_hash>/<idx>.png` — always the best art that exists for
   that key right now (exact → fallback → placeholder).
 - `GET /texture_stats` — store + queue counts.
-- CLI: `--texture-backend rest --texture-url http://…` to attach a real
-  generator; `--texture-store`, `--texture-variations`, `--tile-px`.
+- CLI:
+  - `--texture-backend rest --texture-url http://…` for generic REST
+  - `--texture-backend runpod-comfyui` for direct RunPod worker-comfyui
+  - plus `--texture-store`, `--texture-variations`, `--tile-px`.
 
 ## 11. Roadmap
 
@@ -253,7 +305,7 @@ prefix; later, IPAdapter reference images for cross-key consistency).
 3. ✅ Fallback chain + placeholder painter + variation determinism
 4. ✅ Priority queue + worker + pre-warming
 5. ✅ Bridge endpoints (`/tiles`, `/texture/…`, `/texture_stats`)
-6. ☐ ComfyUI/RunPod (or fal.ai) shim + `rembg` + first real LoRA batch
+6. ✅ RunPod worker-comfyui SDXL backend + workflow payload path
 7. ☐ Godot: render chunks from `/tiles` (swap placeholder → real art live)
 8. ☐ Atlas packing + ETags
 9. ☐ Curation pass: review grid (the contact-sheet, but per subject),

@@ -535,19 +535,22 @@ def main() -> None:
     parser.add_argument("--civ-count", type=int, default=3)
     parser.add_argument("--texture-store", default="texture_store",
                         help="root dir for the generated-texture store")
-    parser.add_argument("--texture-backend", choices=["placeholder", "rest"],
+    parser.add_argument("--texture-backend", choices=["placeholder", "rest", "runpod-comfyui"],
                         default="placeholder",
-                        help="image generator: built-in painter, or a REST "
-                             "endpoint (see texgen.RestBackend contract)")
+                        help="image generator: built-in painter, generic REST, "
+                             "or RunPod worker-comfyui SDXL")
     parser.add_argument("--texture-url", default=None,
                         help="URL of the REST image-gen endpoint")
     parser.add_argument("--texture-variations", type=int, default=3)
     parser.add_argument("--tile-px", type=int, default=64)
     args = parser.parse_args()
 
-    backend = (texgen.RestBackend(args.texture_url)
-               if args.texture_backend == "rest" and args.texture_url
-               else texgen.PlaceholderBackend())
+    if args.texture_backend == "rest" and args.texture_url:
+        backend = texgen.RestBackend(args.texture_url)
+    elif args.texture_backend == "runpod-comfyui":
+        backend = texgen.RunPodComfyUIBackend()
+    else:
+        backend = texgen.PlaceholderBackend()
     textures = texgen.TextureService(args.texture_store, backend=backend,
                                      variations=args.texture_variations,
                                      tile_px=args.tile_px)
