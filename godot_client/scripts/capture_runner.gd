@@ -14,7 +14,7 @@ var _height := 1080
 func _initialize() -> void:
 	_parse_args()
 	if _output_dir == "":
-		push_error("capture_runner: missing --output-dir")
+		push_error("capture_runner: required argument --output-dir not provided")
 		quit(2)
 		return
 

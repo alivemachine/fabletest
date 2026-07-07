@@ -144,7 +144,7 @@ def write_manifest(
             }
         )
     payload = {
-        "generated_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        "generated_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
         "seed": seed,
         "size": size,
         "civ_count": civ_count,
@@ -199,7 +199,7 @@ def main() -> int:
         old.unlink()
 
     points = build_points(args.seed, args.size, args.civ_count, args.shots)
-    tmpdir = Path(tempfile.mkdtemp(prefix="fabletest-godot-shots-"))
+    tmpdir = Path(tempfile.mkdtemp(prefix="godot-screenshot-gen-"))
     points_file = tmpdir / "points.json"
     points_file.write_text(json.dumps([asdict(p) for p in points]), encoding="utf-8")
 
