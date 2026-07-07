@@ -86,16 +86,43 @@ def wait_for_bridge(host: str, port: int, timeout_s: float) -> None:
     raise RuntimeError(f"bridge did not become healthy at {url}")
 
 
+def import_project(godot_bin: str) -> None:
+    """Import project resources once so the capture run finds them ready.
+
+    A fresh checkout has no .godot/ import cache; running the capture script
+    directly would fail to load scenes. Importing is a pure asset step, so the
+    dummy headless renderer is fine here."""
+    cmd = [godot_bin, "--headless", "--path", str(ROOT / "godot_client"), "--import"]
+    proc = subprocess.run(cmd, cwd=ROOT, text=True, capture_output=True)
+    if proc.returncode != 0:
+        print(
+            f"warning: project import exited {proc.returncode} (continuing):\n"
+            f"{proc.stderr.strip()[-2000:]}",
+            file=sys.stderr,
+        )
+
+
 def run_capture(
     godot_bin: str,
     output_dir: Path,
     points_file: Path,
     width: int,
     height: int,
+    renderer: str = "opengl3",
 ) -> None:
+    # Godot 4's --headless mode uses the dummy rendering server, so the root
+    # viewport has no texture to read back — captures need a real renderer.
+    # Default to the GL compatibility driver, which renders under xvfb with
+    # Mesa's software rasterizer (no GPU required).
+    if renderer == "headless":
+        render_args = ["--headless"]
+    else:
+        render_args = ["--rendering-driver", renderer]
     cmd = [
         godot_bin,
-        "--headless",
+        *render_args,
+        "--resolution",
+        f"{width}x{height}",
         "--path",
         str(ROOT / "godot_client"),
         "--script",
@@ -177,6 +204,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--shots", type=int, default=10)
     parser.add_argument("--width", type=int, default=1920)
     parser.add_argument("--height", type=int, default=1080)
+    parser.add_argument(
+        "--renderer",
+        default=os.environ.get("GODOT_RENDERER", "opengl3"),
+        choices=["opengl3", "opengl3_es", "vulkan", "headless"],
+        help="Rendering driver for the capture run. 'headless' uses Godot's "
+        "dummy renderer and cannot capture pixels; the default 'opengl3' "
+        "works under xvfb with Mesa software GL.",
+    )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--health-timeout", type=float, default=12.0)
@@ -226,7 +261,15 @@ def main() -> int:
     )
     try:
         wait_for_bridge(args.host, args.port, args.health_timeout)
-        run_capture(args.godot_bin, output_dir, points_file, args.width, args.height)
+        import_project(args.godot_bin)
+        run_capture(
+            args.godot_bin,
+            output_dir,
+            points_file,
+            args.width,
+            args.height,
+            renderer=args.renderer,
+        )
         write_manifest(
             args.manifest.resolve(),
             output_dir,

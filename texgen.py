@@ -1,4 +1,4 @@
-"""Tag-driven texture pipeline — organization & management of generated sprites.
+r"""Tag-driven texture pipeline — organization & management of generated sprites.
 
 The problem: every tile's appearance depends on continuous world state
 (temperature, season phase, time of day, vegetation, ecosystem health, zoom …),
