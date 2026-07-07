@@ -129,9 +129,12 @@ def write_manifest(
     width: int,
     height: int,
 ) -> None:
+    missing: list[str] = []
     entries = []
     for i, p in enumerate(points):
         filename = f"frame_{i:02d}.png"
+        if not (output_dir / filename).exists():
+            missing.append(filename)
         entries.append(
             {
                 "file": filename,
@@ -157,6 +160,8 @@ def write_manifest(
         exists = (output_dir / item["file"]).exists()
         marker = "✓" if exists else "!"
         print(f" {marker} {item['file']} ({item['kind']}, cx={item['cx']}, cy={item['cy']})")
+    if missing:
+        raise RuntimeError(f"Missing expected screenshots: {', '.join(missing)}")
 
 
 def parse_args() -> argparse.Namespace:
