@@ -20,6 +20,9 @@ header{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;
   padding:12px 16px;border-bottom:1px solid var(--line);background:var(--panel)}
 .nameplate{font-size:12px;letter-spacing:.22em;text-transform:uppercase;font-weight:700}
 .clock{margin-left:auto;font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap}
+.jump{font-size:10.5px;letter-spacing:.08em;color:var(--muted)}
+.jump a{color:var(--accent);text-decoration:none}
+.jump a:hover{text-decoration:underline}
 .clock b{color:var(--ink)}
 
 main{max-width:1060px;margin:0 auto;padding:14px;display:grid;gap:14px;grid-template-columns:1fr}
@@ -97,6 +100,10 @@ progress.on{display:block}
 <body>
 <header>
   <div class="nameplate">World Engine</div>
+  <nav class="jump">
+    <a href="#godot-gallery">godot snapshots</a> ·
+    <a href="#texture-gallery">generated textures</a>
+  </nav>
   <div class="clock" id="clock">loading…</div>
 </header>
 
@@ -168,13 +175,13 @@ progress.on{display:block}
   </aside>
 </main>
 
-<section class="godot-gallery">
+<section class="godot-gallery" id="godot-gallery">
   <h2>Godot client snapshots (auto-generated)</h2>
   <p class="godot-meta" id="godotShotsMeta">Run <code>python3 generate_godot_screenshots.py</code> after Python or Godot changes to refresh these images.</p>
   <div class="godot-grid" id="godotShotsGrid"></div>
 </section>
 
-<section class="tex-gallery">
+<section class="tex-gallery" id="texture-gallery">
   <h2>Generated textures (tag-driven pipeline)</h2>
   <p class="tex-meta" id="texMeta">Run <code>python3 export_texture_gallery.py</code> to refresh this set. Each row of images is one canonical key's variations.</p>
   <div class="tex-controls">
