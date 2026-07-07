@@ -9,7 +9,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import signal
+import socket
 import struct
+import subprocess
+import sys
 import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -18,6 +23,7 @@ from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 
+import texgen
 import world_core as wc
 
 
@@ -48,13 +54,15 @@ def _mean_u8(field: np.ndarray) -> int:
 
 
 class WorldBridge:
-    def __init__(self, seed: int, size: int, civ_count: int):
+    def __init__(self, seed: int, size: int, civ_count: int,
+                 textures: "texgen.TextureService | None" = None):
         self.seed = int(seed)
         self.size = int(size)
         self.civ_count = int(civ_count)
         self.t = 0.0
         self.lock = threading.Lock()
         self.world = wc.build_world(self.seed, self.size, self.civ_count)
+        self.textures = textures
 
     def _rebuild(self, seed: int, size: int, civ_count: int) -> None:
         seed = int(seed)
@@ -157,12 +165,91 @@ class WorldBridge:
             "temperature": _q_u8_array(st["tf"]),
         }
 
-    def _payload_binary(self, ws: wc.WorldSlice, st: dict[str, Any], target_tiles: int) -> bytes:
+    def _bitmap_payload(self, ws: wc.WorldSlice, st: dict[str, Any]) -> dict[str, np.ndarray]:
+        """Build the three bitmaps Godot reads directly — no per-field reconstruction.
+
+        color_map   (N×N×3 uint8)  — BIOME layer only (no lighting). Pure stable
+                                     colors from worldgen.BIOME_COLORS. Godot keys
+                                     each pixel into its TileDefinition (texture,
+                                     physics, walkability, resource …). Must not
+                                     include lighting — the composite render shifts
+                                     every frame with day/night and breaks lookups.
+        property_map (N×N×4 uint8) — per-tile game data that Godot CAN'T infer from
+                                     color alone:
+                                       R = height  (0-255, normalized above sea_level)
+                                       G = surface flags: 0=land 1=water 2=river-on-land
+                                       B = structure: 0=none 1=road 2=building
+                                       A = faction id+1 (0=unclaimed)
+        data_map    (N×N×4 uint8)  — per-tile world-state channels:
+                                       R = sunlight  (Godot applies this as tile lighting)
+                                       G = vegetation (live)
+                                       B = flow direction (0-255 → 0-TAU)
+                                       A = flow speed (0=still)
+        """
         fields = self._payload_fields(ws, st)
+
+        # --- color_map: pure stable biome color (no lighting, no compositing).
+        # The "biome" layer returns BIOME_LUT[biome_id] — exact matches to the
+        # TILE_PALETTE keys in terrain_chunk.gd. Day/night is applied separately
+        # via data_map.R (sunlight) so Godot controls illumination itself.
+        biome_rgb = wc.colorize(st, "biome")
+        color_map = np.clip(biome_rgb, 0, 255).astype(np.uint8)          # N×N×3
+
+        # --- property_map
+        n = ws.size
+        prop = np.zeros((n, n, 4), np.uint8)
+        elev = ws.elev
+        sea_eff  = float(st["sea_eff"])   # tide-adjusted: determines water boundary
+        sea_level = float(st["sea_level"]) # stable geographic baseline: used for height
+        range_norm = max(1.0 - sea_level, 1e-6)
+        # R: height — land tiles use their own elevation; water tiles use the
+        # current tide-adjusted waterline (sea_eff) so the sea surface rises
+        # and falls with the tide instead of sitting at a fixed 8 px.  Land
+        # tiles near the waterline transition smoothly because the tile at
+        # exactly sea_eff encodes the same height whether it's land or water.
+        land_mask = elev >= sea_eff
+        sea_eff_norm = float(np.clip((sea_eff - sea_level) / range_norm, 0.0, 1.0))
+        water_height_byte = int(sea_eff_norm * 255 + 0.5)
+        prop[..., 0] = np.where(land_mask,
+                                np.clip((elev - sea_level) / range_norm * 255, 0, 255).astype(np.uint8),
+                                water_height_byte)
+        # G: surface type
+        river_alpha = getattr(ws, "river_alpha", np.zeros_like(elev))
+        brook_alpha = getattr(ws, "brook_alpha", np.zeros_like(elev))
+        river_gate = np.clip(ws.river_disc / max(float(st["river_thr"]), 1.0), 0.0, 1.0) ** 0.6
+        river = np.maximum(river_alpha * river_gate, brook_alpha)
+        surf = np.zeros((n, n), np.uint8)
+        surf[~land_mask] = 1                              # water
+        surf[land_mask & (river > 0.05)] = 2             # river on land
+        prop[..., 1] = surf
+        # B: structure (already computed in _payload_fields)
+        prop[..., 2] = fields["structure"].reshape(n, n)
+        # A: faction
+        prop[..., 3] = fields["faction"].reshape(n, n)
+
+        # --- data_map: R=sunlight G=vegetation B=flow_dir A=flow_speed
+        data = np.zeros((n, n, 4), np.uint8)
+        data[..., 0] = fields["sunlight"].reshape(n, n)   # per-tile lighting
+        data[..., 1] = fields["vegetation"].reshape(n, n)
+        data[..., 2] = fields["flow_dir"].reshape(n, n)
+        data[..., 3] = fields["flow_speed"].reshape(n, n)
+
+        return {
+            "color_map": np.ascontiguousarray(color_map),
+            "property_map": np.ascontiguousarray(prop),
+            "data_map": np.ascontiguousarray(data),
+        }
+
+    def _payload_binary(self, ws: wc.WorldSlice, st: dict[str, Any], target_tiles: int) -> bytes:
+        bitmaps = self._bitmap_payload(ws, st)
+        # Header: magic "FTB1", version=3, then same geometry fields as before.
+        # sea_level (not sea_eff) is the stable geographic baseline Godot uses
+        # for column-height calculation — tide only affects the waterline flag
+        # already baked into property_map.G.
         header = struct.pack(
             "<4sHHIHHfffffffBBH",
             b"FTB1",
-            2,
+            3,
             int(ws.size),
             int(self.seed),
             int(self.size),
@@ -178,63 +265,110 @@ class WorldBridge:
             _mean_u8(st["clouds"]),
             0,
         )
-        parts = [header]
-        for name in ("biome_id", "height", "sunlight", "river", "vegetation",
-                     "scorch", "flow_dir", "flow_speed", "fauna_herb",
-                     "fauna_pred", "structure", "faction", "moisture",
-                     "temperature"):
-            parts.append(fields[name].tobytes())
-        return b"".join(parts)
+        return b"".join([
+            header,
+            bitmaps["color_map"].tobytes(),     # N*N*3 bytes
+            bitmaps["property_map"].tobytes(),  # N*N*4 bytes
+            bitmaps["data_map"].tobytes(),      # N*N*4 bytes
+        ])
 
-    def snapshot(self, *, seed: int | None = None, size: int | None = None,
-                 civ_count: int | None = None, cx: float = 0.5, cy: float = 0.5,
-                 zoom: float = 12.0, view_tiles: int = 24, dt_seconds: float = 0.0,
-                 speed: float = 0.35, playing: bool = True, sea_level: float = 0.42,
-                 river_thr: float | None = None, season_amp: float = 0.18,
-                 tide_amp: float = 0.012, day_night: float = 0.65,
-                 reset: bool = False) -> dict[str, Any]:
+    def _chunk_state(self, *, seed: int | None = None, size: int | None = None,
+                     civ_count: int | None = None, cx: float = 0.5, cy: float = 0.5,
+                     zoom: float = 12.0, view_tiles: int = 24, dt_seconds: float = 0.0,
+                     speed: float = 0.35, playing: bool = True, sea_level: float = 0.42,
+                     river_thr: float | None = None, season_amp: float = 0.18,
+                     tide_amp: float = 0.012, day_night: float = 0.65,
+                     reset: bool = False):
+        """Shared prologue of every endpoint: rebuild if params changed,
+        advance the clock, cut the player-centered chunk, compute its state.
+        Caller must hold self.lock."""
+        self._rebuild(seed if seed is not None else self.seed,
+                      size if size is not None else self.size,
+                      civ_count if civ_count is not None else self.civ_count)
+        if reset:
+            eco = getattr(self.world, "eco", None)
+            if eco is not None:
+                eco.reset()
+            self.t = 0.0
+        river_thr = (wc.default_river_threshold(self.size)
+                     if river_thr is None else float(river_thr))
+        self._advance(dt_seconds, speed, playing, sea_level, season_amp, tide_amp)
+        zoom = max(1.0, float(zoom))
+        view_tiles = max(8, int(view_tiles))
+        chunk = self.world.stream_view(cx % 1.0, cy % 1.0, zoom, view_tiles)
+        st = wc.state(chunk, self.t, sea_level, river_thr, season_amp, tide_amp, day_night)
+        return chunk, st
+
+    def snapshot(self, **kw: Any) -> dict[str, Any]:
         with self.lock:
-            self._rebuild(seed if seed is not None else self.seed,
-                          size if size is not None else self.size,
-                          civ_count if civ_count is not None else self.civ_count)
-            if reset:
-                eco = getattr(self.world, "eco", None)
-                if eco is not None:
-                    eco.reset()
-                self.t = 0.0
-            river_thr = (wc.default_river_threshold(self.size)
-                         if river_thr is None else float(river_thr))
-            self._advance(dt_seconds, speed, playing, sea_level, season_amp, tide_amp)
-            zoom = max(1.0, float(zoom))
-            view_tiles = max(8, int(view_tiles))
-            chunk = self.world.stream_view(cx % 1.0, cy % 1.0, zoom, view_tiles)
-            st = wc.state(chunk, self.t, sea_level, river_thr, season_amp, tide_amp, day_night)
+            view_tiles = max(8, int(kw.get("view_tiles", 24)))
+            chunk, st = self._chunk_state(**kw)
             return self._payload(chunk, st, view_tiles)
 
-    def snapshot_binary(self, *, seed: int | None = None, size: int | None = None,
-                        civ_count: int | None = None, cx: float = 0.5, cy: float = 0.5,
-                        zoom: float = 12.0, view_tiles: int = 24, dt_seconds: float = 0.0,
-                        speed: float = 0.35, playing: bool = True, sea_level: float = 0.42,
-                        river_thr: float | None = None, season_amp: float = 0.18,
-                        tide_amp: float = 0.012, day_night: float = 0.65,
-                        reset: bool = False) -> bytes:
+    def snapshot_binary(self, **kw: Any) -> bytes:
         with self.lock:
-            self._rebuild(seed if seed is not None else self.seed,
-                          size if size is not None else self.size,
-                          civ_count if civ_count is not None else self.civ_count)
-            if reset:
-                eco = getattr(self.world, "eco", None)
-                if eco is not None:
-                    eco.reset()
-                self.t = 0.0
-            river_thr = (wc.default_river_threshold(self.size)
-                         if river_thr is None else float(river_thr))
-            self._advance(dt_seconds, speed, playing, sea_level, season_amp, tide_amp)
-            zoom = max(1.0, float(zoom))
-            view_tiles = max(8, int(view_tiles))
-            chunk = self.world.stream_view(cx % 1.0, cy % 1.0, zoom, view_tiles)
-            st = wc.state(chunk, self.t, sea_level, river_thr, season_amp, tide_amp, day_night)
+            view_tiles = max(8, int(kw.get("view_tiles", 24)))
+            chunk, st = self._chunk_state(**kw)
             return self._payload_binary(chunk, st, view_tiles)
+
+    def tiles(self, prewarm: bool = True, **kw: Any) -> dict[str, Any]:
+        """The texture-descriptor view of the same chunk /frame streams: which
+        distinct appearances are on screen, which sprite files serve them NOW
+        (exact / nearest fallback / placeholder while the real art generates),
+        and where each multi-tile prop instance anchors. Godot renders from
+        this and simply re-asks next frame — art upgrades in place as the
+        generation queue drains."""
+        svc = self.textures
+        if svc is None:
+            return {"error": "texture service disabled"}
+        with self.lock:
+            chunk, st = self._chunk_state(**kw)
+            df = texgen.derive(chunk, st, n_variations=svc.variations)
+            var = texgen.variation_grid(chunk, svc.variations, df.lod)
+        res = svc.resolve_field(df)
+        if prewarm:
+            svc.prewarm_neighbors(df)
+        legend = {}
+        for code, r in res.items():
+            legend[str(code)] = {
+                "key": r.key, "key_hash": r.key_hash, "subject": r.subject,
+                "status": r.status, "served": r.served, "tags": r.tags,
+                "footprint": r.footprint,
+                "urls": [f"/texture/{r.key_hash}/{i}.png"
+                         for i in range(len(r.paths))],
+            }
+        return {
+            "seed": self.seed, "time_days": float(st["t"]),
+            "size": int(chunk.size), "span": float(chunk.span),
+            "center": {"cx": float(chunk.cx), "cy": float(chunk.cy)},
+            "lod": df.lod,
+            "lod_name": texgen.LOD_NAMES[df.lod - texgen.LOD_MIN],
+            "ground_codes": df.ground.ravel().tolist(),
+            "ground_variations": var.ravel().tolist(),
+            "props": [[p.i, p.j, p.code, p.variation, p.footprint]
+                      for p in df.props],
+            "legend": legend,
+            "queue": svc.pending_count(),
+        }
+
+    def texture_png(self, key_hash: str, idx: int) -> bytes | None:
+        """Serve variation `idx` of the asset behind `key_hash` — always the
+        best art that exists right now for that key."""
+        svc = self.textures
+        if svc is None:
+            return None
+        key = svc.store.key_for_hash(key_hash)
+        if key is None:
+            return None
+        r = svc.resolve(texgen._desc_from_key(key), enqueue=False)
+        if not r.paths:
+            return None
+        path = r.paths[max(0, min(idx, len(r.paths) - 1))]
+        try:
+            with open(path, "rb") as f:
+                return f.read()
+        except OSError:
+            return None
 
 
 def _parse_bool(values: dict[str, list[str]], name: str, default: bool) -> bool:
@@ -273,12 +407,30 @@ class BridgeHandler(BaseHTTPRequestHandler):
         if parsed.path == "/health":
             self._send_json({"ok": True})
             return
-        if parsed.path not in {"/frame", "/frame.bin"}:
-            self._send_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
-            return
         bridge = self.bridge
         if bridge is None:
             self._send_json({"error": "bridge unavailable"}, status=HTTPStatus.SERVICE_UNAVAILABLE)
+            return
+        if parsed.path.startswith("/texture/"):
+            # /texture/<key_hash>/<idx>.png — the sprite files /tiles points at
+            parts = parsed.path.strip("/").split("/")
+            if len(parts) == 3 and parts[2].endswith(".png"):
+                try:
+                    idx = int(parts[2][:-4])
+                except ValueError:
+                    idx = 0
+                png = bridge.texture_png(parts[1], idx)
+                if png is not None:
+                    self._send_binary(png, content_type="image/png")
+                    return
+            self._send_json({"error": "unknown texture"}, status=HTTPStatus.NOT_FOUND)
+            return
+        if parsed.path == "/texture_stats":
+            svc = bridge.textures
+            self._send_json(svc.stats() if svc else {"error": "texture service disabled"})
+            return
+        if parsed.path not in {"/frame", "/frame.bin", "/tiles"}:
+            self._send_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
             return
         qs = parse_qs(parsed.query)
         args = {
@@ -302,6 +454,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
         if parsed.path == "/frame.bin":
             self._send_binary(bridge.snapshot_binary(**args))
             return
+        if parsed.path == "/tiles":
+            args["prewarm"] = _parse_bool(qs, "prewarm", True)
+            self._send_json(bridge.tiles(**args))
+            return
         payload = bridge.snapshot(**args)
         self._send_json(payload)
 
@@ -320,13 +476,54 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_binary(self, body: bytes, status: HTTPStatus = HTTPStatus.OK) -> None:
+    def _send_binary(self, body: bytes, status: HTTPStatus = HTTPStatus.OK,
+                     content_type: str = "application/octet-stream") -> None:
         self.send_response(status)
         self._cors_headers()
-        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+
+def _evict_port(port: int) -> None:
+    """Kill any process already listening on *port* before we bind to it.
+    Uses netstat on Windows, lsof on POSIX. Best-effort — never blocks startup."""
+    try:
+        if sys.platform == "win32":
+            out = subprocess.check_output(
+                ["netstat", "-ano"], text=True, stderr=subprocess.DEVNULL
+            )
+            pids: set[int] = set()
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) >= 5 and f":{port}" in parts[1] and parts[3] == "LISTENING":
+                    try:
+                        pid = int(parts[4])
+                        if pid != os.getpid():
+                            pids.add(pid)
+                    except ValueError:
+                        pass
+            for pid in pids:
+                subprocess.call(
+                    ["taskkill", "/F", "/PID", str(pid)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+            if pids:
+                import time as _t; _t.sleep(0.5)
+        else:
+            out = subprocess.check_output(
+                ["lsof", "-ti", f"tcp:{port}"], text=True, stderr=subprocess.DEVNULL
+            )
+            for pid_s in out.split():
+                try:
+                    pid = int(pid_s)
+                    if pid != os.getpid():
+                        os.kill(pid, signal.SIGTERM)
+                except (ValueError, OSError):
+                    pass
+    except Exception:
+        pass
 
 
 def main() -> None:
@@ -336,15 +533,39 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--size", type=int, default=192)
     parser.add_argument("--civ-count", type=int, default=3)
+    parser.add_argument("--texture-store", default="texture_store",
+                        help="root dir for the generated-texture store")
+    parser.add_argument("--texture-backend", choices=["placeholder", "rest"],
+                        default="placeholder",
+                        help="image generator: built-in painter, or a REST "
+                             "endpoint (see texgen.RestBackend contract)")
+    parser.add_argument("--texture-url", default=None,
+                        help="URL of the REST image-gen endpoint")
+    parser.add_argument("--texture-variations", type=int, default=3)
+    parser.add_argument("--tile-px", type=int, default=64)
     args = parser.parse_args()
 
-    BridgeHandler.bridge = WorldBridge(args.seed, args.size, args.civ_count)
+    backend = (texgen.RestBackend(args.texture_url)
+               if args.texture_backend == "rest" and args.texture_url
+               else texgen.PlaceholderBackend())
+    textures = texgen.TextureService(args.texture_store, backend=backend,
+                                     variations=args.texture_variations,
+                                     tile_px=args.tile_px)
+    textures.start_worker()
+    BridgeHandler.bridge = WorldBridge(args.seed, args.size, args.civ_count,
+                                       textures=textures)
+    _evict_port(args.port)
     server = ThreadingHTTPServer((args.host, args.port), BridgeHandler)
     print(f"serving Godot bridge at http://{args.host}:{args.port}/frame")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
+    except Exception as e:
+        import traceback
+        print(f"\nBridge crashed: {e}", flush=True)
+        traceback.print_exc()
+        sys.exit(1)
     finally:
         server.server_close()
 

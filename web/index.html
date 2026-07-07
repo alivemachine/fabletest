@@ -190,7 +190,7 @@ for (const [key, name] of LAYERS){
 function syncSel(){ for (const [k] of LAYERS) thumbs[k].btn.classList.toggle("active", k === S.layer); }
 
 // ---------- pyodide bootstrap ----------
-let py = null, pyRender = null, pyBuild = null, pyView = null, pyEco = null, pyEcoReset = null;
+let py = null, pyRender = null, pyBuild = null, pyView = null, pyEco = null, pyEcoReset = null, pyThumbs = null;
 
 function loadScript(src){
   return new Promise((resolve, reject) => {
@@ -215,7 +215,7 @@ async function ensurePyodide(){
 }
 
 async function fetchSource(name){
-  const paths = [`${name}?v=9`, `../${name}?v=9`];
+  const paths = [`${name}?v=10`, `../${name}?v=10`];
   for (const path of paths){
     const res = await fetch(path);
     if (res.ok) return await res.text();
@@ -234,6 +234,7 @@ async function boot(){
     pyodide.FS.writeFile(f, src);
   }
   pyodide.runPython(`
+import numpy as np
 import world_core as wc
 
 _state = {}
@@ -257,6 +258,23 @@ def eco_reset():
 def render_rgba(which, layer, t, sea, thr, season, tide, daynight):
     return wc.render_rgba_bytes(_state[which], layer, float(t), float(sea),
                                 float(thr), float(season), float(tide), float(daynight))
+
+_THUMB_LAYERS = [k for k, _ in wc.LAYERS]   # canonical order (matches JS LAYERS)
+
+def render_thumbs(t, sea, thr, season, tide, daynight):
+    # All 12 thumbnails share ONE state() computation (clouds, lighting, biome,
+    # etc. are the expensive shared fields); only the thin per-layer colorize
+    # runs 12x. Packed as (w, RGBA bytes for all layers, contiguous) so the
+    # whole strip crosses into JS in a single call.
+    ws = _state["thumb"]
+    st = wc.state(ws, float(t), float(sea), float(thr),
+                  float(season), float(tide), float(daynight))
+    w = st["e"].shape[0]
+    buf = np.empty((len(_THUMB_LAYERS), w, w, 4), np.uint8)
+    for i, layer in enumerate(_THUMB_LAYERS):
+        buf[i, ..., :3] = wc.colorize(st, layer)
+        buf[i, ..., 3] = 255
+    return w, buf.tobytes()
 `);
   py = pyodide;
   pyBuild = pyodide.globals.get("build");
@@ -264,6 +282,7 @@ def render_rgba(which, layer, t, sea, thr, season, tide, daynight):
   pyView = pyodide.globals.get("set_view");
   pyEco = pyodide.globals.get("eco_step");
   pyEcoReset = pyodide.globals.get("eco_reset");
+  pyThumbs = pyodide.globals.get("render_thumbs");
   busysub.textContent = "generating world…";
   await new Promise(r => setTimeout(r, 20));
   rebuild();
@@ -292,17 +311,9 @@ function blit(which, layer, t, canvas, ctx){
   ctx.putImageData(new ImageData(arr, w, w), 0, 0);
 }
 
-let frameCount = 0;
-function draw(){
-  blit("view", S.layer, S.t, view, vctx);       // main = the (maybe zoomed) window
-  // thumbs stay whole-planet overviews; refresh half per frame while playing
-  for (let i = 0; i < LAYERS.length; i++){
-    if (S.playing && (i + frameCount) % 2 !== 0) continue;
-    const key = LAYERS[i][0];
-    const c = thumbs[key].canvas;
-    blit("thumb", key, S.t, c, c.getContext("2d"));
-  }
-  frameCount++;
+// The main (maybe-zoomed) window: the only thing pan/zoom changes.
+function drawView(){
+  blit("view", S.layer, S.t, view, vctx);
   const day = S.t % YEAR, year = Math.floor(S.t / YEAR);
   const name = LAYERS.find(l => l[0] === S.layer)[1];
   clock.innerHTML = "<b>day " + day.toFixed(1) + "</b> · year " + year + " · seed " + S.seed;
@@ -310,14 +321,41 @@ function draw(){
   hud.textContent = "seed " + S.seed + " · " + S.size + "² · " + name.toLowerCase()
                   + (S.zoom > 1 ? " · ×" + z : "");
 }
-function drawIfPaused(){ if (!S.playing && py) draw(); }
+
+// Thumbnails are whole-planet overviews: independent of pan/zoom, and only the
+// clock (t) and the climate sliders change them. So they share ONE state()
+// computation across all 12 layers (Python side) and refresh at their own slow
+// cadence — never per pan frame, and at most ~5/s while playing.
+const THUMB_MS = 190;
+let lastThumbAt = -1e9;
+function drawThumbs(force){
+  if (!py) return;
+  const now = performance.now();
+  if (!force && S.playing && now - lastThumbAt < THUMB_MS) return;
+  lastThumbAt = now;
+  const res = pyThumbs(S.t, S.seaLevel, S.riverThr, S.seasonAmp, S.tideAmp, S.dayNight);
+  const [w, bytes] = res.toJs();
+  res.destroy();
+  const stride = w * w * 4;
+  const all = new Uint8ClampedArray(bytes.length);
+  all.set(bytes);                                 // `bytes` may view the wasm heap
+  for (let i = 0; i < LAYERS.length; i++){
+    const c = thumbs[LAYERS[i][0]].canvas;
+    if (c.width !== w){ c.width = w; c.height = w; }
+    const px = new Uint8ClampedArray(all.subarray(i * stride, (i + 1) * stride));
+    c.getContext("2d").putImageData(new ImageData(px, w, w), 0, 0);
+  }
+}
+
+function draw(){ drawView(); drawThumbs(false); }
+function drawIfPaused(){ if (!S.playing && py){ drawView(); drawThumbs(true); } }
 
 let last = null;
 function loop(now){
   if (S.viewDirty && py && !S.exporting){       // pan/zoom -> re-sample window
     pyView(S.cx, S.cy, S.zoom);
     S.viewDirty = false;
-    if (!S.playing) draw();
+    if (!S.playing) drawView();                  // thumbs are unaffected by pan
   }
   if (S.playing && !S.exporting){
     if (last != null){
