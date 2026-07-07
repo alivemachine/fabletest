@@ -75,5 +75,7 @@ jobs:
             echo "No screenshot changes to commit."
           else
             git commit -m "Update Godot screenshot gallery frames"
+            # The branch may have moved while we rendered; replay on top.
+            git pull --rebase origin "$GITHUB_REF_NAME"
             git push
           fi
