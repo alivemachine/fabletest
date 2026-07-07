@@ -249,9 +249,10 @@ count. Three implementations ship:
 
   The generated workflow uses: `CheckpointLoaderSimple`, `CLIPTextEncode`,
   `LoraLoader`, `KSampler`, `VAEDecode`, `SaveImage` (plus `EmptyLatentImage`
-  to provide sampler input). Default prompt prefix:
-
-  `"isometric stylized setting, tiny fantasy village on a cliff, tile-game environment, soft sunlight, clean shapes, SDXL, high detail"`
+  to provide sampler input). There is no extra prompt prefix by default —
+  job prompts from `build_prompt()` already carry the global STYLE prefix,
+  and a content prefix would override each sprite's actual subject. Set
+  `RUNPOD_PROMPT_PREFIX` to prepend one anyway.
 
   Required env vars:
 

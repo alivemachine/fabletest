@@ -933,7 +933,10 @@ class RunPodComfyUIBackend(Backend):
         self.lora_path = lora_path or _env_str("RUNPOD_LORA_PATH", RUNPOD_DEFAULT_LORA_DIR)
         self.lora_strength_model = float(_env_float("RUNPOD_LORA_STRENGTH_MODEL", lora_strength_model))
         self.lora_strength_clip = float(_env_float("RUNPOD_LORA_STRENGTH_CLIP", lora_strength_clip))
-        self.prompt_prefix = prompt_prefix or _env_str("RUNPOD_PROMPT_PREFIX", RUNPOD_DEFAULT_PROMPT)
+        # job prompts from build_prompt() already carry the STYLE prefix, so
+        # no extra prefix by default — a content prefix like "tiny fantasy
+        # village on a cliff" would override every sprite's actual subject
+        self.prompt_prefix = prompt_prefix or _env_str("RUNPOD_PROMPT_PREFIX", "")
         self.dry_run = bool(_env_bool("RUNPOD_DRY_RUN", False) if dry_run is None else dry_run)
         self.filename_prefix = _env_str("RUNPOD_FILENAME_PREFIX", "fabletest")
         self.min_px = int(_env_int("RUNPOD_MIN_PX", 1024))
