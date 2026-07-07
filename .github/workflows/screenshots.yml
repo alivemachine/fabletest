@@ -5,6 +5,9 @@ name: Generate Godot screenshots
 # manifest to web/godot_frames/ so the Pages gallery can show them.
 
 on:
+  push:
+    branches:
+      - claude/merge-features-texture-test-7kg8rs
   workflow_dispatch:
     inputs:
       shots:
