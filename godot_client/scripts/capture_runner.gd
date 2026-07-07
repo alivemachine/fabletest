@@ -44,7 +44,7 @@ func _initialize() -> void:
 		await process_frame
 		await process_frame
 		var tex := get_root().get_texture()
-		var image: Image = tex.get_image() if tex != null else null
+		var image: Image = tex.get_image() if tex else null
 		if image == null:
 			push_warning("capture_runner: viewport capture unavailable at #%d" % index)
 			continue

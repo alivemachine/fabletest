@@ -144,7 +144,7 @@ def write_manifest(
             }
         )
     payload = {
-        "generated_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+        "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
         "seed": seed,
         "size": size,
         "civ_count": civ_count,
