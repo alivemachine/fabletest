@@ -570,12 +570,21 @@ func _spr_quad(verts: Array, colors: Array, uvs: Array, id: int,
 func _upload_mesh(result: Dictionary) -> void:
 	if result.is_empty():
 		return
-	_mesh_serial = int(result.get("snapshot_serial", _mesh_serial))
+	var serial := int(result.get("snapshot_serial", _mesh_serial))
 	var verts: PackedVector2Array = result.get("verts", PackedVector2Array())
 	var colors: PackedColorArray = result.get("colors", PackedColorArray())
 	var new_base: Vector2i = result.get("base", _mesh_base)
 	if verts.is_empty():
+		# A build that drew nothing only counts as current if it really was
+		# built from the latest snapshot (a truly empty view); a stale empty
+		# (rebuild raced ahead of the payload merge) must retry, or the
+		# capture-sync wait would accept an off-screen/blank mesh.
+		if serial >= _snapshot_serial:
+			_mesh_serial = serial
+		else:
+			_mesh_rebuild_pending = true
 		return
+	_mesh_serial = serial
 	var arrays := []
 	arrays.resize(Mesh.ARRAY_MAX)
 	arrays[Mesh.ARRAY_VERTEX] = verts

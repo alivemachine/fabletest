@@ -47,9 +47,14 @@ def build_points(
     rng = np.random.default_rng(seed ^ 0x9E3779B9)
 
     def on_land(cx: float, cy: float) -> bool:
+        # A zoom-12 view spans ~16 planet cells, so one land cell isn't
+        # enough — require a 5x5 block of land around the point or the
+        # rendered frame can still be all ocean.
         j = int(cx * world.size) % world.size
         i = int(cy * world.size) % world.size
-        return float(world.elev[i, j]) > sea_level + 0.01
+        block = world.elev[np.ix_([(i + di) % world.size for di in range(-2, 3)],
+                                  [(j + dj) % world.size for dj in range(-2, 3)])]
+        return float(block.min()) > sea_level + 0.01
 
     def nudge_to_land(cx: float, cy: float) -> tuple[float, float]:
         if on_land(cx, cy):
@@ -134,6 +139,9 @@ def run_capture(
     height: int,
     renderer: str = "opengl3",
     sim_day: float = -1.0,
+    seed: int = -1,
+    size: int = -1,
+    civ_count: int = -1,
 ) -> None:
     # Godot 4's --headless mode uses the dummy rendering server, so the root
     # viewport has no texture to read back — captures need a real renderer.
@@ -163,6 +171,12 @@ def run_capture(
         str(height),
         "--sim-day",
         str(sim_day),
+        "--seed",
+        str(seed),
+        "--size",
+        str(size),
+        "--civ-count",
+        str(civ_count),
     ]
     proc = subprocess.run(cmd, cwd=ROOT, text=True, capture_output=True)
     if proc.returncode != 0:
@@ -310,6 +324,9 @@ def main() -> int:
             args.height,
             renderer=args.renderer,
             sim_day=args.sim_day,
+            seed=args.seed,
+            size=args.size,
+            civ_count=args.civ_count,
         )
         write_manifest(
             args.manifest.resolve(),
