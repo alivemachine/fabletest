@@ -13,6 +13,9 @@ on:
       seed:
         description: World seed
         default: "42"
+      sim_day:
+        description: Sim day to render (N.5 = noon, 96 days/year)
+        default: "1152.5"
 
 permissions:
   contents: write
@@ -60,7 +63,8 @@ jobs:
               --godot-bin ./godot-bin \
               --renderer opengl3 \
               --shots "${{ github.event.inputs.shots || '10' }}" \
-              --seed "${{ github.event.inputs.seed || '42' }}"
+              --seed "${{ github.event.inputs.seed || '42' }}" \
+              --sim-day "${{ github.event.inputs.sim_day || '1152.5' }}"
 
       - name: Commit frames + manifest
         run: |

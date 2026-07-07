@@ -139,6 +139,13 @@ var _mesh_thread: Thread
 var _mesh_mutex := Mutex.new()
 var _mesh_ready := false
 var _mesh_result: Dictionary = {}
+# Capture-sync counters: _snapshot_serial ticks on every payload merge, and
+# _mesh_serial records which snapshot the visible mesh was built from — so an
+# external runner can wait until the screen actually shows the data it asked
+# for instead of a stale or half-built chunk.
+var _snapshot_serial := 0
+var _mesh_serial := 0
+var _mesh_rebuild_pending := false
 
 
 func _ready() -> void:
@@ -191,6 +198,9 @@ func _process(_delta: float) -> void:
 			_mesh_thread.wait_to_finish()
 			_mesh_thread = null
 		_upload_mesh(mresult)
+		if _mesh_rebuild_pending:
+			_mesh_rebuild_pending = false
+			_request_mesh_rebuild()
 	if _build_ready:
 		_build_mutex.lock()
 		var result: Dictionary = _build_result
@@ -397,8 +407,17 @@ func _setup_mesh_renderer() -> void:
 	add_child(_mesh_node)
 
 
+func snapshot_serial() -> int:
+	return _snapshot_serial
+
+
+func mesh_serial() -> int:
+	return _mesh_serial
+
+
 func _request_mesh_rebuild() -> void:
 	if _mesh_thread != null:
+		_mesh_rebuild_pending = true
 		return
 	var f := _world_tile_f(focus_uv)
 	var new_base := Vector2i(int(floor(f.x + 0.5)), int(floor(f.y + 0.5)))
@@ -414,12 +433,13 @@ func _request_mesh_rebuild() -> void:
 			if rec != null:
 				cache_snap[Vector2i(tx, ty)] = rec
 	_mesh_thread = Thread.new()
-	_mesh_thread.start(Callable(self, "_build_mesh_thread_func").bind(new_base, cache_snap, gn, _time_days))
+	_mesh_thread.start(Callable(self, "_build_mesh_thread_func").bind(new_base, cache_snap, gn, _time_days, _snapshot_serial))
 
 
-func _build_mesh_thread_func(new_base: Vector2i, cache: Dictionary, gn: int, t_days: float) -> void:
+func _build_mesh_thread_func(new_base: Vector2i, cache: Dictionary, gn: int, t_days: float, serial: int) -> void:
 	var result := _build_mesh_data(new_base.x, new_base.y, cache, gn, t_days)
 	result["base"] = new_base
+	result["snapshot_serial"] = serial
 	_mesh_mutex.lock()
 	_mesh_result = result
 	_mesh_ready = true
@@ -550,6 +570,7 @@ func _spr_quad(verts: Array, colors: Array, uvs: Array, id: int,
 func _upload_mesh(result: Dictionary) -> void:
 	if result.is_empty():
 		return
+	_mesh_serial = int(result.get("snapshot_serial", _mesh_serial))
 	var verts: PackedVector2Array = result.get("verts", PackedVector2Array())
 	var colors: PackedColorArray = result.get("colors", PackedColorArray())
 	var new_base: Vector2i = result.get("base", _mesh_base)
@@ -615,6 +636,7 @@ func _merge_snapshot(snapshot: Dictionary) -> void:
 		var rec: Dictionary = rec_v
 		_tile_cache[rec["key"]] = rec
 	_has_payload = not _tile_cache.is_empty()
+	_snapshot_serial += 1
 	_prune_cache()
 	_request_mesh_rebuild()
 

@@ -76,6 +76,22 @@ progress.on{display:block}
 .godot-card{background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:6px}
 .godot-card img{display:block;width:100%;aspect-ratio:16/9;object-fit:cover;border-radius:2px;background:#000}
 .godot-card .cap{margin-top:6px;font-size:10.5px;color:var(--muted);letter-spacing:.05em}
+
+.tex-gallery{max-width:1060px;margin:0 auto;padding:0 14px 28px}
+.tex-gallery h2{margin:0 0 8px;font-size:11px;letter-spacing:.2em;text-transform:uppercase;color:var(--muted)}
+.tex-meta{font-size:11px;color:var(--muted);margin:0 0 10px}
+.tex-controls{display:flex;gap:8px;margin:0 0 10px;flex-wrap:wrap}
+.tex-controls input,.tex-controls select{background:var(--panel2);color:inherit;
+  border:1px solid var(--line);border-radius:4px;padding:7px 8px;font-size:12px}
+.tex-controls input{flex:1;min-width:180px}
+.tex-grid{display:grid;gap:8px;grid-template-columns:repeat(auto-fill,minmax(200px,1fr))}
+.tex-card{background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:6px}
+.tex-card .vars{display:flex;gap:4px}
+.tex-card .vars img{display:block;width:100%;min-width:0;aspect-ratio:1/1;object-fit:cover;
+  border-radius:2px;background:#000;image-rendering:pixelated}
+.tex-card .cap{margin-top:6px;font-size:10px;color:var(--muted);letter-spacing:.03em;
+  word-break:break-all;line-height:1.45}
+.tex-more{margin-top:10px}
 </style>
 </head>
 <body>
@@ -156,6 +172,17 @@ progress.on{display:block}
   <h2>Godot client snapshots (auto-generated)</h2>
   <p class="godot-meta" id="godotShotsMeta">Run <code>python3 generate_godot_screenshots.py</code> after Python or Godot changes to refresh these images.</p>
   <div class="godot-grid" id="godotShotsGrid"></div>
+</section>
+
+<section class="tex-gallery">
+  <h2>Generated textures (tag-driven pipeline)</h2>
+  <p class="tex-meta" id="texMeta">Run <code>python3 export_texture_gallery.py</code> to refresh this set. Each row of images is one canonical key's variations.</p>
+  <div class="tex-controls">
+    <input type="search" id="texSearch" placeholder="filter keys… e.g. winter, tree.oak, scorched">
+    <select id="texSubject"><option value="">all subjects</option></select>
+  </div>
+  <div class="tex-grid" id="texGrid"></div>
+  <button class="btn tex-more" id="texMore" hidden>show more</button>
 </section>
 
 <script>
@@ -398,6 +425,74 @@ function shotCaption(item){
   return `${item.kind || "random"} · (${Number(item.cx).toFixed(3)}, ${Number(item.cy).toFixed(3)})`;
 }
 
+/* ---- generated-texture browser (static export of the texgen store) ---- */
+const texGrid = document.getElementById("texGrid");
+const texMeta = document.getElementById("texMeta");
+const texSearch = document.getElementById("texSearch");
+const texSubject = document.getElementById("texSubject");
+const texMore = document.getElementById("texMore");
+const TEX_PAGE = 120;
+let texAssets = [], texMatches = [], texShown = 0;
+
+async function loadTexGallery(){
+  if (!texGrid) return;
+  try {
+    const res = await fetch("textures/index.json?v=" + Date.now());
+    if (!res.ok) throw new Error("index missing");
+    const idx = await res.json();
+    texAssets = Array.isArray(idx.assets) ? idx.assets : [];
+    const subjects = [...new Set(texAssets.map(a => a.subject))].sort();
+    for (const s of subjects){
+      const o = document.createElement("option");
+      o.value = s; o.textContent = s;
+      texSubject.append(o);
+    }
+    texMeta.textContent = `${texAssets.length} generated keys · backend ${texAssets[0]?.backend || "?"} · exported ${idx.generated_at || "unknown"}`;
+    texFilter();
+  } catch (_err) {
+    texMeta.textContent = "No exported textures yet. Run python3 export_texture_gallery.py.";
+  }
+}
+
+function texFilter(){
+  const q = (texSearch.value || "").trim().toLowerCase();
+  const subj = texSubject.value;
+  texMatches = texAssets.filter(a =>
+    (!subj || a.subject === subj) && (!q || a.key.toLowerCase().includes(q)));
+  texGrid.innerHTML = "";
+  texShown = 0;
+  texRenderMore();
+}
+
+function texRenderMore(){
+  const slice = texMatches.slice(texShown, texShown + TEX_PAGE);
+  for (const a of slice){
+    const card = document.createElement("article");
+    card.className = "tex-card";
+    const vars = document.createElement("div");
+    vars.className = "vars";
+    for (const f of a.files){
+      const img = document.createElement("img");
+      img.loading = "lazy";
+      img.src = "textures/img/" + f;
+      img.alt = a.key;
+      vars.append(img);
+    }
+    const cap = document.createElement("div");
+    cap.className = "cap";
+    cap.textContent = a.key;
+    card.append(vars, cap);
+    texGrid.append(card);
+  }
+  texShown += slice.length;
+  texMore.hidden = texShown >= texMatches.length;
+  texMore.textContent = `show more (${texMatches.length - texShown} left)`;
+}
+
+if (texSearch) texSearch.addEventListener("input", texFilter);
+if (texSubject) texSubject.addEventListener("change", texFilter);
+if (texMore) texMore.addEventListener("click", texRenderMore);
+
 let last = null;
 function loop(now){
   if (S.viewDirty && py && !S.exporting){       // pan/zoom -> re-sample window
@@ -633,6 +728,7 @@ boot().catch(err => {
   busysub.textContent = String(err);
 });
 loadGodotShots();
+loadTexGallery();
 </script>
 </body>
 </html>

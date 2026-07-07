@@ -1,7 +1,7 @@
 extends SceneTree
 
 const DEFAULT_POINTS := 10
-const WAIT_TIMEOUT_SECONDS := 4.0
+const WAIT_TIMEOUT_SECONDS := 15.0
 const WAIT_TIMEOUT_MSEC := int(WAIT_TIMEOUT_SECONDS * 1000.0)
 const MAIN_SCENE_PATH := "res://scenes/main.tscn"
 
@@ -9,6 +9,7 @@ var _output_dir := ""
 var _points_path := ""
 var _width := 1920
 var _height := 1080
+var _sim_day := -1.0
 
 
 func _initialize() -> void:
@@ -23,6 +24,8 @@ func _initialize() -> void:
 
 	var scene := load(MAIN_SCENE_PATH)
 	var main = scene.instantiate()
+	if _sim_day >= 0.0:
+		main.sim_day_override = _sim_day
 	get_root().add_child(main)
 	await process_frame
 	await process_frame
@@ -37,10 +40,11 @@ func _initialize() -> void:
 	for p in points:
 		var cx := float(p.get("cx", 0.5))
 		var cy := float(p.get("cy", 0.5))
+		var before: Dictionary = main.capture_serials()
 		main.teleport_to(Vector2(cx, cy), true)
-		var ok := await _wait_for_frame(main)
+		var ok := await _wait_for_frame(main, int(before.get("snapshot", 0)))
 		if not ok:
-			push_warning("capture_runner: timed out waiting for payload at #%d" % index)
+			push_warning("capture_runner: timed out waiting for built chunk at #%d" % index)
 		await process_frame
 		await process_frame
 		var tex := get_root().get_texture()
@@ -56,10 +60,16 @@ func _initialize() -> void:
 	quit(0)
 
 
-func _wait_for_frame(main: Node) -> bool:
+func _wait_for_frame(main: Node, snapshot_before: int) -> bool:
+	# Done when a payload merged after the teleport (snapshot serial moved past
+	# the pre-teleport value) AND the visible mesh was built from it — waiting
+	# on has_payload() alone accepts the previous point's stale chunk.
 	var deadline := Time.get_ticks_msec() + WAIT_TIMEOUT_MSEC
 	while Time.get_ticks_msec() < deadline:
-		if main.has_live_payload() and not main.is_request_pending():
+		var s: Dictionary = main.capture_serials()
+		var snap := int(s.get("snapshot", 0))
+		var mesh := int(s.get("mesh", 0))
+		if snap > snapshot_before and mesh >= snap and not main.is_request_pending():
 			return true
 		await process_frame
 	return false
@@ -106,6 +116,11 @@ func _parse_args() -> void:
 			"--height":
 				if i + 1 < args.size():
 					_height = int(args[i + 1])
+					i += 2
+					continue
+			"--sim-day":
+				if i + 1 < args.size():
+					_sim_day = float(args[i + 1])
 					i += 2
 					continue
 		i += 1
