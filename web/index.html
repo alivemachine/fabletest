@@ -68,6 +68,14 @@ input[type=number],select{background:var(--panel2);border:1px solid var(--line);
 .note{font-size:10.5px;color:var(--muted);margin:8px 0 0;line-height:1.5}
 progress{width:100%;height:6px;accent-color:var(--accent);display:none;margin-top:8px}
 progress.on{display:block}
+
+.godot-gallery{max-width:1060px;margin:0 auto;padding:0 14px 20px}
+.godot-gallery h2{margin:0 0 8px;font-size:11px;letter-spacing:.2em;text-transform:uppercase;color:var(--muted)}
+.godot-meta{font-size:11px;color:var(--muted);margin:0 0 10px}
+.godot-grid{display:grid;gap:8px;grid-template-columns:repeat(auto-fill,minmax(170px,1fr))}
+.godot-card{background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:6px}
+.godot-card img{display:block;width:100%;aspect-ratio:16/9;object-fit:cover;border-radius:2px;background:#000}
+.godot-card .cap{margin-top:6px;font-size:10.5px;color:var(--muted);letter-spacing:.05em}
 </style>
 </head>
 <body>
@@ -144,6 +152,12 @@ progress.on{display:block}
   </aside>
 </main>
 
+<section class="godot-gallery">
+  <h2>Godot client snapshots (auto-generated)</h2>
+  <p class="godot-meta" id="godotShotsMeta">Run <code>python3 generate_godot_screenshots.py</code> after Python/Godot changes to refresh these images.</p>
+  <div class="godot-grid" id="godotShotsGrid"></div>
+</section>
+
 <script>
 "use strict";
 /* All world math is Python (worldgen.py + world_core.py) running in Pyodide.
@@ -172,6 +186,8 @@ const view = document.getElementById("view"), vctx = view.getContext("2d");
 const viewwrap = document.getElementById("viewwrap");
 const busysub = document.getElementById("busysub"), busy = document.getElementById("busy");
 const hud = document.getElementById("hud"), clock = document.getElementById("clock");
+const godotShotsGrid = document.getElementById("godotShotsGrid");
+const godotShotsMeta = document.getElementById("godotShotsMeta");
 
 // thumbnails
 const THUMB_STRIDE_TARGET = 72;
@@ -349,6 +365,35 @@ function drawThumbs(force){
 
 function draw(){ drawView(); drawThumbs(false); }
 function drawIfPaused(){ if (!S.playing && py){ drawView(); drawThumbs(true); } }
+
+async function loadGodotShots(){
+  if (!godotShotsGrid || !godotShotsMeta) return;
+  try {
+    const res = await fetch("godot_frames/manifest.json?v=1");
+    if (!res.ok) throw new Error("manifest missing");
+    const man = await res.json();
+    const shots = Array.isArray(man.screenshots) ? man.screenshots : [];
+    godotShotsGrid.innerHTML = "";
+    for (const item of shots){
+      const card = document.createElement("article");
+      card.className = "godot-card";
+      const img = document.createElement("img");
+      img.loading = "lazy";
+      img.src = "godot_frames/" + item.file;
+      img.alt = "Godot screenshot " + item.file;
+      const cap = document.createElement("div");
+      cap.className = "cap";
+      cap.textContent = (item.kind || "random") + " · (" + Number(item.cx).toFixed(3) + ", " + Number(item.cy).toFixed(3) + ")";
+      card.append(img, cap);
+      godotShotsGrid.append(card);
+    }
+    godotShotsMeta.textContent = "Last generated " + (man.generated_at || "unknown")
+      + " · " + shots.length + " frame(s) · " + (man.width || 0) + "x" + (man.height || 0);
+  } catch (_err) {
+    godotShotsMeta.textContent = "No generated Godot screenshots yet. Run python3 generate_godot_screenshots.py.";
+    godotShotsGrid.innerHTML = "";
+  }
+}
 
 let last = null;
 function loop(now){
@@ -584,6 +629,7 @@ boot().catch(err => {
   busy.firstChild.textContent = "FAILED TO LOAD";
   busysub.textContent = String(err);
 });
+loadGodotShots();
 </script>
 </body>
 </html>

@@ -24,6 +24,16 @@ python godot_bridge.py --seed 42 --size 192 --civ-count 3
 
 Then open `godot_client/` in Godot 4.2 or newer and run the main scene.
 
+To auto-capture 10 Full HD gameplay screenshots (including teleports near
+settlements) for the web page gallery, run from the repository root:
+
+```bash
+python3 generate_godot_screenshots.py
+```
+
+Run that script after any Python or Godot update so the browser gallery stays
+current.
+
 ## Controls
 
 - `WASD` or arrow keys: move across the streamed world.

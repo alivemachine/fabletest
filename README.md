@@ -48,6 +48,16 @@ is a 3D chunk renderer with sprite-stacked props and parallax layers. If you
 later switch to an authored `TileMapLayer` terrain surface, `better-terrain`
 would be a good fit there; see `godot_client/README.md`.
 
+To refresh the web gallery with current Godot gameplay captures (10 random /
+settlement-near Full HD teleports), run:
+
+```bash
+python3 generate_godot_screenshots.py
+```
+
+Run that script after any Python or Godot-client change so `web/index.html`
+always shows an up-to-date Godot experience.
+
 ## The interface
 
 - **Big map + 7 thumbnails** (world composite, elevation, temperature,
