@@ -43,6 +43,16 @@ Python and streams a player-centered chunk through `godot_bridge.py`.
 python godot_bridge.py --seed 42 --size 192 --civ-count 3
 ```
 
+RunPod ComfyUI SDXL backend (with dry-run support) is available via:
+
+```bash
+RUNPOD_ENDPOINT_ID=... RUNPOD_API_KEY=... \
+python godot_bridge.py --texture-backend runpod-comfyui
+```
+
+For full RunPod/LoRA setup, env vars, and `input.workflow` payload shape, see
+`TEXTURES.md` section "The far side of the API".
+
 The bridge also runs the **tag-driven texture pipeline** (`texgen.py`): every
 tile's continuous state (biome, season, time of day, temperature, growth,
 ecosystem condition, zoom lod) quantizes into a canonical tag key; distinct

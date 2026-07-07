@@ -68,9 +68,12 @@ import hashlib
 import json
 import os
 import queue
+import re
 import sqlite3
 import threading
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 
@@ -688,6 +691,238 @@ class RestBackend(Backend):
         if len(images) != job.n:
             raise RuntimeError(f"backend returned {len(images)} images, wanted {job.n}")
         return images
+
+
+RUNPOD_DEFAULT_PROMPT = (
+    "isometric stylized setting, tiny fantasy village on a cliff, tile-game "
+    "environment, soft sunlight, clean shapes, SDXL, high detail"
+)
+RUNPOD_DEFAULT_LORA_PAGE_URL = (
+    "https://civitai.com/models/118775/stylized-setting-isometric-sdxl-and-sd15"
+)
+RUNPOD_DEFAULT_LORA_DIR = "/workspace/ComfyUI/models/loras/"
+RUNPOD_DEFAULT_SDXL_CKPT = "sd_xl_base_1.0.safetensors"
+
+
+def _env_str(name: str, default: str | None = None) -> str | None:
+    v = os.getenv(name)
+    return default if v is None or v == "" else v
+
+
+def _env_int(name: str, default: int) -> int:
+    v = _env_str(name)
+    return int(v) if v is not None else int(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    v = _env_str(name)
+    return float(v) if v is not None else float(default)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    v = _env_str(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+
+def civitai_lora_download_url(url: str = RUNPOD_DEFAULT_LORA_PAGE_URL) -> str:
+    """Normalize a Civitai model page URL to a downloadable endpoint."""
+    m = re.match(r"^https://civitai\.com/models/(\d+)(?:[/?].*)?$", url.strip())
+    if m:
+        return f"https://civitai.com/api/download/models/{m.group(1)}"
+    return url
+
+
+def download_civitai_lora(
+    *,
+    source_url: str = RUNPOD_DEFAULT_LORA_PAGE_URL,
+    dest_dir: str = RUNPOD_DEFAULT_LORA_DIR,
+    filename: str = "stylized-setting-isometric-sdxl-and-sd15.safetensors",
+    timeout: float = 120.0,
+    token: str | None = None,
+    dry_run: bool = False,
+) -> str:
+    """Download the LoRA safetensors into `dest_dir` and return its full path."""
+    os.makedirs(dest_dir, exist_ok=True)
+    out_path = os.path.join(dest_dir, filename)
+    if dry_run:
+        return out_path
+    url = civitai_lora_download_url(source_url)
+    headers = {"User-Agent": "fabletest-texgen/1.0"}
+    if token:
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}token={urllib.parse.quote(token)}"
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = resp.read()
+    if b"<html" in data[:512].lower():
+        raise RuntimeError(
+            "LoRA download returned HTML instead of safetensors; check Civitai URL/token."
+        )
+    with open(out_path, "wb") as f:
+        f.write(data)
+    return out_path
+
+
+def build_runpod_comfyui_workflow(
+    *,
+    prompt: str,
+    negative_prompt: str,
+    seed: int,
+    width: int,
+    height: int,
+    checkpoint_name: str = RUNPOD_DEFAULT_SDXL_CKPT,
+    lora_name: str = "stylized-setting-isometric-sdxl-and-sd15.safetensors",
+    lora_strength_model: float = 0.8,
+    lora_strength_clip: float = 0.8,
+    steps: int = 30,
+    cfg: float = 7.0,
+    sampler_name: str = "euler",
+    scheduler: str = "normal",
+    denoise: float = 1.0,
+    filename_prefix: str = "fabletest",
+    batch_size: int = 1,
+) -> dict:
+    """Build a ComfyUI SDXL workflow JSON compatible with RunPod worker-comfyui."""
+    return {
+        "1": {"class_type": "CheckpointLoaderSimple",
+              "inputs": {"ckpt_name": checkpoint_name}},
+        "2": {"class_type": "LoraLoader", "inputs": {
+            "model": ["1", 0], "clip": ["1", 1],
+            "lora_name": lora_name,
+            "strength_model": float(lora_strength_model),
+            "strength_clip": float(lora_strength_clip),
+        }},
+        "3": {"class_type": "CLIPTextEncode",
+              "inputs": {"text": prompt, "clip": ["2", 1]}},
+        "4": {"class_type": "CLIPTextEncode",
+              "inputs": {"text": negative_prompt, "clip": ["2", 1]}},
+        "5": {"class_type": "EmptyLatentImage",
+              "inputs": {"width": int(width), "height": int(height),
+                         "batch_size": int(batch_size)}},
+        "6": {"class_type": "KSampler", "inputs": {
+            "seed": int(seed), "steps": int(steps), "cfg": float(cfg),
+            "sampler_name": sampler_name, "scheduler": scheduler,
+            "denoise": float(denoise), "model": ["2", 0],
+            "positive": ["3", 0], "negative": ["4", 0],
+            "latent_image": ["5", 0],
+        }},
+        "7": {"class_type": "VAEDecode",
+              "inputs": {"samples": ["6", 0], "vae": ["1", 2]}},
+        "8": {"class_type": "SaveImage",
+              "inputs": {"images": ["7", 0], "filename_prefix": filename_prefix}},
+    }
+
+
+def build_runpod_runsync_payload(workflow: dict) -> dict:
+    return {"input": {"workflow": workflow}}
+
+
+class RunPodComfyUIBackend(Backend):
+    """RunPod runsync backend for worker-comfyui SDXL custom workflows."""
+    name = "runpod-comfyui"
+
+    def __init__(
+        self,
+        endpoint_id: str | None = None,
+        api_key: str | None = None,
+        timeout: float | None = None,
+        retries: int | None = None,
+        retry_backoff: float | None = None,
+        checkpoint_name: str | None = None,
+        lora_name: str | None = None,
+        lora_path: str | None = None,
+        lora_strength_model: float = 0.8,
+        lora_strength_clip: float = 0.8,
+        prompt_prefix: str | None = None,
+        dry_run: bool | None = None,
+    ):
+        self.endpoint_id = endpoint_id or _env_str("RUNPOD_ENDPOINT_ID")
+        self.api_key = api_key or _env_str("RUNPOD_API_KEY")
+        self.timeout = float(timeout if timeout is not None else _env_float("RUNPOD_TIMEOUT_SEC", 120.0))
+        self.retries = int(retries if retries is not None else _env_int("RUNPOD_RETRIES", 2))
+        self.retry_backoff = float(
+            retry_backoff if retry_backoff is not None else _env_float("RUNPOD_RETRY_BACKOFF_SEC", 1.5)
+        )
+        self.checkpoint_name = checkpoint_name or _env_str("RUNPOD_SDXL_CHECKPOINT", RUNPOD_DEFAULT_SDXL_CKPT)
+        self.lora_name = lora_name or _env_str(
+            "RUNPOD_LORA_NAME", "stylized-setting-isometric-sdxl-and-sd15.safetensors"
+        )
+        self.lora_path = lora_path or _env_str("RUNPOD_LORA_PATH", RUNPOD_DEFAULT_LORA_DIR)
+        self.lora_strength_model = float(_env_float("RUNPOD_LORA_STRENGTH_MODEL", lora_strength_model))
+        self.lora_strength_clip = float(_env_float("RUNPOD_LORA_STRENGTH_CLIP", lora_strength_clip))
+        self.prompt_prefix = prompt_prefix or _env_str("RUNPOD_PROMPT_PREFIX", RUNPOD_DEFAULT_PROMPT)
+        self.dry_run = bool(_env_bool("RUNPOD_DRY_RUN", False) if dry_run is None else dry_run)
+        self.filename_prefix = _env_str("RUNPOD_FILENAME_PREFIX", "fabletest")
+        self.url = (f"https://api.runpod.ai/v2/{self.endpoint_id}/runsync"
+                    if self.endpoint_id else None)
+        if not self.checkpoint_name:
+            raise ValueError("RUNPOD_SDXL_CHECKPOINT must be configured for SDXL.")
+        if self.lora_path and not self.lora_path.endswith("/"):
+            self.lora_path += "/"
+        self.full_lora_name = (
+            f"{self.lora_path}{self.lora_name}" if self.lora_path and "/" not in self.lora_name else self.lora_name
+        )
+
+    def build_payload(self, job: GenJob) -> dict:
+        prompt = f"{self.prompt_prefix}, {job.prompt}" if self.prompt_prefix else job.prompt
+        workflow = build_runpod_comfyui_workflow(
+            prompt=prompt,
+            negative_prompt=job.negative,
+            seed=job.seed,
+            width=job.px,
+            height=job.px,
+            checkpoint_name=self.checkpoint_name,
+            lora_name=self.full_lora_name,
+            lora_strength_model=self.lora_strength_model,
+            lora_strength_clip=self.lora_strength_clip,
+            filename_prefix=self.filename_prefix,
+            batch_size=job.n,
+        )
+        return build_runpod_runsync_payload(workflow)
+
+    def _decode_images(self, data: dict, want: int) -> list:
+        output = data.get("output", {})
+        imgs = output.get("images", output if isinstance(output, list) else [])
+        out = []
+        for item in imgs:
+            if isinstance(item, str):
+                b64 = item.split(",", 1)[-1]
+                out.append(base64.b64decode(b64))
+            elif isinstance(item, dict):
+                b64 = item.get("image") or item.get("base64")
+                if b64:
+                    b64 = b64.split(",", 1)[-1]
+                    out.append(base64.b64decode(b64))
+        if len(out) != want:
+            raise RuntimeError(f"runpod returned {len(out)} images, wanted {want}: {data.get('status')}")
+        return out
+
+    def generate(self, job: GenJob) -> list:
+        if self.dry_run:
+            return PlaceholderBackend().generate(job)
+        if not self.url or not self.api_key:
+            raise ValueError("RunPod backend requires RUNPOD_ENDPOINT_ID and RUNPOD_API_KEY (or dry-run mode).")
+        body = json.dumps(self.build_payload(job)).encode()
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + self.api_key,
+        }
+        last_err = None
+        for attempt in range(self.retries + 1):
+            try:
+                req = urllib.request.Request(self.url, data=body, headers=headers)
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    data = json.loads(resp.read().decode())
+                return self._decode_images(data, job.n)
+            except (TimeoutError, urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError,
+                    KeyError, RuntimeError, ValueError) as e:
+                last_err = e
+                if attempt >= self.retries:
+                    break
+                time.sleep(self.retry_backoff * (2 ** attempt))
+        raise RuntimeError(f"runpod runsync request failed after {self.retries + 1} attempts: {last_err}") from last_err
 
 
 def _desc_from_key(key: str) -> Descriptor:

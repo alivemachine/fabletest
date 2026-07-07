@@ -165,6 +165,59 @@ def test_prompt_reflects_tags():
     assert "tileable" in gp and "desert" in gp
 
 
+# --- runpod workflow/backend --------------------------------------------------
+
+def test_runpod_payload_shape_and_required_nodes():
+    wf = tg.build_runpod_comfyui_workflow(
+        prompt="p", negative_prompt="n", seed=7, width=512, height=512
+    )
+    payload = tg.build_runpod_runsync_payload(wf)
+    assert "input" in payload and "workflow" in payload["input"]
+    classes = {node["class_type"] for node in wf.values()}
+    for need in ("CheckpointLoaderSimple", "CLIPTextEncode", "LoraLoader",
+                 "KSampler", "VAEDecode", "SaveImage"):
+        assert need in classes
+
+
+def test_runpod_backend_build_payload_includes_prompt_prefix_and_lora_path():
+    b = tg.RunPodComfyUIBackend(
+        endpoint_id="ep",
+        api_key="key",
+        prompt_prefix="isometric stylized setting",
+        checkpoint_name="sd_xl_base_1.0.safetensors",
+        lora_name="foo.safetensors",
+        lora_path="/workspace/ComfyUI/models/loras/",
+    )
+    job = tg.GenJob("k", "tree sprite", "bad", 11, 640, 2)
+    payload = b.build_payload(job)
+    wf = payload["input"]["workflow"]
+    assert wf["1"]["inputs"]["ckpt_name"] == "sd_xl_base_1.0.safetensors"
+    assert wf["2"]["inputs"]["lora_name"] == "/workspace/ComfyUI/models/loras/foo.safetensors"
+    assert "isometric stylized setting" in wf["3"]["inputs"]["text"]
+
+
+def test_runpod_backend_dry_run_works_without_credentials():
+    b = tg.RunPodComfyUIBackend(dry_run=True, endpoint_id=None, api_key=None)
+    d = tg.descriptor("tree.oak", lod="single", season="summer", tod="day",
+                      temp="mild", growth="mature", cond="pristine")
+    job = tg.GenJob(d.key, tg.build_prompt(d)[0], tg.NEGATIVE, 123, 64, 2)
+    out = b.generate(job)
+    assert len(out) == 2 and all(isinstance(x, bytes) for x in out)
+
+
+def test_civitai_lora_download_support_dry_run_path():
+    assert tg.civitai_lora_download_url(
+        "https://civitai.com/models/118775/stylized-setting-isometric-sdxl-and-sd15"
+    ) == "https://civitai.com/api/download/models/118775"
+    root = tempfile.mkdtemp(prefix="lora_")
+    try:
+        p = tg.download_civitai_lora(dest_dir=root, dry_run=True)
+        assert p.endswith("stylized-setting-isometric-sdxl-and-sd15.safetensors")
+        assert p.startswith(root)
+    finally:
+        shutil.rmtree(root)
+
+
 # --- store & service lifecycle --------------------------------------------------
 
 def test_resolve_serves_placeholder_then_ready():
