@@ -387,8 +387,7 @@ async function loadGodotShots(){
       card.append(img, cap);
       godotShotsGrid.append(card);
     }
-    godotShotsMeta.textContent = "Last generated " + (man.generated_at || "unknown")
-      + " · " + shots.length + " frame(s) · " + (man.width || 0) + "x" + (man.height || 0);
+    godotShotsMeta.textContent = `Last generated ${man.generated_at || "unknown"} · ${shots.length} frame(s) · ${man.width || 0}x${man.height || 0}`;
   } catch (_err) {
     godotShotsMeta.textContent = "No generated Godot screenshots yet. Run python3 generate_godot_screenshots.py.";
     godotShotsGrid.innerHTML = "";

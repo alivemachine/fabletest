@@ -54,7 +54,7 @@ func _initialize() -> void:
 
 func _wait_for_frame(main: Node) -> bool:
 	var deadline := Time.get_ticks_msec() + WAIT_TIMEOUT_MSEC
-	while Time.get_ticks_msec() <= deadline:
+	while Time.get_ticks_msec() < deadline:
 		if main.has_live_payload() and not main.is_request_pending():
 			return true
 		await process_frame
