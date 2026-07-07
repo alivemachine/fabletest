@@ -369,7 +369,7 @@ function drawIfPaused(){ if (!S.playing && py){ drawView(); drawThumbs(true); } 
 async function loadGodotShots(){
   if (!godotShotsGrid || !godotShotsMeta) return;
   try {
-    const res = await fetch("godot_frames/manifest.json?v=1");
+    const res = await fetch("godot_frames/manifest.json?v=" + Date.now());
     if (!res.ok) throw new Error("manifest missing");
     const man = await res.json();
     const shots = Array.isArray(man.screenshots) ? man.screenshots : [];
@@ -383,7 +383,7 @@ async function loadGodotShots(){
       img.alt = "Godot screenshot " + item.file;
       const cap = document.createElement("div");
       cap.className = "cap";
-      cap.textContent = (item.kind || "random") + " · (" + Number(item.cx).toFixed(3) + ", " + Number(item.cy).toFixed(3) + ")";
+      cap.textContent = shotCaption(item);
       card.append(img, cap);
       godotShotsGrid.append(card);
     }
@@ -393,6 +393,10 @@ async function loadGodotShots(){
     godotShotsMeta.textContent = "No generated Godot screenshots yet. Run python3 generate_godot_screenshots.py.";
     godotShotsGrid.innerHTML = "";
   }
+}
+
+function shotCaption(item){
+  return (item.kind || "random") + " · (" + Number(item.cx).toFixed(3) + ", " + Number(item.cy).toFixed(3) + ")";
 }
 
 let last = null;

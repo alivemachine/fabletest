@@ -2,6 +2,8 @@ extends SceneTree
 
 const DEFAULT_POINTS := 10
 const WAIT_TIMEOUT_SECONDS := 4.0
+const WAIT_TIMEOUT_MSEC := int(WAIT_TIMEOUT_SECONDS * 1000.0)
+const MAIN_SCENE_PATH := "res://scenes/main.tscn"
 
 var _output_dir := ""
 var _points_path := ""
@@ -19,7 +21,7 @@ func _initialize() -> void:
 	DirAccess.make_dir_recursive_absolute(_output_dir)
 	get_root().size = Vector2i(_width, _height)
 
-	var scene := load("res://scenes/main.tscn")
+	var scene := load(MAIN_SCENE_PATH)
 	var main = scene.instantiate()
 	get_root().add_child(main)
 	await process_frame
@@ -51,7 +53,7 @@ func _initialize() -> void:
 
 
 func _wait_for_frame(main: Node) -> bool:
-	var deadline := Time.get_ticks_msec() + int(WAIT_TIMEOUT_SECONDS * 1000.0)
+	var deadline := Time.get_ticks_msec() + WAIT_TIMEOUT_MSEC
 	while Time.get_ticks_msec() <= deadline:
 		if main.has_live_payload() and not main.is_request_pending():
 			return true

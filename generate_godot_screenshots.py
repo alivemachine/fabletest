@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import os
 import shutil
@@ -34,7 +35,7 @@ class ShotPoint:
     kind: str
 
 
-def _clamp01(v: float) -> float:
+def _wrap01(v: float) -> float:
     return v % 1.0
 
 
@@ -52,8 +53,8 @@ def build_points(seed: int, size: int, civ_count: int, shots: int) -> list[ShotP
             cy, cx = float(core[0]), float(core[1])
             points.append(
                 ShotPoint(
-                    cx=_clamp01(cx + float(rng.uniform(-0.03, 0.03))),
-                    cy=_clamp01(cy + float(rng.uniform(-0.03, 0.03))),
+                    cx=_wrap01(cx + float(rng.uniform(-0.03, 0.03))),
+                    cy=_wrap01(cy + float(rng.uniform(-0.03, 0.03))),
                     kind="near_settlement",
                 )
             )
@@ -140,7 +141,7 @@ def write_manifest(
             }
         )
     payload = {
-        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "generated_at": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
         "seed": seed,
         "size": size,
         "civ_count": civ_count,
