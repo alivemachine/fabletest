@@ -15,7 +15,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
@@ -201,7 +201,7 @@ def main() -> int:
     points = build_points(args.seed, args.size, args.civ_count, args.shots)
     tmpdir = Path(tempfile.mkdtemp(prefix="fabletest-godot-shots-"))
     points_file = tmpdir / "points.json"
-    points_file.write_text(json.dumps([p.__dict__ for p in points]), encoding="utf-8")
+    points_file.write_text(json.dumps([asdict(p) for p in points]), encoding="utf-8")
 
     bridge_cmd = [
         sys.executable,
@@ -239,7 +239,10 @@ def main() -> int:
         )
     finally:
         if bridge.poll() is None:
-            bridge.send_signal(signal.SIGINT)
+            try:
+                bridge.send_signal(signal.SIGINT)
+            except Exception:
+                bridge.terminate()
             try:
                 bridge.wait(timeout=4.0)
             except subprocess.TimeoutExpired:

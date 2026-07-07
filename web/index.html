@@ -395,7 +395,7 @@ async function loadGodotShots(){
 }
 
 function shotCaption(item){
-  return (item.kind || "random") + " · (" + Number(item.cx).toFixed(3) + ", " + Number(item.cy).toFixed(3) + ")";
+  return `${item.kind || "random"} · (${Number(item.cx).toFixed(3)}, ${Number(item.cy).toFixed(3)})`;
 }
 
 let last = null;
