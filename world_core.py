@@ -1720,11 +1720,18 @@ def colorize(st, layer):
     if layer == "elevation":
         img = np.empty(e.shape + (3,), np.float32)
         sea_m = e < sea_eff
+        # Depth gradient: 0 at seabed, 1 at surface.  Scale the whole palette
+        # by sea_eff so a higher tide surface sits visually higher in the
+        # 0-1 elevation range (brighter = more elevated water surface).
         f = np.clip(e / max(sea_eff, 1e-6), 0, 1)
-        img[..., 0] = 16 + 70 * f
-        img[..., 1] = 34 + 106 * f
-        img[..., 2] = 78 + 108 * f
-        g = np.clip((e - sea_level) / max(1 - sea_level, 1e-6), 0, 1)
+        tide_bright = np.clip(sea_eff / 0.42, 0.5, 1.5)  # 0.42 = nominal sea level
+        img[..., 0] = (16 + 70 * f) * tide_bright
+        img[..., 1] = (34 + 106 * f) * tide_bright
+        img[..., 2] = (78 + 108 * f) * tide_bright
+        # Land gradient anchored to sea_eff (not the static sea_level slider)
+        # so that newly exposed or newly submerged cells show their true
+        # elevation relative to the CURRENT waterline, not mean sea level.
+        g = np.clip((e - sea_eff) / max(1 - sea_eff, 1e-6), 0, 1)
         land_rgb = color_ramp(g, [0.0, 0.55, 1.0],
                               [(88, 140, 80), (168, 150, 96), (245, 245, 248)])
         img[~sea_m] = land_rgb[~sea_m]

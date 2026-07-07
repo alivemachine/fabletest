@@ -9,7 +9,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import signal
+import socket
 import struct
+import subprocess
+import sys
 import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -157,12 +162,91 @@ class WorldBridge:
             "temperature": _q_u8_array(st["tf"]),
         }
 
-    def _payload_binary(self, ws: wc.WorldSlice, st: dict[str, Any], target_tiles: int) -> bytes:
+    def _bitmap_payload(self, ws: wc.WorldSlice, st: dict[str, Any]) -> dict[str, np.ndarray]:
+        """Build the three bitmaps Godot reads directly — no per-field reconstruction.
+
+        color_map   (N×N×3 uint8)  — BIOME layer only (no lighting). Pure stable
+                                     colors from worldgen.BIOME_COLORS. Godot keys
+                                     each pixel into its TileDefinition (texture,
+                                     physics, walkability, resource …). Must not
+                                     include lighting — the composite render shifts
+                                     every frame with day/night and breaks lookups.
+        property_map (N×N×4 uint8) — per-tile game data that Godot CAN'T infer from
+                                     color alone:
+                                       R = height  (0-255, normalized above sea_level)
+                                       G = surface flags: 0=land 1=water 2=river-on-land
+                                       B = structure: 0=none 1=road 2=building
+                                       A = faction id+1 (0=unclaimed)
+        data_map    (N×N×4 uint8)  — per-tile world-state channels:
+                                       R = sunlight  (Godot applies this as tile lighting)
+                                       G = vegetation (live)
+                                       B = flow direction (0-255 → 0-TAU)
+                                       A = flow speed (0=still)
+        """
         fields = self._payload_fields(ws, st)
+
+        # --- color_map: pure stable biome color (no lighting, no compositing).
+        # The "biome" layer returns BIOME_LUT[biome_id] — exact matches to the
+        # TILE_PALETTE keys in terrain_chunk.gd. Day/night is applied separately
+        # via data_map.R (sunlight) so Godot controls illumination itself.
+        biome_rgb = wc.colorize(st, "biome")
+        color_map = np.clip(biome_rgb, 0, 255).astype(np.uint8)          # N×N×3
+
+        # --- property_map
+        n = ws.size
+        prop = np.zeros((n, n, 4), np.uint8)
+        elev = ws.elev
+        sea_eff  = float(st["sea_eff"])   # tide-adjusted: determines water boundary
+        sea_level = float(st["sea_level"]) # stable geographic baseline: used for height
+        range_norm = max(1.0 - sea_level, 1e-6)
+        # R: height — land tiles use their own elevation; water tiles use the
+        # current tide-adjusted waterline (sea_eff) so the sea surface rises
+        # and falls with the tide instead of sitting at a fixed 8 px.  Land
+        # tiles near the waterline transition smoothly because the tile at
+        # exactly sea_eff encodes the same height whether it's land or water.
+        land_mask = elev >= sea_eff
+        sea_eff_norm = float(np.clip((sea_eff - sea_level) / range_norm, 0.0, 1.0))
+        water_height_byte = int(sea_eff_norm * 255 + 0.5)
+        prop[..., 0] = np.where(land_mask,
+                                np.clip((elev - sea_level) / range_norm * 255, 0, 255).astype(np.uint8),
+                                water_height_byte)
+        # G: surface type
+        river_alpha = getattr(ws, "river_alpha", np.zeros_like(elev))
+        brook_alpha = getattr(ws, "brook_alpha", np.zeros_like(elev))
+        river_gate = np.clip(ws.river_disc / max(float(st["river_thr"]), 1.0), 0.0, 1.0) ** 0.6
+        river = np.maximum(river_alpha * river_gate, brook_alpha)
+        surf = np.zeros((n, n), np.uint8)
+        surf[~land_mask] = 1                              # water
+        surf[land_mask & (river > 0.05)] = 2             # river on land
+        prop[..., 1] = surf
+        # B: structure (already computed in _payload_fields)
+        prop[..., 2] = fields["structure"].reshape(n, n)
+        # A: faction
+        prop[..., 3] = fields["faction"].reshape(n, n)
+
+        # --- data_map: R=sunlight G=vegetation B=flow_dir A=flow_speed
+        data = np.zeros((n, n, 4), np.uint8)
+        data[..., 0] = fields["sunlight"].reshape(n, n)   # per-tile lighting
+        data[..., 1] = fields["vegetation"].reshape(n, n)
+        data[..., 2] = fields["flow_dir"].reshape(n, n)
+        data[..., 3] = fields["flow_speed"].reshape(n, n)
+
+        return {
+            "color_map": np.ascontiguousarray(color_map),
+            "property_map": np.ascontiguousarray(prop),
+            "data_map": np.ascontiguousarray(data),
+        }
+
+    def _payload_binary(self, ws: wc.WorldSlice, st: dict[str, Any], target_tiles: int) -> bytes:
+        bitmaps = self._bitmap_payload(ws, st)
+        # Header: magic "FTB1", version=3, then same geometry fields as before.
+        # sea_level (not sea_eff) is the stable geographic baseline Godot uses
+        # for column-height calculation — tide only affects the waterline flag
+        # already baked into property_map.G.
         header = struct.pack(
             "<4sHHIHHfffffffBBH",
             b"FTB1",
-            2,
+            3,
             int(ws.size),
             int(self.seed),
             int(self.size),
@@ -178,13 +262,12 @@ class WorldBridge:
             _mean_u8(st["clouds"]),
             0,
         )
-        parts = [header]
-        for name in ("biome_id", "height", "sunlight", "river", "vegetation",
-                     "scorch", "flow_dir", "flow_speed", "fauna_herb",
-                     "fauna_pred", "structure", "faction", "moisture",
-                     "temperature"):
-            parts.append(fields[name].tobytes())
-        return b"".join(parts)
+        return b"".join([
+            header,
+            bitmaps["color_map"].tobytes(),     # N*N*3 bytes
+            bitmaps["property_map"].tobytes(),  # N*N*4 bytes
+            bitmaps["data_map"].tobytes(),      # N*N*4 bytes
+        ])
 
     def snapshot(self, *, seed: int | None = None, size: int | None = None,
                  civ_count: int | None = None, cx: float = 0.5, cy: float = 0.5,
@@ -329,6 +412,46 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+def _evict_port(port: int) -> None:
+    """Kill any process already listening on *port* before we bind to it.
+    Uses netstat on Windows, lsof on POSIX. Best-effort — never blocks startup."""
+    try:
+        if sys.platform == "win32":
+            out = subprocess.check_output(
+                ["netstat", "-ano"], text=True, stderr=subprocess.DEVNULL
+            )
+            pids: set[int] = set()
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) >= 5 and f":{port}" in parts[1] and parts[3] == "LISTENING":
+                    try:
+                        pid = int(parts[4])
+                        if pid != os.getpid():
+                            pids.add(pid)
+                    except ValueError:
+                        pass
+            for pid in pids:
+                subprocess.call(
+                    ["taskkill", "/F", "/PID", str(pid)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+            if pids:
+                import time as _t; _t.sleep(0.5)
+        else:
+            out = subprocess.check_output(
+                ["lsof", "-ti", f"tcp:{port}"], text=True, stderr=subprocess.DEVNULL
+            )
+            for pid_s in out.split():
+                try:
+                    pid = int(pid_s)
+                    if pid != os.getpid():
+                        os.kill(pid, signal.SIGTERM)
+                except (ValueError, OSError):
+                    pass
+    except Exception:
+        pass
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Serve world_core chunks to a Godot client.")
     parser.add_argument("--host", default="127.0.0.1")
@@ -339,12 +462,18 @@ def main() -> None:
     args = parser.parse_args()
 
     BridgeHandler.bridge = WorldBridge(args.seed, args.size, args.civ_count)
+    _evict_port(args.port)
     server = ThreadingHTTPServer((args.host, args.port), BridgeHandler)
     print(f"serving Godot bridge at http://{args.host}:{args.port}/frame")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
+    except Exception as e:
+        import traceback
+        print(f"\nBridge crashed: {e}", flush=True)
+        traceback.print_exc()
+        sys.exit(1)
     finally:
         server.server_close()
 

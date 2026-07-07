@@ -19,6 +19,18 @@ var bridge_url := bridge_url_binary
 @export var zoom := 12.0
 @export var move_speed_tiles := 8.5
 
+@export_group("Rendering")
+## Tiles drawn in each direction from the player (diameter = radius*2+1).
+@export var render_radius := 13
+## Isometric tile width in pixels.
+@export var tile_width := 56.0
+## Isometric tile height in pixels (half of width for classic 2:1 iso).
+@export var tile_height := 28.0
+## Maximum terrain elevation in pixels (land tiles scale 0→this above water).
+@export var relief_scale := 72.0
+## Base height of the water surface column in pixels.
+@export var water_column_height := 8.0
+
 @export_group("Simulation")
 @export var sim_speed := 0.35
 @export var sea_level := 0.42
@@ -56,7 +68,7 @@ var backdrop_layers: Array = []
 
 
 func _ready() -> void:
-	Engine.max_fps = 120
+	Engine.max_fps = 60
 	_build_environment()
 	_build_terrain()
 	_build_player()
@@ -175,6 +187,12 @@ func _build_terrain() -> void:
 	terrain = TerrainChunkScene.new()
 	terrain.name = "Terrain"
 	terrain.z_index = 20
+	# Apply Inspector-tweaked rendering vars before _ready() fires on add_child.
+	terrain.render_radius = render_radius
+	terrain.tile_width = tile_width
+	terrain.tile_height = tile_height
+	terrain.relief_scale = relief_scale
+	terrain.water_column_height = water_column_height
 	add_child(terrain)
 
 
@@ -427,4 +445,4 @@ func _update_hud() -> void:
 	var mode_line: String = "OFFLINE GRID (no fetching)" if offline_grid else status_line
 	hud_label.text = "Fabletest Godot client\n" \
 		+ "WASD move  |  [ ] zoom  |  Space pause  |  R reset  |  G grid test\n" \
-		+ "seed %d  |  day %.1f  |  view %d / chunk %d  |  zoom %.1fx  |  %s" % [seed, day, view_tiles, chunk, zoom, mode_line] 
+		+ "seed %d  |  day %.1f  |  view %d / chunk %d  |  zoom %.1fx  |  fps %d  |  %s" % [seed, day, view_tiles, chunk, zoom, Engine.get_frames_per_second(), mode_line] 

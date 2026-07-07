@@ -5,6 +5,9 @@
 [node name="Main" type="Node2D" unique_id=257245491]
 script = ExtResource("1_main")
 seed = 43
+render_radius = 59
+relief_scale = 512.0
 sim_speed = 0.03
 sea_level = 0.495
+tide_amp = 0.767
 day_night = 3.115

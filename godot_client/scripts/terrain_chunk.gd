@@ -1,6 +1,5 @@
 extends Node2D
 
-const PixelArt = preload("res://scripts/pixel_art.gd")
 const FRAME_PACKET_HEADER_BYTES := 48
 const FRAME_PACKET_VERSION := 3
 
@@ -105,13 +104,10 @@ var _last_chunk_center_uv := Vector2(0.5, 0.5)
 var _time_days := 0.0
 var _sunlight_mean := 180
 var _cloud_mean := 110
-var _water_texture: Texture2D
-var _tree_textures: Dictionary = {}
 # Persistent tile cache keyed by wrapped world-tile Vector2i -> draw record.
 # Chunks are merged in as they arrive; drawing samples this cache around the
 # player. Data can arrive late, partial, or never -- rendering never waits.
 var _tile_cache: Dictionary = {}
-var _iso_order: Array = []
 var _build_thread: Thread
 var _build_mutex := Mutex.new()
 var _build_ready := false
@@ -121,11 +117,23 @@ var _build_token := 0
 
 var anchor := Vector2.ZERO
 
+# ArrayMesh renderer: all tile geometry is baked into a MeshInstance2D once per
+# chunk-data-change or once per tile-step. Moving sub-tile is just a position
+# offset on the mesh node — zero GDScript draw work per frame at runtime.
+var _mesh_node: MeshInstance2D
+var _mesh_front: ArrayMesh
+var _mesh_back: ArrayMesh
+var _mesh_base := Vector2i(-99999, -99999)
+var _mesh_buf_radius := 8
+var _mesh_thread: Thread
+var _mesh_mutex := Mutex.new()
+var _mesh_ready := false
+var _mesh_result: Dictionary = {}
+
 
 func _ready() -> void:
-	_water_texture = PixelArt.make_water_texture(Color8(66, 122, 196), Color8(170, 212, 238))
-	_rebuild_iso_order()
 	_build_palette_index()
+	_setup_mesh_renderer()
 
 
 func _build_palette_index() -> void:
@@ -162,22 +170,17 @@ func _palette_lookup(color: Color) -> Dictionary:
 	return best
 
 
-func _rebuild_iso_order() -> void:
-	# Precompute the fixed render-window offsets once, sorted back-to-front so
-	# the isometric painter's order is correct without per-frame sorting.
-	_iso_order.clear()
-	var r := render_radius
-	for oy in range(-r, r + 1):
-		for ox in range(-r, r + 1):
-			_iso_order.append(Vector2i(ox, oy))
-	_iso_order.sort_custom(func(a, b): return (a.x + a.y) < (b.x + b.y))
-
-
 func _process(_delta: float) -> void:
-	# Merge a freshly-built chunk into the persistent tile cache when the worker
-	# finishes. This only ADDS data; it never repositions anything already drawn.
-	# Rendering is driven purely by the player position, so late/partial/no data
-	# all look fine -- the world just fills in around the character.
+	if _mesh_ready:
+		_mesh_mutex.lock()
+		var mresult := _mesh_result
+		_mesh_result = {}
+		_mesh_ready = false
+		_mesh_mutex.unlock()
+		if _mesh_thread != null:
+			_mesh_thread.wait_to_finish()
+			_mesh_thread = null
+		_upload_mesh(mresult)
 	if _build_ready:
 		_build_mutex.lock()
 		var result: Dictionary = _build_result
@@ -199,16 +202,30 @@ func _exit_tree() -> void:
 	if _build_thread != null:
 		_build_thread.wait_to_finish()
 		_build_thread = null
+	if _mesh_thread != null:
+		_mesh_thread.wait_to_finish()
+		_mesh_thread = null
 
 
 func set_focus(uv: Vector2, screen_anchor: Vector2) -> void:
-	# The terrain layer origin is pinned to the screen anchor. The player never
-	# moves off-screen and never reaches an edge: tiles are drawn in a fixed
-	# radius AROUND the player every frame, sliding smoothly sub-tile.
 	focus_uv = uv
 	anchor = screen_anchor
 	position = anchor
-	queue_redraw()
+	if _mesh_node == null:
+		return
+	# Pixel offset from mesh_base to current player — continuous tile delta.
+	# This is the ONLY per-frame work: one Vector2 assignment.
+	var f := _world_tile_f(uv)
+	var dx := f.x - float(_mesh_base.x)
+	var dy := f.y - float(_mesh_base.y)
+	_mesh_node.position = Vector2(-(dx - dy) * tile_width * 0.5,
+		-(dx + dy) * tile_height * 0.5)
+	# Trigger an off-thread mesh rebuild when player nears the buffer edge.
+	var cur_ix := int(floor(f.x + 0.5))
+	var cur_iy := int(floor(f.y + 0.5))
+	if max(absi(cur_ix - _mesh_base.x), absi(cur_iy - _mesh_base.y)) > _mesh_buf_radius - 2:
+		if _mesh_thread == null:
+			_request_mesh_rebuild()
 
 
 func has_payload() -> bool:
@@ -355,36 +372,164 @@ func _tile_key(tx: int, ty: int) -> Vector2i:
 	return Vector2i(((tx % n) + n) % n, ((ty % n) + n) % n)
 
 
-func _draw() -> void:
-	# Draw a fixed radius of tiles AROUND the player, sampled from the cache.
-	# The player's fractional tile position gives a smooth sub-tile slide; any
-	# tile with no data yet is skipped (shows the sky/void placeholder), so the
-	# experience stays fluid whether data is present, partial, or absent.
-	var f := _world_tile_f(focus_uv)
-	var base_x := int(floor(f.x + 0.5))
-	var base_y := int(floor(f.y + 0.5))
-	var frac := Vector2(f.x - float(base_x), f.y - float(base_y))
-	# Screen offset for the player's sub-tile position (iso projection).
-	var slide := Vector2((frac.x - frac.y) * tile_width * 0.5,
-		(frac.x + frac.y) * tile_height * 0.5)
+func _setup_mesh_renderer() -> void:
+	_mesh_front = ArrayMesh.new()
+	_mesh_back = ArrayMesh.new()
+	_mesh_node = MeshInstance2D.new()
+	_mesh_node.mesh = _mesh_front
+	var shader := Shader.new()
+	shader.code = "shader_type canvas_item;\nvoid fragment() { COLOR = COLOR; }"
+	var mat := ShaderMaterial.new()
+	mat.shader = shader
+	_mesh_node.material = mat
+	add_child(_mesh_node)
 
-	for off_v in _iso_order:
-		var off: Vector2i = off_v
-		var rec = _tile_cache.get(_tile_key(base_x + off.x, base_y + off.y), null)
-		if rec == null:
-			continue
-		var iso := Vector2(float(off.x - off.y) * tile_width * 0.5,
-			float(off.x + off.y) * tile_height * 0.5) - slide
-		var height_px: float = rec["height_px"]
-		_draw_block(iso, height_px, rec["top"], rec["left"], rec["right"])
-		var water_scale: float = rec["water_scale"]
-		if water_scale > 0.0:
-			_draw_water_surface(iso, height_px, water_scale, rec["water_tint"])
-		var tree_biome: int = rec["tree_biome"]
-		if tree_biome >= 0:
-			_draw_tree(iso, height_px, tree_biome, rec["tree_sun"], rec["tree_veg"])
-		if int(rec.get("structure", 0)) == 2:
-			_draw_building(iso, height_px, rec.get("wall", Color8(200, 190, 170)))
+
+func _request_mesh_rebuild() -> void:
+	if _mesh_thread != null:
+		return
+	var f := _world_tile_f(focus_uv)
+	var new_base := Vector2i(int(floor(f.x + 0.5)), int(floor(f.y + 0.5)))
+	var r := render_radius + _mesh_buf_radius
+	var gn := _grid_n
+	# Snapshot relevant tiles on main thread — safe, no race with _merge_snapshot.
+	var cache_snap := {}
+	for oy in range(-r, r + 1):
+		for ox in range(-r, r + 1):
+			var tx := (((new_base.x + ox) % gn) + gn) % gn
+			var ty := (((new_base.y + oy) % gn) + gn) % gn
+			var rec = _tile_cache.get(Vector2i(tx, ty), null)
+			if rec != null:
+				cache_snap[Vector2i(tx, ty)] = rec
+	_mesh_thread = Thread.new()
+	_mesh_thread.start(Callable(self, "_build_mesh_thread_func").bind(new_base, cache_snap, gn))
+
+
+func _build_mesh_thread_func(new_base: Vector2i, cache: Dictionary, gn: int) -> void:
+	var result := _build_mesh_data(new_base.x, new_base.y, cache, gn)
+	result["base"] = new_base
+	_mesh_mutex.lock()
+	_mesh_result = result
+	_mesh_ready = true
+	_mesh_mutex.unlock()
+
+
+func _build_mesh_data(base_x: int, base_y: int, cache: Dictionary, gn: int) -> Dictionary:
+	var r := render_radius + _mesh_buf_radius
+	var hw := tile_width * 0.5
+	var hh := tile_height * 0.5
+	var verts_arr := []
+	var colors_arr := []
+	# Diagonal sweep gives iso back-to-front order (d = ox+oy ascending).
+	for d in range(-2 * r, 2 * r + 1):
+		for ox in range(-r, r + 1):
+			var oy := d - ox
+			if oy < -r or oy > r:
+				continue
+			var tx := (((base_x + ox) % gn) + gn) % gn
+			var ty_i := (((base_y + oy) % gn) + gn) % gn
+			var rec = cache.get(Vector2i(tx, ty_i), null)
+			if rec == null:
+				continue
+			var hp: float = rec["height_px"]
+			var tc: Color = rec["top"]
+			var lc: Color = rec["left"]
+			var rc_c: Color = rec["right"]
+			if rec["water_scale"] > 0.0:
+				tc = tc.lerp(Color(0.50, 0.80, 1.0), 0.40)
+			var cx := float(ox - oy) * hw
+			var cy := float(ox + oy) * hh
+			var tyv := cy - hp  # Y of top-center
+			# Left face
+			_arr_quad(verts_arr, colors_arr,
+				cx - hw, tyv,      cx, tyv + hh,
+				cx, cy + hh,       cx - hw, cy, lc)
+			# Right face
+			_arr_quad(verts_arr, colors_arr,
+				cx + hw, tyv,      cx, tyv + hh,
+				cx, cy + hh,       cx + hw, cy, rc_c)
+			# Top face
+			_arr_quad(verts_arr, colors_arr,
+				cx, tyv - hh,      cx + hw, tyv,
+				cx, tyv + hh,      cx - hw, tyv, tc)
+			# Tree canopy
+			if rec["tree_biome"] >= 0:
+				var veg: float = rec["tree_veg"]
+				var sun: float = rec["tree_sun"]
+				var cc: Color = rec["canopy_color"].lerp(Color.WHITE, sun * 0.10)
+				var trunk_h := 10.0 + veg * 12.0
+				var cw := 12.0 + veg * 10.0
+				var ch_v := 8.0 + veg * 8.0
+				var trunk_c: Color = Color8(92, 64, 44).lerp(Color.WHITE, sun * 0.12)
+				_arr_quad(verts_arr, colors_arr,
+					cx - 2.0, tyv - trunk_h + 6.0,   cx + 2.0, tyv - trunk_h + 6.0,
+					cx + 2.0, tyv + 6.0,              cx - 2.0, tyv + 6.0, trunk_c)
+				var cp := tyv - trunk_h + 4.0
+				_arr_quad(verts_arr, colors_arr,
+					cx, cp - ch_v,   cx + cw, cp,
+					cx, cp + ch_v,   cx - cw, cp, cc)
+			# Building
+			if int(rec.get("structure", 0)) == 2:
+				var wall: Color = rec.get("wall", Color8(200, 190, 170))
+				var fw := tile_width * 0.30
+				var fh_b := tile_height * 0.30
+				var wh := 22.0
+				_arr_quad(verts_arr, colors_arr,
+					cx - fw, tyv,          cx, tyv + fh_b,
+					cx, tyv + fh_b - wh,   cx - fw, tyv - wh, wall.darkened(0.30))
+				_arr_quad(verts_arr, colors_arr,
+					cx + fw, tyv,          cx, tyv + fh_b,
+					cx, tyv + fh_b - wh,   cx + fw, tyv - wh, wall.darkened(0.14))
+				_arr_quad(verts_arr, colors_arr,
+					cx, tyv - fh_b - wh,   cx + fw, tyv - wh,
+					cx, tyv + fh_b - wh,   cx - fw, tyv - wh,
+					wall.lerp(Color8(96, 62, 52), 0.5).lightened(0.04))
+	return {
+		"verts": PackedVector2Array(verts_arr),
+		"colors": PackedColorArray(colors_arr),
+	}
+
+
+func _arr_quad(verts: Array, colors: Array,
+		x0: float, y0: float, x1: float, y1: float,
+		x2: float, y2: float, x3: float, y3: float,
+		color: Color) -> void:
+	verts.append(Vector2(x0, y0)); colors.append(color)
+	verts.append(Vector2(x1, y1)); colors.append(color)
+	verts.append(Vector2(x2, y2)); colors.append(color)
+	verts.append(Vector2(x0, y0)); colors.append(color)
+	verts.append(Vector2(x2, y2)); colors.append(color)
+	verts.append(Vector2(x3, y3)); colors.append(color)
+
+
+func _upload_mesh(result: Dictionary) -> void:
+	if result.is_empty():
+		return
+	var verts: PackedVector2Array = result.get("verts", PackedVector2Array())
+	var colors: PackedColorArray = result.get("colors", PackedColorArray())
+	var new_base: Vector2i = result.get("base", _mesh_base)
+	if verts.is_empty():
+		return
+	var arrays := []
+	arrays.resize(Mesh.ARRAY_MAX)
+	arrays[Mesh.ARRAY_VERTEX] = verts
+	arrays[Mesh.ARRAY_COLOR] = colors
+	# Write into the back buffer — never touch the front mesh while GPU uses it.
+	_mesh_back.clear_surfaces()
+	_mesh_back.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+	# Swap: point the node at the freshly written mesh, recycle the old front.
+	_mesh_node.mesh = _mesh_back
+	var tmp := _mesh_front
+	_mesh_front = _mesh_back
+	_mesh_back = tmp
+	_mesh_base = new_base
+	# Fix position immediately — main._process already ran this frame with the
+	# old _mesh_base, so we must correct it here or get a 1-frame jump.
+	var f := _world_tile_f(focus_uv)
+	var dx := f.x - float(_mesh_base.x)
+	var dy := f.y - float(_mesh_base.y)
+	_mesh_node.position = Vector2(-(dx - dy) * tile_width * 0.5,
+		-(dx + dy) * tile_height * 0.5)
 
 
 func _start_build(payload) -> void:
@@ -425,7 +570,7 @@ func _merge_snapshot(snapshot: Dictionary) -> void:
 		_tile_cache[rec["key"]] = rec
 	_has_payload = not _tile_cache.is_empty()
 	_prune_cache()
-	queue_redraw()
+	_request_mesh_rebuild()
 
 
 func _prune_cache() -> void:
@@ -548,15 +693,13 @@ func _build_snapshot_bitmaps(payload: Dictionary) -> Dictionary:
 				var structure   := int(prop_map[pi + 2])
 				var faction     := int(prop_map[pi + 3]) - 1  # -1 = unclaimed
 
-				# Height in pixels: water tiles are flat at water_column_height;
-				# land tiles scale from sea surface up. Python already baked the
-				# correct sea_level into property_map.R — no recalculation.
-				var height_px: float
-				if surf_flag == 1:
-					height_px = water_column_height
-				else:
-					height_px = clampf(water_column_height + height_norm * relief_scale,
-									   water_column_height, water_column_height + relief_scale)
+				# Height in pixels: unified formula for land and water.
+				# Python encodes land elevation for land tiles, and the
+				# tide-adjusted waterline (sea_eff) for water tiles, so the
+				# sea surface rises/falls with the tide.  No special case
+				# needed; the same ramp works for both.
+				var height_px: float = clampf(water_column_height + height_norm * relief_scale,
+								water_column_height, water_column_height + relief_scale)
 
 				# --- data_map: R=sunlight G=veg B=flow_dir A=flow_speed
 				var sun   := float(data_map[di])     / 255.0 if di < data_map.size() else 0.8
@@ -571,15 +714,8 @@ func _build_snapshot_bitmaps(payload: Dictionary) -> Dictionary:
 				var left_color  := lit_color.darkened(0.28 if not water else 0.10)
 				var right_color := lit_color.darkened(0.16 if not water else 0.18)
 
-				# Water/river surface overlay
-				var water_scale := 0.0
-				var water_tint  := Color(0.0, 0.0, 0.0, 0.0)
-				if surf_flag == 1:  # open water
-					water_scale = 0.94
-					water_tint  = Color(0.94, 0.99, 1.0, 0.96)
-				elif surf_flag == 2:  # river on land
-					water_scale = 0.62
-					water_tint  = Color(0.76, 0.92, 1.0, 0.72)
+				# Water flag: top face gets animated shimmer tint in _draw().
+				var water_scale := 1.0 if surf_flag > 0 else 0.0
 
 				# Tree placement: use hash on global tile coords for stability
 				var gtx := origin_x + gx
@@ -587,14 +723,14 @@ func _build_snapshot_bitmaps(payload: Dictionary) -> Dictionary:
 				var tree_biome := -1
 				var tree_sun   := 0.8
 				var tree_veg   := veg
+				var canopy_color := Color.TRANSPARENT
 				if structure == 0 and foliage and veg > 0.26 and _hash01(gtx, gty, seed) > 0.55:
 					tree_biome = 6  # grassland index as generic foliage fallback
+					canopy_color = lit_color.lightened(0.12)
 
 				# Building wall color from faction tint
 				var wall_color := Color(0.0, 0.0, 0.0, 0.0)
 				if structure == 2:
-					# Derive wall tint from the palette color so buildings feel
-					# grounded in the biome. Faction offset shifts hue slightly.
 					wall_color = lit_color.lerp(Color8(228, 214, 186), 0.55)
 					if faction >= 0:
 						var fi := faction % 6
@@ -605,19 +741,19 @@ func _build_snapshot_bitmaps(payload: Dictionary) -> Dictionary:
 				var key := Vector2i(((gtx % grid_n) + grid_n) % grid_n,
 					((gty % grid_n) + grid_n) % grid_n)
 				tiles.append({
-					"key":         key,
-					"height":      height_norm,
-					"height_px":   height_px,
-					"top":         lit_color,
-					"left":        left_color,
-					"right":       right_color,
-					"water_scale": water_scale,
-					"water_tint":  water_tint,
-					"tree_biome":  tree_biome,
-					"tree_sun":    tree_sun,
-					"tree_veg":    tree_veg,
-					"structure":   structure,
-					"wall":        wall_color,
+					"key":          key,
+					"height":       height_norm,
+					"height_px":    height_px,
+					"top":          lit_color,
+					"left":         left_color,
+					"right":        right_color,
+					"water_scale":  water_scale,
+					"tree_biome":   tree_biome,
+					"tree_sun":     tree_sun,
+					"tree_veg":     tree_veg,
+					"canopy_color": canopy_color,
+					"structure":    structure,
+					"wall":         wall_color,
 					"env": {
 						"biome":     tile_def["name"],
 						"water":     surf_flag == 1,
@@ -687,8 +823,8 @@ func _build_snapshot_legacy(payload: Dictionary) -> Dictionary:
 					"key": key, "height": elev, "height_px": height_px,
 					"top": top_color, "left": left_color, "right": right_color,
 					"water_scale": 0.94 if water else 0.0,
-					"water_tint": Color(0.94, 0.99, 1.0, 0.96) if water else Color(0,0,0,0),
-					"tree_biome": -1, "tree_sun": sun, "tree_veg": 0.0,
+						"tree_biome": -1, "tree_sun": sun, "tree_veg": 0.0,
+						"canopy_color": Color.TRANSPARENT,
 					"structure": 0, "wall": Color(0,0,0,0), "env": {},
 				})
 	return {
@@ -761,85 +897,6 @@ func _column_height_px_for(elev: float, sea_effective: float) -> float:
 	if elev < sea_effective:
 		return water_column_height
 	return clampf(10.0 + (elev - sea_effective) * relief_scale, 8.0, 44.0)
-
-
-func _draw_block(center: Vector2, height_px: float, top_color: Color, left_color: Color, right_color: Color) -> void:
-	var half_w := tile_width * 0.5
-	var half_h := tile_height * 0.5
-	var top_center := center - Vector2(0.0, height_px)
-	var top := top_center + Vector2(0.0, -half_h)
-	var right := top_center + Vector2(half_w, 0.0)
-	var bottom := top_center + Vector2(0.0, half_h)
-	var left := top_center + Vector2(-half_w, 0.0)
-	var drop := Vector2(0.0, height_px)
-
-	draw_colored_polygon(PackedVector2Array([left, bottom, bottom + drop, left + drop]), left_color)
-	draw_colored_polygon(PackedVector2Array([right, bottom, bottom + drop, right + drop]), right_color)
-	draw_colored_polygon(PackedVector2Array([top, right, bottom, left]), top_color)
-
-
-func _draw_water_surface(center: Vector2, height_px: float, scale: float, tint: Color) -> void:
-	var draw_width := tile_width * clampf(scale, 0.24, 1.0)
-	var draw_height := tile_height * clampf(scale, 0.22, 0.95)
-	var top_center := center - Vector2(0.0, height_px + 1.0)
-	var rect := Rect2(top_center - Vector2(draw_width * 0.5, draw_height * 0.5), Vector2(draw_width, draw_height))
-	draw_texture_rect(_water_texture, rect, false, tint)
-
-
-func _draw_tree(center: Vector2, height_px: float, biome_id: int, sun: float, veg: float) -> void:
-	var trunk_height := 10.0 + veg * 12.0
-	var top_center := center - Vector2(0.0, height_px)
-	var trunk_rect := Rect2(top_center + Vector2(-2.0, -trunk_height + 6.0), Vector2(4.0, trunk_height))
-	draw_rect(trunk_rect, Color8(92, 64, 44).lerp(Color.WHITE, sun * 0.12))
-
-	var canopy := _tree_texture(biome_id)
-	var size := Vector2(24.0 + veg * 18.0, 24.0 + veg * 16.0)
-	var pos := top_center + Vector2(-size.x * 0.5, -size.y + 8.0)
-	draw_texture_rect(canopy, Rect2(pos, size), false,
-		Color(1.0, 1.0, 1.0, 0.94).lerp(Color(1.0, 1.0, 1.0, 1.0), sun * 0.14))
-
-
-func _draw_building(center: Vector2, height_px: float, wall: Color) -> void:
-	# An isometric box standing on the tile's top face. The footprint is a
-	# fraction of the tile so the structure reads as a building sitting ON the
-	# ground rather than replacing it; walls carry the faction tint (passed in),
-	# the roof is a darkened warm cap so blocks stay legible when packed into a
-	# settlement. Same diamond projection as _draw_block, lifted by wall height.
-	var fw := tile_width * 0.30      # footprint half-width  (iso x)
-	var fh := tile_height * 0.30     # footprint half-height (iso y)
-	var wall_h := 22.0               # how tall the walls stand, in px
-	var top_center := center - Vector2(0.0, height_px)
-
-	# base diamond (on the ground) and the roof diamond (base lifted by wall_h)
-	var b_top := top_center + Vector2(0.0, -fh)
-	var b_right := top_center + Vector2(fw, 0.0)
-	var b_bottom := top_center + Vector2(0.0, fh)
-	var b_left := top_center + Vector2(-fw, 0.0)
-	var lift := Vector2(0.0, wall_h)
-	var r_top := b_top - lift
-	var r_right := b_right - lift
-	var r_bottom := b_bottom - lift
-	var r_left := b_left - lift
-
-	# two front walls (matching the block's left/right shading), then the roof
-	var left_wall := wall.darkened(0.30)
-	var right_wall := wall.darkened(0.14)
-	var roof := wall.lerp(Color8(96, 62, 52), 0.5).lightened(0.04)
-	draw_colored_polygon(PackedVector2Array([b_left, b_bottom, r_bottom, r_left]), left_wall)
-	draw_colored_polygon(PackedVector2Array([b_right, b_bottom, r_bottom, r_right]), right_wall)
-	draw_colored_polygon(PackedVector2Array([r_top, r_right, r_bottom, r_left]), roof)
-
-
-func _tree_texture(biome_id: int) -> Texture2D:
-	var key := str(biome_id)
-	if _tree_textures.has(key):
-		return _tree_textures[key]
-	var info: Dictionary = BIOME_INFO[biome_id]
-	var base: Color = info["base"]
-	var accent: Color = info["accent"]
-	var texture: Texture2D = PixelArt.make_canopy_texture(base.lightened(0.06), accent)
-	_tree_textures[key] = texture
-	return texture
 
 
 func _hash01(x: int, y: int, salt: int) -> float:
