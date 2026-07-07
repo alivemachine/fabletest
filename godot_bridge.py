@@ -293,7 +293,7 @@ class WorldBridge:
                      speed: float = 0.35, playing: bool = True, sea_level: float = 0.42,
                      river_thr: float | None = None, season_amp: float = 0.18,
                      tide_amp: float = 0.012, day_night: float = 0.65,
-                     reset: bool = False):
+                     reset: bool = False, day: float = -1.0):
         """Shared prologue of every endpoint: rebuild if params changed,
         advance the clock, cut the player-centered chunk, compute its state.
         Caller must hold self.lock."""
@@ -307,6 +307,10 @@ class WorldBridge:
             self.t = 0.0
         river_thr = (wc.default_river_threshold(self.size)
                      if river_thr is None else float(river_thr))
+        if day >= 0.0:
+            # Absolute sim-day override (screenshot runs, deep links). Only the
+            # seekable channels move; the stateful EcoSim keeps its own path.
+            self.t = float(day)
         self._advance(dt_seconds, speed, playing, sea_level, season_amp, tide_amp)
         zoom = max(1.0, float(zoom))
         view_tiles = max(8, int(view_tiles))
@@ -465,6 +469,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             "tide_amp": _clamp(_parse_float(qs, "tide_amp", 0.012), 0.0, 0.05),
             "day_night": _clamp(_parse_float(qs, "day_night", 0.65), 0.0, 1.0),
             "reset": _parse_bool(qs, "reset", False),
+            "day": _parse_float(qs, "day", -1.0),
         }
         if parsed.path == "/frame.bin":
             self._send_binary(bridge.snapshot_binary(**args))

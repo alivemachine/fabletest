@@ -38,6 +38,9 @@ var bridge_url := bridge_url_binary
 @export var tide_amp := 0.012
 @export var day_night := 0.65
 @export var playing := true
+## Absolute sim-day override sent with every frame request (-1 = live clock).
+## day N.5 is local noon; a year is 96 days. Used by the screenshot runner.
+@export var sim_day_override := -1.0
 
 # Offline test mode: draw a static grey grid and do zero fetching, so movement
 # smoothness can be verified in isolation. Press G to toggle at runtime.
@@ -329,6 +332,8 @@ func _request_frame(dt: float, reset: bool, center_override = null) -> void:
 		"day_night": day_night,
 		"reset": 1 if reset else 0,
 	}
+	if sim_day_override >= 0.0:
+		query["day"] = sim_day_override
 	var url := bridge_url + "?" + _encode_query(query)
 	var err := http.request(url)
 	if err != OK:
@@ -450,6 +455,12 @@ func _update_hud() -> void:
 
 func has_live_payload() -> bool:
 	return terrain != null and terrain.has_payload()
+
+
+func capture_serials() -> Dictionary:
+	if terrain == null:
+		return {"snapshot": 0, "mesh": 0}
+	return {"snapshot": terrain.snapshot_serial(), "mesh": terrain.mesh_serial()}
 
 
 func is_request_pending() -> bool:

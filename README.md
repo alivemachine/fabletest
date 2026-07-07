@@ -68,14 +68,28 @@ is a 3D chunk renderer with sprite-stacked props and parallax layers. If you
 later switch to an authored `TileMapLayer` terrain surface, `better-terrain`
 would be a good fit there; see `godot_client/README.md`.
 
-To refresh the web gallery with current Godot gameplay captures (10 random /
-settlement-near Full HD teleports), run:
+To refresh the web gallery with current Godot gameplay captures (10 land-only
+random / settlement-near Full HD teleports), run:
 
 ```bash
-python3 generate_godot_screenshots.py
+python3 generate_godot_screenshots.py            # needs a Godot 4 binary
 ```
 
-Run that script after any Python or Godot-client change so `web/index.html`
+Captures default to noon of year 12 (`--sim-day 1152.5`; `N.5` is local noon,
+96 days/year) so settlements have had time to appear. On a headless box run it
+under xvfb — Godot's true `--headless` mode cannot read back pixels — or just
+dispatch the **Generate Godot screenshots** workflow (Actions tab), which
+renders on CI and commits the frames.
+
+The page also hosts a **Generated textures** browser (key search + subject
+filter) over a static export of the texture store. Refresh it with:
+
+```bash
+python3 export_texture_gallery.py                # placeholder backend
+python3 export_texture_gallery.py --backend runpod-comfyui   # real SDXL art
+```
+
+Run these after any Python or Godot-client change so `web/index.html`
 always shows an up-to-date Godot experience.
 
 ## The interface

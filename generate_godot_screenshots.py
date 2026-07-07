@@ -39,10 +39,32 @@ def _wrap01(v: float) -> float:
     return v % 1.0
 
 
-def build_points(seed: int, size: int, civ_count: int, shots: int) -> list[ShotPoint]:
+def build_points(
+    seed: int, size: int, civ_count: int, shots: int, sea_level: float = 0.42
+) -> list[ShotPoint]:
     world = wc.build_world(seed, size, civ_count)
     cores = list(getattr(world, "civ_cores", []))
     rng = np.random.default_rng(seed ^ 0x9E3779B9)
+
+    def on_land(cx: float, cy: float) -> bool:
+        # A zoom-12 view spans ~16 planet cells, so one land cell isn't
+        # enough — require a 5x5 block of land around the point or the
+        # rendered frame can still be all ocean.
+        j = int(cx * world.size) % world.size
+        i = int(cy * world.size) % world.size
+        block = world.elev[np.ix_([(i + di) % world.size for di in range(-2, 3)],
+                                  [(j + dj) % world.size for dj in range(-2, 3)])]
+        return float(block.min()) > sea_level + 0.01
+
+    def nudge_to_land(cx: float, cy: float) -> tuple[float, float]:
+        if on_land(cx, cy):
+            return cx, cy
+        for _ in range(24):
+            nx = _wrap01(cx + float(rng.uniform(-0.05, 0.05)))
+            ny = _wrap01(cy + float(rng.uniform(-0.05, 0.05)))
+            if on_land(nx, ny):
+                return nx, ny
+        return cx, cy
 
     points: list[ShotPoint] = []
     if cores:
@@ -51,15 +73,22 @@ def build_points(seed: int, size: int, civ_count: int, shots: int) -> list[ShotP
         for i in range(near_target):
             core = cores[int(order[i % len(order)])]
             cy, cx = float(core[0]), float(core[1])
-            points.append(
-                ShotPoint(
-                    cx=_wrap01(cx + float(rng.uniform(-0.03, 0.03))),
-                    cy=_wrap01(cy + float(rng.uniform(-0.03, 0.03))),
-                    kind="near_settlement",
-                )
+            cx, cy = nudge_to_land(
+                _wrap01(cx + float(rng.uniform(-0.02, 0.02))),
+                _wrap01(cy + float(rng.uniform(-0.02, 0.02))),
             )
+            points.append(ShotPoint(cx=cx, cy=cy, kind="near_settlement"))
 
-    while len(points) < shots:
+    # Random shots stick to land — an all-ocean frame shows nothing worth
+    # publishing to the gallery.
+    attempts = 0
+    while len(points) < shots and attempts < shots * 400:
+        attempts += 1
+        cx = float(rng.uniform(0.0, 1.0))
+        cy = float(rng.uniform(0.0, 1.0))
+        if on_land(cx, cy):
+            points.append(ShotPoint(cx=cx, cy=cy, kind="random"))
+    while len(points) < shots:  # pathological all-ocean world
         points.append(
             ShotPoint(
                 cx=float(rng.uniform(0.0, 1.0)),
@@ -109,6 +138,10 @@ def run_capture(
     width: int,
     height: int,
     renderer: str = "opengl3",
+    sim_day: float = -1.0,
+    seed: int = -1,
+    size: int = -1,
+    civ_count: int = -1,
 ) -> None:
     # Godot 4's --headless mode uses the dummy rendering server, so the root
     # viewport has no texture to read back — captures need a real renderer.
@@ -136,6 +169,14 @@ def run_capture(
         str(width),
         "--height",
         str(height),
+        "--sim-day",
+        str(sim_day),
+        "--seed",
+        str(seed),
+        "--size",
+        str(size),
+        "--civ-count",
+        str(civ_count),
     ]
     proc = subprocess.run(cmd, cwd=ROOT, text=True, capture_output=True)
     if proc.returncode != 0:
@@ -155,6 +196,7 @@ def write_manifest(
     civ_count: int,
     width: int,
     height: int,
+    sim_day: float = -1.0,
 ) -> None:
     missing: list[str] = []
     entries = []
@@ -177,6 +219,7 @@ def write_manifest(
         "civ_count": civ_count,
         "width": width,
         "height": height,
+        "sim_day": sim_day,
         "screenshots": entries,
     }
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -204,6 +247,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--shots", type=int, default=10)
     parser.add_argument("--width", type=int, default=1920)
     parser.add_argument("--height", type=int, default=1080)
+    parser.add_argument(
+        "--sim-day",
+        type=float,
+        default=1152.5,
+        help="Absolute sim day to render at (N.5 = local noon, year = 96 days)."
+        " Default is noon of year 12, deep enough into the history timeline"
+        " for settlements to exist. Pass -1 for the live clock (day 0).",
+    )
+    parser.add_argument("--sea-level", type=float, default=0.42)
     parser.add_argument(
         "--renderer",
         default=os.environ.get("GODOT_RENDERER", "opengl3"),
@@ -233,7 +285,9 @@ def main() -> int:
     for old in output_dir.glob("frame_*.png"):
         old.unlink()
 
-    points = build_points(args.seed, args.size, args.civ_count, args.shots)
+    points = build_points(
+        args.seed, args.size, args.civ_count, args.shots, sea_level=args.sea_level
+    )
     tmpdir = Path(tempfile.mkdtemp(prefix="godot-screenshot-gen-"))
     points_file = tmpdir / "points.json"
     points_file.write_text(json.dumps([asdict(p) for p in points]), encoding="utf-8")
@@ -269,6 +323,10 @@ def main() -> int:
             args.width,
             args.height,
             renderer=args.renderer,
+            sim_day=args.sim_day,
+            seed=args.seed,
+            size=args.size,
+            civ_count=args.civ_count,
         )
         write_manifest(
             args.manifest.resolve(),
@@ -279,6 +337,7 @@ def main() -> int:
             args.civ_count,
             args.width,
             args.height,
+            sim_day=args.sim_day,
         )
     finally:
         if bridge.poll() is None:
