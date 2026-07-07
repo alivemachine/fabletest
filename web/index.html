@@ -407,13 +407,16 @@ async function loadGodotShots(){
     if (!res.ok) throw new Error("manifest missing");
     const man = await res.json();
     const shots = Array.isArray(man.screenshots) ? man.screenshots : [];
+    // Frames keep the same filenames across regenerations, so pin each image
+    // to this manifest's generation stamp or the browser serves stale art.
+    const gen = encodeURIComponent(man.generated_at || Date.now());
     godotShotsGrid.innerHTML = "";
     for (const item of shots){
       const card = document.createElement("article");
       card.className = "godot-card";
       const img = document.createElement("img");
       img.loading = "lazy";
-      img.src = "godot_frames/" + item.file;
+      img.src = "godot_frames/" + item.file + "?v=" + gen;
       img.alt = "Godot screenshot " + item.file;
       const cap = document.createElement("div");
       cap.className = "cap";
@@ -439,7 +442,7 @@ const texSearch = document.getElementById("texSearch");
 const texSubject = document.getElementById("texSubject");
 const texMore = document.getElementById("texMore");
 const TEX_PAGE = 120;
-let texAssets = [], texMatches = [], texShown = 0;
+let texAssets = [], texMatches = [], texShown = 0, texGen = "";
 
 async function loadTexGallery(){
   if (!texGrid) return;
@@ -448,6 +451,9 @@ async function loadTexGallery(){
     if (!res.ok) throw new Error("index missing");
     const idx = await res.json();
     texAssets = Array.isArray(idx.assets) ? idx.assets : [];
+    // Same keys keep the same filenames when regenerated (e.g. placeholder
+    // art upgraded to real SDXL art), so version the image URLs too.
+    texGen = encodeURIComponent(idx.generated_at || Date.now());
     const subjects = [...new Set(texAssets.map(a => a.subject))].sort();
     for (const s of subjects){
       const o = document.createElement("option");
@@ -481,7 +487,7 @@ function texRenderMore(){
     for (const f of a.files){
       const img = document.createElement("img");
       img.loading = "lazy";
-      img.src = "textures/img/" + f;
+      img.src = "textures/img/" + f + "?v=" + texGen;
       img.alt = a.key;
       vars.append(img);
     }
