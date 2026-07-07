@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import itertools
 import json
 import shutil
 from pathlib import Path
@@ -53,7 +54,20 @@ def make_backend(name: str) -> texgen.Backend | None:
     raise SystemExit(f"unknown backend {name!r}")
 
 
-def populate(svc: texgen.TextureService, seed: int, size: int) -> None:
+def reset_stranded(svc: texgen.TextureService) -> None:
+    """A killed run leaves keys stuck in 'generating'; nothing is running
+    when this script starts, so put them back to 'pending' for re-queueing."""
+    with svc.store.lock:
+        n = svc.store.db.execute(
+            "UPDATE assets SET status='pending' WHERE status='generating'"
+        ).rowcount
+        svc.store.db.commit()
+    if n:
+        print(f"reset {n} stranded 'generating' key(s) to pending")
+
+
+def populate(svc: texgen.TextureService, seed: int, size: int,
+             concurrency: int = 1) -> None:
     world = wc.build_world(seed, size, 3)
     sea, thr = 0.42, wc.default_river_threshold(size)
     for label, zoom, t in VIEWS:
@@ -62,8 +76,16 @@ def populate(svc: texgen.TextureService, seed: int, size: int) -> None:
         df = texgen.derive(chunk, st)
         svc.resolve_field(df)
         print(f"[{label}] -> {len(df.legend)} distinct keys")
-    ran = svc.pump()
-    print(f"generated {ran} assets via '{svc.backend.name}' backend")
+
+    total = svc._queue.qsize()
+    done = itertools.count(1)
+
+    def progress(key: str) -> None:
+        print(f"[{next(done)}/{total}] {key}", flush=True)
+
+    ran = svc.pump(concurrency=concurrency, progress=progress)
+    print(f"generated {ran} assets via '{svc.backend.name}' backend "
+          f"(concurrency={concurrency})")
 
 
 def export(svc: texgen.TextureService, out_dir: Path) -> int:
@@ -130,10 +152,16 @@ def main() -> int:
     ap.add_argument(
         "--backend", default="placeholder", choices=["placeholder", "runpod-comfyui"]
     )
+    ap.add_argument(
+        "--concurrency", type=int, default=1,
+        help="generation jobs to keep in flight at once (lets several "
+             "RunPod workers run in parallel)",
+    )
     args = ap.parse_args()
 
     svc = texgen.TextureService(args.store, backend=make_backend(args.backend))
-    populate(svc, args.seed, args.size)
+    reset_stranded(svc)
+    populate(svc, args.seed, args.size, concurrency=args.concurrency)
     n = export(svc, args.out.resolve())
     print(f"exported {n} assets -> {args.out}/index.json")
     return 0

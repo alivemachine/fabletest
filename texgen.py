@@ -1486,18 +1486,37 @@ class TextureService:
     def pending_count(self) -> int:
         return self._queue.qsize()
 
-    def pump(self, max_jobs: int | None = None) -> int:
+    def pump(self, max_jobs: int | None = None, concurrency: int = 1,
+             progress=None) -> int:
         """Run queued generation jobs synchronously (tests, demos, batch
-        pre-warming). Returns how many jobs ran."""
-        ran = 0
-        while max_jobs is None or ran < max_jobs:
+        pre-warming). Returns how many jobs ran.
+
+        concurrency > 1 keeps that many jobs in flight at once — with a
+        remote backend this is what lets several RunPod workers generate in
+        parallel (the store is lock-protected and each key writes its own
+        directory, so _run_job is safe to run from a thread pool).
+        progress, if given, is called as progress(key) after each job."""
+        keys = []
+        while max_jobs is None or len(keys) < max_jobs:
             try:
                 _, _, key = self._queue.get_nowait()
             except queue.Empty:
                 break
+            keys.append(key)
+
+        def run(key):
             self._run_job(key)
-            ran += 1
-        return ran
+            if progress:
+                progress(key)
+
+        if concurrency <= 1:
+            for key in keys:
+                run(key)
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=concurrency) as ex:
+                list(ex.map(run, keys))
+        return len(keys)
 
     def start_worker(self):
         if self._worker and self._worker.is_alive():

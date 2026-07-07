@@ -292,6 +292,27 @@ def test_runpod_backend_dry_run_works_without_credentials():
     assert len(out) == 2 and all(isinstance(x, bytes) for x in out)
 
 
+def test_pump_concurrent_generates_all_queued():
+    root = tempfile.mkdtemp(prefix="texsvc_")
+    try:
+        svc = tg.TextureService(root, backend=tg.PlaceholderBackend())
+        descs = [
+            tg.descriptor("tree.oak", lod="single", season=s, tod="day",
+                          temp="mild", growth="mature", cond="pristine")
+            for s in ("spring", "summer", "autumn", "winter")
+        ]
+        for d in descs:
+            svc.resolve(d)
+        seen = []
+        ran = svc.pump(concurrency=3, progress=seen.append)
+        assert ran == 4 and sorted(seen) == sorted(d.key for d in descs)
+        for d in descs:
+            r = svc.resolve(d, enqueue=False)
+            assert r.status == "ready" and r.served == "exact"
+    finally:
+        shutil.rmtree(root)
+
+
 def test_civitai_lora_download_support_dry_run_path():
     assert tg.civitai_lora_download_url(
         "https://civitai.com/models/118775/stylized-setting-isometric-sdxl-and-sd15"
