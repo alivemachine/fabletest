@@ -182,6 +182,12 @@ class WorldBridge:
                                        G = vegetation (live)
                                        B = flow direction (0-255 → 0-TAU)
                                        A = flow speed (0=still)
+        detail_map  (N×N×4 uint8)  — per-tile ecology/climate channels for
+                                     sprite variation (v4):
+                                       R = herbivore density
+                                       G = predator density
+                                       B = temperature
+                                       A = cloud cover (light attenuation on sprites)
         """
         fields = self._payload_fields(ws, st)
 
@@ -231,22 +237,30 @@ class WorldBridge:
         data[..., 2] = fields["flow_dir"].reshape(n, n)
         data[..., 3] = fields["flow_speed"].reshape(n, n)
 
+        # --- detail_map: R=herbivore G=predator B=temperature A=cloud cover
+        detail = np.zeros((n, n, 4), np.uint8)
+        detail[..., 0] = fields["fauna_herb"].reshape(n, n)
+        detail[..., 1] = fields["fauna_pred"].reshape(n, n)
+        detail[..., 2] = fields["temperature"].reshape(n, n)
+        detail[..., 3] = _q_u8_array(st["clouds"]).reshape(n, n)
+
         return {
             "color_map": np.ascontiguousarray(color_map),
             "property_map": np.ascontiguousarray(prop),
             "data_map": np.ascontiguousarray(data),
+            "detail_map": np.ascontiguousarray(detail),
         }
 
     def _payload_binary(self, ws: wc.WorldSlice, st: dict[str, Any], target_tiles: int) -> bytes:
         bitmaps = self._bitmap_payload(ws, st)
-        # Header: magic "FTB1", version=3, then same geometry fields as before.
+        # Header: magic "FTB1", version=4, then same geometry fields as before.
         # sea_level (not sea_eff) is the stable geographic baseline Godot uses
         # for column-height calculation — tide only affects the waterline flag
         # already baked into property_map.G.
         header = struct.pack(
             "<4sHHIHHfffffffBBH",
             b"FTB1",
-            3,
+            4,
             int(ws.size),
             int(self.seed),
             int(self.size),
@@ -267,6 +281,7 @@ class WorldBridge:
             bitmaps["color_map"].tobytes(),     # N*N*3 bytes
             bitmaps["property_map"].tobytes(),  # N*N*4 bytes
             bitmaps["data_map"].tobytes(),      # N*N*4 bytes
+            bitmaps["detail_map"].tobytes(),    # N*N*4 bytes
         ])
 
     def snapshot(self, *, seed: int | None = None, size: int | None = None,
