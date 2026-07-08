@@ -55,13 +55,13 @@ jobs:
           python-version: "3.12"
 
       - name: Install Python deps
-        run: pip install numpy pillow
+        run: pip install "numpy>=1.26,<3" "pillow>=10,<12"
 
       # ── Step 1: Supabase connection check ──────────────────────────────────
       - name: Check Supabase connection
         run: python supabase_store.py check
 
-      # ── Step 2: RunPod smoke test (one texture, saves PNG to smoke_out/) ───
+      # ── Step 2: RunPod smoke test (one texture, saves PNG to runpod_smoke_out/) ──
       - name: RunPod smoke test
         run: python runpod_smoke.py
 
@@ -94,6 +94,6 @@ jobs:
             echo "config.json unchanged — no commit needed."
           else
             git commit -m "Update web/textures/config.json (Supabase bucket URL)"
-            git pull --rebase origin "$GITHUB_REF_NAME"
+            git pull --rebase origin "${{ github.ref_name }}"
             git push
           fi
