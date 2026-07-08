@@ -1,4 +1,8 @@
 exports/
 __pycache__/
+texture_store/
 world_*.png
 pyodide-0.26.4.tar.bz2
+texture_store_runpod/
+runpod_smoke_out/
+runpod_fullrun.log

@@ -1,0 +1,81 @@
+name: Generate Godot screenshots
+
+# Renders Full HD screenshots of the Godot client (against the live Python
+# bridge) with Mesa software GL under xvfb, then commits the frames +
+# manifest to web/godot_frames/ so the Pages gallery can show them.
+
+on:
+  workflow_dispatch:
+    inputs:
+      shots:
+        description: Number of screenshots
+        default: "10"
+      seed:
+        description: World seed
+        default: "42"
+      sim_day:
+        description: Sim day to render (N.5 = noon, 96 days/year)
+        default: "1152.5"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: screenshots-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  screenshots:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GODOT_VERSION: "4.3"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python deps
+        run: pip install numpy
+
+      - name: Install xvfb + Mesa software GL
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xvfb mesa-utils libgl1 libegl1
+
+      - name: Download Godot ${{ env.GODOT_VERSION }}
+        run: |
+          curl -sSL -o godot.zip \
+            "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip"
+          unzip -q godot.zip
+          mv "Godot_v${GODOT_VERSION}-stable_linux.x86_64" godot-bin
+          chmod +x godot-bin
+          ./godot-bin --version
+
+      - name: Generate screenshots
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: |
+          xvfb-run -a -s "-screen 0 1920x1080x24" \
+            python3 generate_godot_screenshots.py \
+              --godot-bin ./godot-bin \
+              --renderer opengl3 \
+              --shots "${{ github.event.inputs.shots || '10' }}" \
+              --seed "${{ github.event.inputs.seed || '42' }}" \
+              --sim-day "${{ github.event.inputs.sim_day || '1152.5' }}"
+
+      - name: Commit frames + manifest
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add web/godot_frames
+          if git diff --cached --quiet; then
+            echo "No screenshot changes to commit."
+          else
+            git commit -m "Update Godot screenshot gallery frames"
+            # The branch may have moved while we rendered; replay on top.
+            git pull --rebase origin "$GITHUB_REF_NAME"
+            git push
+          fi

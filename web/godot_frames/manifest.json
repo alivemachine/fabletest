@@ -1,0 +1,71 @@
+{
+  "generated_at": "2026-07-07T16:58:56.876Z",
+  "seed": 42,
+  "size": 192,
+  "civ_count": 3,
+  "width": 1920,
+  "height": 1080,
+  "sim_day": 1152.5,
+  "screenshots": [
+    {
+      "file": "frame_00.png",
+      "kind": "near_settlement",
+      "cx": 0.551092,
+      "cy": 0.369048
+    },
+    {
+      "file": "frame_01.png",
+      "kind": "random",
+      "cx": 0.253617,
+      "cy": 0.688899
+    },
+    {
+      "file": "frame_02.png",
+      "kind": "near_settlement",
+      "cx": 0.891907,
+      "cy": 0.419004
+    },
+    {
+      "file": "frame_03.png",
+      "kind": "near_settlement",
+      "cx": 0.549625,
+      "cy": 0.374312
+    },
+    {
+      "file": "frame_04.png",
+      "kind": "random",
+      "cx": 0.32977,
+      "cy": 0.331765
+    },
+    {
+      "file": "frame_05.png",
+      "kind": "random",
+      "cx": 0.215716,
+      "cy": 0.863974
+    },
+    {
+      "file": "frame_06.png",
+      "kind": "near_settlement",
+      "cx": 0.045471,
+      "cy": 0.464804
+    },
+    {
+      "file": "frame_07.png",
+      "kind": "near_settlement",
+      "cx": 0.06455,
+      "cy": 0.446742
+    },
+    {
+      "file": "frame_08.png",
+      "kind": "random",
+      "cx": 0.829226,
+      "cy": 0.108878
+    },
+    {
+      "file": "frame_09.png",
+      "kind": "random",
+      "cx": 0.285485,
+      "cy": 0.495928
+    }
+  ]
+}

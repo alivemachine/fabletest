@@ -211,7 +211,9 @@ def _splat_thin(alpha, disc, carve, segs, size):
     whole network instead of a Python loop per segment."""
     X0, Y0, X1, Y1, A, V, D, W = (np.concatenate(s) for s in zip(*segs))
     L = np.hypot(X1 - X0, Y1 - Y0)
-    m = np.maximum(1, np.ceil(L / 0.6).astype(np.int32))
+    # np.intp, not int64: under Pyodide (wasm32) numpy's index type is int32
+    # and repeat/fancy-index with int64 raises a safe-cast TypeError
+    m = np.maximum(1, np.ceil(L / 0.6).astype(np.intp))
     eid = np.repeat(np.arange(m.size), m)
     base = np.repeat(np.cumsum(m) - m, m)
     t = (np.arange(eid.size) - base + 0.5) / m[eid]
@@ -219,8 +221,8 @@ def _splat_thin(alpha, disc, carve, segs, size):
     ys = Y0[eid] + t * (Y1 - Y0)[eid]
     av, vv = A[eid], V[eid]
     dv, thin = D[eid], (W[eid] <= 1.5)
-    xi = np.floor(xs - 0.5).astype(np.int64)
-    yi = np.floor(ys - 0.5).astype(np.int64)
+    xi = np.floor(xs - 0.5).astype(np.intp)
+    yi = np.floor(ys - 0.5).astype(np.intp)
     fx, fy = xs - 0.5 - xi, ys - 0.5 - yi
     af, df_, cf = alpha.reshape(-1), disc.reshape(-1), carve.reshape(-1)
     for ddx, ddy in ((0, 0), (1, 0), (0, 1), (1, 1)):
@@ -675,6 +677,27 @@ def fauna_field(flora, t):
 CLOUD_WIND1_X = 1.0 / 6.0
 CLOUD_WIND2_X = 1.0 / 11.0
 CLOUD_WIND2_Y = 1.0 / 40.0
+# Clouds are a soft, blurred cover mask, so the noise is sampled on a grid this
+# many times coarser than the render and bilinear-upscaled. The dropped octaves
+# are finer than the mask's own blur (invisible), and it cuts the per-frame
+# noise-hash cost — the dominant animation cost — by ~this factor squared.
+CLOUD_DOWNSCALE = 4
+CLOUD_MIN_RES = 24
+
+
+def _bilinear_upsample(a, size):
+    """Upscale a small (h, h) float field to (size, size), bilinear, align-corners.
+    Separable: interpolate rows then columns. Returns float32."""
+    h = a.shape[0]
+    if h >= size:
+        return a.astype(np.float32)
+    t = np.linspace(0.0, h - 1.0, size, dtype=np.float32)
+    i0 = np.floor(t).astype(np.int64)
+    i1 = np.minimum(i0 + 1, h - 1)
+    f = (t - i0).astype(np.float32)
+    rows = a[i0] * (1.0 - f)[:, None] + a[i1] * f[:, None]        # (size, h)
+    return (rows[:, i0] * (1.0 - f)[None, :]
+            + rows[:, i1] * f[None, :]).astype(np.float32)         # (size, size)
 
 
 def clouds_field(ws, t):
@@ -682,14 +705,21 @@ def clouds_field(ws, t):
     different speeds. Pure, seekable function of t, fully decoupled from the
     terrain below — no moisture gating, no orographic (slope) term, just a mask
     that moves. Re-sampled per frame at time-advected WORLD centers, so the
-    cover stays coherent under pan/zoom in both the browser console and Godot."""
+    cover stays coherent under pan/zoom in both the browser console and Godot.
+
+    Computed on a downscaled grid and bilinear-upsampled: the mask is soft
+    enough that the finest octaves never show, and the noise hash — the hot
+    spot of the whole animation loop — runs on ~CLOUD_DOWNSCALE² fewer pixels."""
     size = ws.elev.shape[0]
+    cs = max(CLOUD_MIN_RES, -(-size // CLOUD_DOWNSCALE))    # ceil(size / scale)
+    cs = min(cs, size)
     c1 = _cloud_sheet(ws.seed + 4001, ws.cx - t * CLOUD_WIND1_X, ws.cy,
-                      ws.span, size, 4)
+                      ws.span, cs, 4)
     c2 = _cloud_sheet(ws.seed + 8009, ws.cx - t * CLOUD_WIND2_X,
-                      ws.cy - t * CLOUD_WIND2_Y, ws.span, size, 3)
+                      ws.cy - t * CLOUD_WIND2_Y, ws.span, cs, 3)
     sheet = 0.6 * c1 + 0.4 * c2
-    return smoothstep((sheet - 0.46) / 0.30).astype(np.float32)
+    mask = smoothstep((sheet - 0.46) / 0.30)
+    return _bilinear_upsample(mask, size)
 
 
 # ===========================================================================
@@ -1692,11 +1722,18 @@ def colorize(st, layer):
     if layer == "elevation":
         img = np.empty(e.shape + (3,), np.float32)
         sea_m = e < sea_eff
+        # Depth gradient: 0 at seabed, 1 at surface.  Scale the whole palette
+        # by sea_eff so a higher tide surface sits visually higher in the
+        # 0-1 elevation range (brighter = more elevated water surface).
         f = np.clip(e / max(sea_eff, 1e-6), 0, 1)
-        img[..., 0] = 16 + 70 * f
-        img[..., 1] = 34 + 106 * f
-        img[..., 2] = 78 + 108 * f
-        g = np.clip((e - sea_level) / max(1 - sea_level, 1e-6), 0, 1)
+        tide_bright = np.clip(sea_eff / 0.42, 0.5, 1.5)  # 0.42 = nominal sea level
+        img[..., 0] = (16 + 70 * f) * tide_bright
+        img[..., 1] = (34 + 106 * f) * tide_bright
+        img[..., 2] = (78 + 108 * f) * tide_bright
+        # Land gradient anchored to sea_eff (not the static sea_level slider)
+        # so that newly exposed or newly submerged cells show their true
+        # elevation relative to the CURRENT waterline, not mean sea level.
+        g = np.clip((e - sea_eff) / max(1 - sea_eff, 1e-6), 0, 1)
         land_rgb = color_ramp(g, [0.0, 0.55, 1.0],
                               [(88, 140, 80), (168, 150, 96), (245, 245, 248)])
         img[~sea_m] = land_rgb[~sea_m]

@@ -20,6 +20,9 @@ header{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;
   padding:12px 16px;border-bottom:1px solid var(--line);background:var(--panel)}
 .nameplate{font-size:12px;letter-spacing:.22em;text-transform:uppercase;font-weight:700}
 .clock{margin-left:auto;font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap}
+.jump{font-size:10.5px;letter-spacing:.08em;color:var(--muted)}
+.jump a{color:var(--accent);text-decoration:none}
+.jump a:hover{text-decoration:underline}
 .clock b{color:var(--ink)}
 
 main{max-width:1060px;margin:0 auto;padding:14px;display:grid;gap:14px;grid-template-columns:1fr}
@@ -68,11 +71,39 @@ input[type=number],select{background:var(--panel2);border:1px solid var(--line);
 .note{font-size:10.5px;color:var(--muted);margin:8px 0 0;line-height:1.5}
 progress{width:100%;height:6px;accent-color:var(--accent);display:none;margin-top:8px}
 progress.on{display:block}
+
+.godot-gallery{max-width:1060px;margin:0 auto;padding:0 14px 20px}
+.godot-gallery h2{margin:0 0 8px;font-size:11px;letter-spacing:.2em;text-transform:uppercase;color:var(--muted)}
+.godot-meta{font-size:11px;color:var(--muted);margin:0 0 10px}
+.godot-grid{display:grid;gap:8px;grid-template-columns:repeat(auto-fill,minmax(170px,1fr))}
+.godot-card{background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:6px}
+.godot-card img{display:block;width:100%;aspect-ratio:16/9;object-fit:cover;border-radius:2px;background:#000}
+.godot-card .cap{margin-top:6px;font-size:10.5px;color:var(--muted);letter-spacing:.05em}
+
+.tex-gallery{max-width:1060px;margin:0 auto;padding:0 14px 28px}
+.tex-gallery h2{margin:0 0 8px;font-size:11px;letter-spacing:.2em;text-transform:uppercase;color:var(--muted)}
+.tex-meta{font-size:11px;color:var(--muted);margin:0 0 10px}
+.tex-controls{display:flex;gap:8px;margin:0 0 10px;flex-wrap:wrap}
+.tex-controls input,.tex-controls select{background:var(--panel2);color:inherit;
+  border:1px solid var(--line);border-radius:4px;padding:7px 8px;font-size:12px}
+.tex-controls input{flex:1;min-width:180px}
+.tex-grid{display:grid;gap:8px;grid-template-columns:repeat(auto-fill,minmax(200px,1fr))}
+.tex-card{background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:6px}
+.tex-card .vars{display:flex;gap:4px}
+.tex-card .vars img{display:block;width:100%;min-width:0;aspect-ratio:1/1;object-fit:cover;
+  border-radius:2px;background:#000;image-rendering:pixelated}
+.tex-card .cap{margin-top:6px;font-size:10px;color:var(--muted);letter-spacing:.03em;
+  word-break:break-all;line-height:1.45}
+.tex-more{margin-top:10px}
 </style>
 </head>
 <body>
 <header>
   <div class="nameplate">World Engine</div>
+  <nav class="jump">
+    <a href="#godot-gallery">godot snapshots</a> ·
+    <a href="#texture-gallery">generated textures</a>
+  </nav>
   <div class="clock" id="clock">loading…</div>
 </header>
 
@@ -144,6 +175,23 @@ progress.on{display:block}
   </aside>
 </main>
 
+<section class="godot-gallery" id="godot-gallery">
+  <h2>Godot client snapshots (auto-generated)</h2>
+  <p class="godot-meta" id="godotShotsMeta">Run <code>python3 generate_godot_screenshots.py</code> after Python or Godot changes to refresh these images.</p>
+  <div class="godot-grid" id="godotShotsGrid"></div>
+</section>
+
+<section class="tex-gallery" id="texture-gallery">
+  <h2>Generated textures (tag-driven pipeline)</h2>
+  <p class="tex-meta" id="texMeta">Run <code>python3 export_texture_gallery.py</code> to refresh this set. Each row of images is one canonical key's variations.</p>
+  <div class="tex-controls">
+    <input type="search" id="texSearch" placeholder="filter keys… e.g. winter, tree.oak, scorched">
+    <select id="texSubject"><option value="">all subjects</option></select>
+  </div>
+  <div class="tex-grid" id="texGrid"></div>
+  <button class="btn tex-more" id="texMore" hidden>show more</button>
+</section>
+
 <script>
 "use strict";
 /* All world math is Python (worldgen.py + world_core.py) running in Pyodide.
@@ -172,6 +220,8 @@ const view = document.getElementById("view"), vctx = view.getContext("2d");
 const viewwrap = document.getElementById("viewwrap");
 const busysub = document.getElementById("busysub"), busy = document.getElementById("busy");
 const hud = document.getElementById("hud"), clock = document.getElementById("clock");
+const godotShotsGrid = document.getElementById("godotShotsGrid");
+const godotShotsMeta = document.getElementById("godotShotsMeta");
 
 // thumbnails
 const THUMB_STRIDE_TARGET = 72;
@@ -190,7 +240,7 @@ for (const [key, name] of LAYERS){
 function syncSel(){ for (const [k] of LAYERS) thumbs[k].btn.classList.toggle("active", k === S.layer); }
 
 // ---------- pyodide bootstrap ----------
-let py = null, pyRender = null, pyBuild = null, pyView = null, pyEco = null, pyEcoReset = null;
+let py = null, pyRender = null, pyBuild = null, pyView = null, pyEco = null, pyEcoReset = null, pyThumbs = null;
 
 function loadScript(src){
   return new Promise((resolve, reject) => {
@@ -215,7 +265,7 @@ async function ensurePyodide(){
 }
 
 async function fetchSource(name){
-  const paths = [`${name}?v=9`, `../${name}?v=9`];
+  const paths = [`${name}?v=10`, `../${name}?v=10`];
   for (const path of paths){
     const res = await fetch(path);
     if (res.ok) return await res.text();
@@ -234,6 +284,7 @@ async function boot(){
     pyodide.FS.writeFile(f, src);
   }
   pyodide.runPython(`
+import numpy as np
 import world_core as wc
 
 _state = {}
@@ -257,6 +308,23 @@ def eco_reset():
 def render_rgba(which, layer, t, sea, thr, season, tide, daynight):
     return wc.render_rgba_bytes(_state[which], layer, float(t), float(sea),
                                 float(thr), float(season), float(tide), float(daynight))
+
+_THUMB_LAYERS = [k for k, _ in wc.LAYERS]   # canonical order (matches JS LAYERS)
+
+def render_thumbs(t, sea, thr, season, tide, daynight):
+    # All 12 thumbnails share ONE state() computation (clouds, lighting, biome,
+    # etc. are the expensive shared fields); only the thin per-layer colorize
+    # runs 12x. Packed as (w, RGBA bytes for all layers, contiguous) so the
+    # whole strip crosses into JS in a single call.
+    ws = _state["thumb"]
+    st = wc.state(ws, float(t), float(sea), float(thr),
+                  float(season), float(tide), float(daynight))
+    w = st["e"].shape[0]
+    buf = np.empty((len(_THUMB_LAYERS), w, w, 4), np.uint8)
+    for i, layer in enumerate(_THUMB_LAYERS):
+        buf[i, ..., :3] = wc.colorize(st, layer)
+        buf[i, ..., 3] = 255
+    return w, buf.tobytes()
 `);
   py = pyodide;
   pyBuild = pyodide.globals.get("build");
@@ -264,6 +332,7 @@ def render_rgba(which, layer, t, sea, thr, season, tide, daynight):
   pyView = pyodide.globals.get("set_view");
   pyEco = pyodide.globals.get("eco_step");
   pyEcoReset = pyodide.globals.get("eco_reset");
+  pyThumbs = pyodide.globals.get("render_thumbs");
   busysub.textContent = "generating world…";
   await new Promise(r => setTimeout(r, 20));
   rebuild();
@@ -292,17 +361,9 @@ function blit(which, layer, t, canvas, ctx){
   ctx.putImageData(new ImageData(arr, w, w), 0, 0);
 }
 
-let frameCount = 0;
-function draw(){
-  blit("view", S.layer, S.t, view, vctx);       // main = the (maybe zoomed) window
-  // thumbs stay whole-planet overviews; refresh half per frame while playing
-  for (let i = 0; i < LAYERS.length; i++){
-    if (S.playing && (i + frameCount) % 2 !== 0) continue;
-    const key = LAYERS[i][0];
-    const c = thumbs[key].canvas;
-    blit("thumb", key, S.t, c, c.getContext("2d"));
-  }
-  frameCount++;
+// The main (maybe-zoomed) window: the only thing pan/zoom changes.
+function drawView(){
+  blit("view", S.layer, S.t, view, vctx);
   const day = S.t % YEAR, year = Math.floor(S.t / YEAR);
   const name = LAYERS.find(l => l[0] === S.layer)[1];
   clock.innerHTML = "<b>day " + day.toFixed(1) + "</b> · year " + year + " · seed " + S.seed;
@@ -310,14 +371,158 @@ function draw(){
   hud.textContent = "seed " + S.seed + " · " + S.size + "² · " + name.toLowerCase()
                   + (S.zoom > 1 ? " · ×" + z : "");
 }
-function drawIfPaused(){ if (!S.playing && py) draw(); }
+
+// Thumbnails are whole-planet overviews: independent of pan/zoom, and only the
+// clock (t) and the climate sliders change them. So they share ONE state()
+// computation across all 12 layers (Python side) and refresh at their own slow
+// cadence — never per pan frame, and at most ~5/s while playing.
+const THUMB_MS = 190;
+let lastThumbAt = -1e9;
+function drawThumbs(force){
+  if (!py) return;
+  const now = performance.now();
+  if (!force && S.playing && now - lastThumbAt < THUMB_MS) return;
+  lastThumbAt = now;
+  const res = pyThumbs(S.t, S.seaLevel, S.riverThr, S.seasonAmp, S.tideAmp, S.dayNight);
+  const [w, bytes] = res.toJs();
+  res.destroy();
+  const stride = w * w * 4;
+  const all = new Uint8ClampedArray(bytes.length);
+  all.set(bytes);                                 // `bytes` may view the wasm heap
+  for (let i = 0; i < LAYERS.length; i++){
+    const c = thumbs[LAYERS[i][0]].canvas;
+    if (c.width !== w){ c.width = w; c.height = w; }
+    const px = new Uint8ClampedArray(all.subarray(i * stride, (i + 1) * stride));
+    c.getContext("2d").putImageData(new ImageData(px, w, w), 0, 0);
+  }
+}
+
+function draw(){ drawView(); drawThumbs(false); }
+function drawIfPaused(){ if (!S.playing && py){ drawView(); drawThumbs(true); } }
+
+async function loadGodotShots(){
+  if (!godotShotsGrid || !godotShotsMeta) return;
+  try {
+    const res = await fetch("godot_frames/manifest.json?v=" + Date.now());
+    if (!res.ok) throw new Error("manifest missing");
+    const man = await res.json();
+    const shots = Array.isArray(man.screenshots) ? man.screenshots : [];
+    // Frames keep the same filenames across regenerations, so pin each image
+    // to this manifest's generation stamp or the browser serves stale art.
+    const gen = encodeURIComponent(man.generated_at || Date.now());
+    godotShotsGrid.innerHTML = "";
+    for (const item of shots){
+      const card = document.createElement("article");
+      card.className = "godot-card";
+      const img = document.createElement("img");
+      img.loading = "lazy";
+      img.src = "godot_frames/" + item.file + "?v=" + gen;
+      img.alt = "Godot screenshot " + item.file;
+      const cap = document.createElement("div");
+      cap.className = "cap";
+      cap.textContent = shotCaption(item);
+      card.append(img, cap);
+      godotShotsGrid.append(card);
+    }
+    godotShotsMeta.textContent = `Last generated ${man.generated_at || "unknown"} · ${shots.length} frame(s) · ${man.width || 0}x${man.height || 0}`;
+  } catch (_err) {
+    godotShotsMeta.textContent = "No generated Godot screenshots yet. Run python3 generate_godot_screenshots.py.";
+    godotShotsGrid.innerHTML = "";
+  }
+}
+
+function shotCaption(item){
+  return `${item.kind || "random"} · (${Number(item.cx).toFixed(3)}, ${Number(item.cy).toFixed(3)})`;
+}
+
+/* ---- generated-texture browser (static export of the texgen store) ---- */
+const texGrid = document.getElementById("texGrid");
+const texMeta = document.getElementById("texMeta");
+const texSearch = document.getElementById("texSearch");
+const texSubject = document.getElementById("texSubject");
+const texMore = document.getElementById("texMore");
+const TEX_PAGE = 120;
+let texAssets = [], texMatches = [], texShown = 0, texGen = "", texBase = "textures";
+
+async function loadTexGallery(){
+  if (!texGrid) return;
+  try {
+    // textures/config.json (written by export_texture_gallery.py --publish
+    // supabase) points at the Supabase bucket holding the full texture
+    // database; without it we use the files committed next to the page.
+    try {
+      const cfg = await fetch("textures/config.json?v=" + Date.now());
+      if (cfg.ok) {
+        const c = await cfg.json();
+        if (c.base_url) texBase = c.base_url;
+      }
+    } catch (_e) { /* no config -> local files */ }
+    const res = await fetch(texBase + "/index.json?v=" + Date.now());
+    if (!res.ok) throw new Error("index missing");
+    const idx = await res.json();
+    if (idx.base_url) texBase = idx.base_url;
+    texAssets = Array.isArray(idx.assets) ? idx.assets : [];
+    // Same keys keep the same filenames when regenerated (e.g. placeholder
+    // art upgraded to real SDXL art), so version the image URLs too.
+    texGen = encodeURIComponent(idx.generated_at || Date.now());
+    const subjects = [...new Set(texAssets.map(a => a.subject))].sort();
+    for (const s of subjects){
+      const o = document.createElement("option");
+      o.value = s; o.textContent = s;
+      texSubject.append(o);
+    }
+    texMeta.textContent = `${texAssets.length} generated keys · backend ${texAssets[0]?.backend || "?"} · exported ${idx.generated_at || "unknown"}`;
+    texFilter();
+  } catch (_err) {
+    texMeta.textContent = "No exported textures yet. Run python3 export_texture_gallery.py.";
+  }
+}
+
+function texFilter(){
+  const q = (texSearch.value || "").trim().toLowerCase();
+  const subj = texSubject.value;
+  texMatches = texAssets.filter(a =>
+    (!subj || a.subject === subj) && (!q || a.key.toLowerCase().includes(q)));
+  texGrid.innerHTML = "";
+  texShown = 0;
+  texRenderMore();
+}
+
+function texRenderMore(){
+  const slice = texMatches.slice(texShown, texShown + TEX_PAGE);
+  for (const a of slice){
+    const card = document.createElement("article");
+    card.className = "tex-card";
+    const vars = document.createElement("div");
+    vars.className = "vars";
+    for (const f of a.files){
+      const img = document.createElement("img");
+      img.loading = "lazy";
+      img.src = texBase + "/img/" + f + "?v=" + texGen;
+      img.alt = a.key;
+      vars.append(img);
+    }
+    const cap = document.createElement("div");
+    cap.className = "cap";
+    cap.textContent = a.key;
+    card.append(vars, cap);
+    texGrid.append(card);
+  }
+  texShown += slice.length;
+  texMore.hidden = texShown >= texMatches.length;
+  texMore.textContent = `show more (${texMatches.length - texShown} left)`;
+}
+
+if (texSearch) texSearch.addEventListener("input", texFilter);
+if (texSubject) texSubject.addEventListener("change", texFilter);
+if (texMore) texMore.addEventListener("click", texRenderMore);
 
 let last = null;
 function loop(now){
   if (S.viewDirty && py && !S.exporting){       // pan/zoom -> re-sample window
     pyView(S.cx, S.cy, S.zoom);
     S.viewDirty = false;
-    if (!S.playing) draw();
+    if (!S.playing) drawView();                  // thumbs are unaffected by pan
   }
   if (S.playing && !S.exporting){
     if (last != null){
@@ -546,6 +751,8 @@ boot().catch(err => {
   busy.firstChild.textContent = "FAILED TO LOAD";
   busysub.textContent = String(err);
 });
+loadGodotShots();
+loadTexGallery();
 </script>
 </body>
 </html>
