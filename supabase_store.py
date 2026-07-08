@@ -35,7 +35,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-DEFAULT_BUCKET = "textures"
+DEFAULT_BUCKET = "worldengine"
 
 
 class SupabaseStorage:
