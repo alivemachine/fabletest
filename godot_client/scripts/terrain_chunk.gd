@@ -147,10 +147,97 @@ var _snapshot_serial := 0
 var _mesh_serial := 0
 var _mesh_rebuild_pending := false
 
+# AI texture overlay
+var _tex_db = null
+var _ai_layer: Node2D = null
+var _tile_polys: Dictionary = {}        # Vector2i -> Polygon2D
+var _subject_hash_cache: Dictionary = {}  # subject -> first hash
+
 
 func _ready() -> void:
 	_build_palette_index()
 	_setup_mesh_renderer()
+
+
+func set_tex_db(db) -> void:
+	_tex_db = db
+	if _ai_layer == null:
+		_ai_layer = Node2D.new()
+		add_child(_ai_layer)  # Added after _mesh_node so it renders on top
+		if _mesh_node != null:
+			_ai_layer.position = _mesh_node.position
+	_update_ai_layer()
+
+
+func _subject_first_hash(subject: String) -> String:
+	if _subject_hash_cache.has(subject):
+		return _subject_hash_cache[subject]
+	var hashes: Array = _tex_db.hashes_for_subject(subject)
+	var h: String = hashes[0] if not hashes.is_empty() else ""
+	_subject_hash_cache[subject] = h
+	return h
+
+
+func _update_ai_layer() -> void:
+	if _tex_db == null or _ai_layer == null or not _has_payload:
+		return
+	var base_x := _mesh_base.x
+	var base_y := _mesh_base.y
+	var r := render_radius
+	var gn := _grid_n
+	var hw := tile_width * 0.5
+	var hh := tile_height * 0.5
+	var active: Dictionary = {}
+	for oy in range(-r, r + 1):
+		for ox in range(-r, r + 1):
+			var tx := (((base_x + ox) % gn) + gn) % gn
+			var ty_i := (((base_y + oy) % gn) + gn) % gn
+			var tile_k := Vector2i(tx, ty_i)
+			var rec = _tile_cache.get(tile_k, null)
+			if rec == null:
+				continue
+			var env: Dictionary = rec.get("env", {})
+			var biome: String = env.get("biome", env.get("name", ""))
+			if biome.is_empty() or biome == "unknown":
+				continue
+			if env.get("water", false) or env.get("river", false):
+				continue
+			var h := _subject_first_hash("ground." + biome)
+			if h.is_empty():
+				continue
+			active[tile_k] = true
+			var cx := float(ox - oy) * hw
+			var cy_base := float(ox + oy) * hh
+			var hp: float = rec.get("height_px", 0.0)
+			var top_y := cy_base - hp
+			var poly: Polygon2D
+			if _tile_polys.has(tile_k):
+				poly = _tile_polys[tile_k]
+			else:
+				poly = Polygon2D.new()
+				_ai_layer.add_child(poly)
+				_tile_polys[tile_k] = poly
+			poly.polygon = PackedVector2Array([
+				Vector2(cx,      top_y - hh),
+				Vector2(cx + hw, top_y),
+				Vector2(cx,      top_y + hh),
+				Vector2(cx - hw, top_y),
+			])
+			if poly.get_meta("hash", "") != h:
+				poly.set_meta("hash", h)
+				poly.texture = null
+				var cap_poly := poly
+				_tex_db.get_texture(h, 0, func(tex):
+					if tex != null and is_instance_valid(cap_poly):
+						cap_poly.texture = tex
+						var sz: Vector2 = tex.get_size()
+						cap_poly.uv = PackedVector2Array([
+							Vector2(0,     0),
+							Vector2(sz.x,  0),
+							Vector2(sz.x,  sz.y),
+							Vector2(0,     sz.y),
+						])
+				)
 
 
 func _build_palette_index() -> void:
@@ -225,6 +312,7 @@ func _exit_tree() -> void:
 	if _mesh_thread != null:
 		_mesh_thread.wait_to_finish()
 		_mesh_thread = null
+	_tile_polys.clear()
 
 
 func set_focus(uv: Vector2, screen_anchor: Vector2) -> void:
@@ -240,6 +328,8 @@ func set_focus(uv: Vector2, screen_anchor: Vector2) -> void:
 	var dy := f.y - float(_mesh_base.y)
 	_mesh_node.position = Vector2(-(dx - dy) * tile_width * 0.5,
 		-(dx + dy) * tile_height * 0.5)
+	if _ai_layer != null:
+		_ai_layer.position = _mesh_node.position
 	# Trigger an off-thread mesh rebuild when player nears the buffer edge.
 	var cur_ix := int(floor(f.x + 0.5))
 	var cur_iy := int(floor(f.y + 0.5))
@@ -606,6 +696,9 @@ func _upload_mesh(result: Dictionary) -> void:
 	var dy := f.y - float(_mesh_base.y)
 	_mesh_node.position = Vector2(-(dx - dy) * tile_width * 0.5,
 		-(dx + dy) * tile_height * 0.5)
+	if _ai_layer != null:
+		_ai_layer.position = _mesh_node.position
+	_update_ai_layer()
 
 
 func _start_build(payload) -> void:

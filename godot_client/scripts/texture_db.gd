@@ -25,10 +25,17 @@ signal index_failed(reason: String)
 
 const CACHE_ROOT := "user://texture_cache"
 
+const MAX_TEX_CACHE := 200       ## max ImageTexture objects kept in RAM
+const MAX_CONCURRENT := 4       ## max simultaneous HTTP downloads
+
 var base_url := ""
 var generation := ""          ## generated_at stamp of the loaded manifest
 var assets := {}              ## key_hash -> {key, subject, lod, tags, files}
 var _pending := {}            ## url -> [callbacks] (dedupes concurrent asks)
+var _tex_cache := {}          ## fname -> Texture2D (in-memory LRU)
+var _tex_cache_order: Array = []  ## insertion order for LRU eviction
+var _download_queue: Array = []   ## pending {url, cb} when at concurrency limit
+var _active_downloads := 0
 
 func load_index(url: String) -> void:
 	base_url = url.trim_suffix("/")
@@ -57,10 +64,18 @@ func get_texture(key_hash: String, variation: int, cb: Callable) -> void:
 		cb.call(null)
 		return
 	var fname: String = a["files"][variation]
-	var local := _cache_dir() + "/" + fname
-	if FileAccess.file_exists(local):
-		cb.call(_texture_from_file(local))
+	# 1) in-memory cache hit — free and instant
+	if _tex_cache.has(fname):
+		cb.call(_tex_cache[fname])
 		return
+	var local := _cache_dir() + "/" + fname
+	# 2) disk cache hit — load once, store in RAM cache
+	if FileAccess.file_exists(local):
+		var tex := _texture_from_file(local)
+		_cache_tex(fname, tex)
+		cb.call(tex)
+		return
+	# 3) network fetch
 	_fetch(base_url + "/img/" + fname, func(body: PackedByteArray):
 		if body.is_empty():
 			cb.call(null)
@@ -70,7 +85,9 @@ func get_texture(key_hash: String, variation: int, cb: Callable) -> void:
 		if f:
 			f.store_buffer(body)
 			f.close()
-		cb.call(_texture_from_buffer(body))
+		var tex := _texture_from_buffer(body)
+		_cache_tex(fname, tex)
+		cb.call(tex)
 	)
 
 ## Every hash for a subject ("tree.oak", "ground.taiga", ...) — lets game
@@ -78,7 +95,7 @@ func get_texture(key_hash: String, variation: int, cb: Callable) -> void:
 func hashes_for_subject(subject: String) -> Array:
 	var out: Array = []
 	for h in assets:
-		if assets[h]["subject"] == subject:
+		if assets[h].get("subject", "") == subject:
 			out.append(h)
 	return out
 
@@ -117,6 +134,18 @@ func _remove_dir_recursive(path: String) -> void:
 	dir.list_dir_end()
 	DirAccess.remove_absolute(path)
 
+## LRU in-memory texture cache helpers
+func _cache_tex(fname: String, tex: Texture2D) -> void:
+	if tex == null:
+		return
+	if _tex_cache.has(fname):
+		_tex_cache_order.erase(fname)
+	if _tex_cache.size() >= MAX_TEX_CACHE:
+		var oldest: String = _tex_cache_order.pop_front()
+		_tex_cache.erase(oldest)
+	_tex_cache[fname] = tex
+	_tex_cache_order.append(fname)
+
 func _texture_from_file(path: String) -> Texture2D:
 	var img := Image.load_from_file(path)
 	return null if img == null else ImageTexture.create_from_image(img)
@@ -127,10 +156,18 @@ func _texture_from_buffer(body: PackedByteArray) -> Texture2D:
 		else ImageTexture.create_from_image(img)
 
 func _fetch(url: String, cb: Callable) -> void:
-	if _pending.has(url):          # already in flight: piggyback
+	# _pending covers BOTH queued and in-flight URLs — full dedup
+	if _pending.has(url):
 		_pending[url].append(cb)
 		return
 	_pending[url] = [cb]
+	if _active_downloads < MAX_CONCURRENT:
+		_do_fetch(url)
+	else:
+		_download_queue.append(url)   # callbacks stored in _pending
+
+func _do_fetch(url: String) -> void:
+	_active_downloads += 1
 	var req := HTTPRequest.new()
 	req.timeout = 30.0
 	req.use_threads = true
@@ -140,13 +177,20 @@ func _fetch(url: String, cb: Callable) -> void:
 			var callbacks: Array = _pending.get(url, [])
 			_pending.erase(url)
 			req.queue_free()
+			_active_downloads -= 1
 			var payload := body if code == 200 else PackedByteArray()
 			for c in callbacks:
 				c.call(payload)
+			if not _download_queue.is_empty() and _active_downloads < MAX_CONCURRENT:
+				_do_fetch(_download_queue.pop_front())
 	)
 	if req.request(url) != OK:
 		var callbacks: Array = _pending.get(url, [])
 		_pending.erase(url)
+		_active_downloads -= 1
 		req.queue_free()
 		for c in callbacks:
 			c.call(PackedByteArray())
+		if not _download_queue.is_empty():
+			_do_fetch(_download_queue.pop_front())
+

@@ -1,73 +1,64 @@
 #!/usr/bin/env python3
-"""Rebuild index.json directly from files already in Supabase.
+"""Rebuild index.json from Supabase files with subject metadata."""
+import json, re, os, shutil, datetime as dt
+import supabase_store, texgen, world_core as wc
+import export_texture_gallery as etg
 
-Lists img/ in the bucket, groups files by key_hash, uploads a fresh
-index.json. No world simulation, no generation, runs in seconds.
-
-Usage:
-    python rebuild_index.py
-Requires: SUPABASE_URL and SUPABASE_SERVICE_KEY env vars.
-"""
-import json, os, re, datetime as dt
-import supabase_store
+SEED, SIZE = 42, 128
 
 def main() -> int:
     storage = supabase_store.SupabaseStorage()
     base_url = storage.public_url("").rstrip("/")
-
-    print(f"Listing Supabase bucket '{storage.bucket}' img/ …")
+    print(f"Listing Supabase '{storage.bucket}' img/ ...")
     items = storage.list("img/")
-    print(f"Found {len(items)} raw items")
-    if items:
-        print(f"  first item keys: {list(items[0].keys())}")
-        print(f"  first item name: {items[0].get('name','?')}")
-
-    # Group by hash: files are named <hash>_v<N>.png (or <hash>_v<N>)
-    by_hash: dict[str, list[str]] = {}
-    pattern = re.compile(r'^([0-9a-f]{16})_v(\d+)(?:_\d+)?(\.png)?$', re.I)
+    pattern = re.compile(r"^([0-9a-f]{16})_v(\d+)(?:_\d+)?\.png$", re.I)
+    by_hash = {}
     for item in items:
-        fname = item.get("name", "")
-        # Supabase may return name with or without the prefix
-        fname = fname.removeprefix("img/").lstrip("/")
+        fname = item.get("name", "").removeprefix("img/").lstrip("/")
         m = pattern.match(fname)
         if m:
-            h = m.group(1)
-            by_hash.setdefault(h, []).append(fname)
-
-    # Sort variations within each hash
+            by_hash.setdefault(m.group(1), []).append(fname)
     for h in by_hash:
         by_hash[h].sort()
+    print(f"Found {len(by_hash)} distinct hashes")
 
-    assets = [
-        {"hash": h, "files": fnames}
-        for h, fnames in sorted(by_hash.items())
-    ]
+    print(f"Running world sim to get subject metadata (no image generation)...")
+    store_path = "_meta_store_tmp"
+    if os.path.exists(store_path):
+        shutil.rmtree(store_path)
+    svc = texgen.TextureService(store_path, backend=texgen.PlaceholderBackend())
+    world = wc.build_world(SEED, SIZE, 3)
+    sea, thr = 0.42, wc.default_river_threshold(SIZE)
+    for label, zoom, t in etg.VIEWS:
+        chunk = world.stream_view(0.62, 0.44, zoom, 48)
+        st = wc.state(chunk, t, sea, thr, 0.18, 0.012, 0.65)
+        df = texgen.derive(chunk, st)
+        for desc in df.legend.values():
+            p, n = texgen.build_prompt(desc)
+            svc.store.insert_pending(desc, p, n, svc.variations, svc.px_for(desc))
+        print(f"  [{label}] {len(df.legend)} keys", flush=True)
+    with svc.store.lock:
+        rows = svc.store.db.execute("SELECT key_hash, subject, lod, tags FROM assets").fetchall()
+    svc.store.db.close()
+    shutil.rmtree(store_path)
+    meta = {h: {"subject": s, "lod": l, "tags": json.loads(t or "{}")} for h, s, l, t in rows}
+    print(f"Matched {sum(1 for h in by_hash if h in meta)}/{len(by_hash)} hashes to subjects")
 
-    print(f"Grouped into {len(assets)} assets")
-    if not assets:
-        print("\nNo files matched pattern <16hexchars>_v<N>.png")
-        print("Raw names sample:", [i.get("name","") for i in items[:10]])
-        return 1
+    assets = []
+    for h, fnames in sorted(by_hash.items()):
+        entry = {"hash": h, "files": fnames}
+        entry.update(meta.get(h, {}))
+        assets.append(entry)
 
     index = {
-        "generated_at": dt.datetime.now(dt.timezone.utc)
-            .isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+        "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="milliseconds").replace("+00:00","Z"),
         "count": len(assets),
         "base_url": base_url,
         "assets": assets,
     }
-
     url = storage.upload_json("index.json", index)
-    print(f"Uploaded index.json with {len(assets)} assets → {url}")
-
-    # Also write web/textures/config.json so the local gallery knows the base_url
-    config_path = os.path.join(os.path.dirname(__file__), "web", "textures", "config.json")
-    os.makedirs(os.path.dirname(config_path), exist_ok=True)
-    with open(config_path, "w") as f:
-        json.dump({"base_url": base_url}, f, indent=1)
-
+    print(f"Done: {sum(1 for a in assets if 'subject' in a)}/{len(assets)} assets have subject -> {url}")
     return 0
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -33,7 +33,7 @@ var bridge_url := bridge_url_binary
 
 @export_group("Textures")
 ## Supabase public bucket URL — leave empty to skip texture loading.
-@export var texture_base_url := "https://lhgflevvgvnsziaxrcwu.supabase.co/storage/v1/object/public/textures"
+@export var texture_base_url := "https://lhgflevvgvnsziaxrcwu.supabase.co/storage/v1/object/public/worldengine"
 
 @export_group("Simulation")
 @export var sim_speed := 0.35
@@ -298,7 +298,10 @@ func _init_texture_db() -> void:
 	var TextureDB = load("res://scripts/texture_db.gd")
 	tex_db = TextureDB.new()
 	add_child(tex_db)
-	tex_db.index_loaded.connect(func(count): print("[TextureDB] loaded %d assets from Supabase" % count))
+	tex_db.index_loaded.connect(func(count):
+		print("[TextureDB] loaded %d assets from Supabase" % count)
+		if terrain != null and terrain.has_method("set_tex_db"):
+			terrain.set_tex_db(tex_db))
 	tex_db.index_failed.connect(func(reason): push_warning("[TextureDB] failed: " + reason))
 	tex_db.load_index(texture_base_url)
 
@@ -402,6 +405,8 @@ func _on_request_completed(_result: int, response_code: int, _headers: PackedStr
 			refresh_after_response = false
 			refresh_reset_pending = false
 			_request_frame(0.0, pending_reset)
+		return
+	if terrain == null or not terrain.has_method("apply_payload_bytes"):
 		return
 	terrain.apply_payload_bytes(body)
 	# Remember the window we actually loaded. This is the sticky stream center:
