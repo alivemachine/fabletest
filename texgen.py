@@ -569,6 +569,10 @@ class GenJob:
     px: int                # output size (scales with |negative lod|)
     n: int                 # how many variations to produce in one call
 
+    @property
+    def key_hash(self) -> str:
+        return hashlib.sha1(self.key.encode()).hexdigest()[:16]
+
 
 class Backend:
     """Protocol: generate(job) -> list of PNG bytes, len == job.n.
@@ -821,8 +825,11 @@ def build_runpod_comfyui_workflow(
     }
 
 
-def build_runpod_runsync_payload(workflow: dict) -> dict:
-    return {"input": {"workflow": workflow}}
+def build_runpod_runsync_payload(workflow: dict, file_name=None) -> dict:
+    payload: dict = {"input": {"workflow": workflow}}
+    if file_name is not None:
+        payload["input"]["file_name"] = file_name
+    return payload
 
 
 def load_runpod_workflow_template(path: str) -> dict | None:
@@ -998,9 +1005,10 @@ class RunPodComfyUIBackend(Backend):
                 width=px,
                 height=px,
                 batch_size=job.n,
-                filename_prefix=self.filename_prefix,
+                filename_prefix=f"img/{job.key_hash}",
             )
-            return build_runpod_runsync_payload(workflow)
+            file_name = [f"img/{job.key_hash}_v{i}" for i in range(job.n)]
+            return build_runpod_runsync_payload(workflow, file_name=file_name)
         workflow = build_runpod_comfyui_workflow(
             prompt=prompt,
             negative_prompt=job.negative,
@@ -1011,10 +1019,11 @@ class RunPodComfyUIBackend(Backend):
             lora_name=self.full_lora_name,
             lora_strength_model=self.lora_strength_model,
             lora_strength_clip=self.lora_strength_clip,
-            filename_prefix=self.filename_prefix,
+            filename_prefix=f"img/{job.key_hash}",
             batch_size=job.n,
         )
-        return build_runpod_runsync_payload(workflow)
+        file_name = [f"img/{job.key_hash}_v{i}" for i in range(job.n)]
+        return build_runpod_runsync_payload(workflow, file_name=file_name)
 
     def _headers(self) -> dict:
         return {
@@ -1089,9 +1098,9 @@ class RunPodComfyUIBackend(Backend):
             if not isinstance(item, str):
                 continue
             if item.startswith("http"):
-                # worker uploaded straight to bucket storage (e.g. Supabase
-                # via BUCKET_ENDPOINT_URL) and returned the URL — fetch it
-                out.append(self._fetch_url(item))
+                # worker uploaded straight to bucket storage — return the URL
+                # directly so the caller can store it without re-downloading
+                out.append(item)
             else:
                 out.append(base64.b64decode(item.split(",", 1)[-1]))
         if len(out) != want:
@@ -1248,12 +1257,16 @@ class TextureStore:
     def attach_files(self, key: str, paths: list, provisional: bool):
         with self.lock:
             for i, p in enumerate(paths):
-                blob = open(p, "rb").read() if os.path.exists(p) else b""
+                if isinstance(p, str) and p.startswith("http"):
+                    blen, sha = 0, ""
+                else:
+                    blob = open(p, "rb").read() if os.path.exists(p) else b""
+                    blen = len(blob)
+                    sha = hashlib.sha1(blob).hexdigest()[:16] if blob else ""
                 self.db.execute(
                     "INSERT OR REPLACE INTO variations(key,idx,path,bytes,sha1,"
                     "provisional) VALUES(?,?,?,?,?,?)",
-                    (key, i, p, len(blob),
-                     hashlib.sha1(blob).hexdigest()[:16], int(provisional)))
+                    (key, i, p, blen, sha, int(provisional)))
             self.db.commit()
 
     def paths(self, key: str, include_provisional: bool = True) -> list:
@@ -1562,13 +1575,16 @@ class TextureService:
         try:
             images = self.backend.generate(job)
             adir = self.store.asset_dir(desc)
-            os.makedirs(adir, exist_ok=True)
             paths = []
-            for i, png in enumerate(images):
-                p = os.path.join(adir, f"v{i}.png")
-                with open(p, "wb") as f:
-                    f.write(png)
-                paths.append(p)
+            for i, img in enumerate(images):
+                if isinstance(img, str):  # cloud storage URL — already uploaded
+                    paths.append(img)
+                else:
+                    os.makedirs(adir, exist_ok=True)
+                    p = os.path.join(adir, f"v{i}.png")
+                    with open(p, "wb") as f:
+                        f.write(img)
+                    paths.append(p)
             self.store.attach_files(key, paths, provisional=False)
             self.store.set_status(key, "ready", backend=self.backend.name)
         except Exception as e:                        # noqa: BLE001

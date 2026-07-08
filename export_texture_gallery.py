@@ -105,13 +105,19 @@ def collect_entries(svc: texgen.TextureService):
             ]
             srcs, files = [], []
             for i, p in enumerate(paths):
-                src = Path(p)
-                if not src.is_absolute():
-                    src = ROOT / src
-                if not src.exists():
-                    continue
-                srcs.append(src)
-                files.append(f"{key_hash}_v{i}.png")
+                if isinstance(p, str) and p.startswith("http"):
+                    # RunPod already uploaded to cloud storage — use URL directly
+                    fname = p.rsplit("/", 1)[-1]  # last path segment
+                    srcs.append(p)
+                    files.append(fname)
+                else:
+                    src = Path(p)
+                    if not src.is_absolute():
+                        src = ROOT / src
+                    if not src.exists():
+                        continue
+                    srcs.append(src)
+                    files.append(f"{key_hash}_v{i}.png")
             if files:
                 out.append((
                     {
@@ -152,7 +158,8 @@ def export(svc: texgen.TextureService, out_dir: Path) -> int:
     entries = []
     for entry, srcs in collect_entries(svc):
         for name, src in zip(entry["files"], srcs):
-            shutil.copyfile(src, img_dir / name)
+            if not (isinstance(src, str) and src.startswith("http")):
+                shutil.copyfile(src, img_dir / name)
         entries.append(entry)
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -174,7 +181,10 @@ def publish_supabase(svc: texgen.TextureService, out_dir: Path) -> int:
     todo = collect_entries(svc)
     for n, (entry, srcs) in enumerate(todo, 1):
         for name, src in zip(entry["files"], srcs):
-            store.upload_png(f"img/{name}", src.read_bytes())
+            if isinstance(src, str) and src.startswith("http"):
+                pass  # RunPod already uploaded to the correct path
+            else:
+                store.upload_png(f"img/{name}", Path(src).read_bytes())
             uploaded += 1
         entries.append(entry)
         print(f"[upload {n}/{len(todo)}] {entry['key']}", flush=True)
