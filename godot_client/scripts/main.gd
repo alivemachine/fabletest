@@ -31,6 +31,10 @@ var bridge_url := bridge_url_binary
 ## Base height of the water surface column in pixels.
 @export var water_column_height := 8.0
 
+@export_group("Textures")
+## Supabase public bucket URL — leave empty to skip texture loading.
+@export var texture_base_url := "https://lhgflevvgvnsziaxrcwu.supabase.co/storage/v1/object/public/textures"
+
 @export_group("Simulation")
 @export var sim_speed := 0.35
 @export var sea_level := 0.42
@@ -68,6 +72,7 @@ var hud_label: Label
 var http: HTTPRequest
 var sky_rect: ColorRect
 var backdrop_layers: Array = []
+var tex_db: Node  # TextureDB instance (null if URL not set)
 
 
 func _ready() -> void:
@@ -79,6 +84,7 @@ func _ready() -> void:
 	_build_hud()
 	_build_http()
 	_layout_scene()
+	_init_texture_db()
 	prefetch_center_uv = world_uv
 	if offline_grid:
 		# Start on the static grey grid so smoothness can be verified before any
@@ -284,6 +290,17 @@ func _build_http() -> void:
 	http.use_threads = true
 	add_child(http)
 	http.request_completed.connect(_on_request_completed)
+
+
+func _init_texture_db() -> void:
+	if texture_base_url.is_empty():
+		return
+	var TextureDB = load("res://scripts/texture_db.gd")
+	tex_db = TextureDB.new()
+	add_child(tex_db)
+	tex_db.index_loaded.connect(func(count): print("[TextureDB] loaded %d assets from Supabase" % count))
+	tex_db.index_failed.connect(func(reason): push_warning("[TextureDB] failed: " + reason))
+	tex_db.load_index(texture_base_url)
 
 
 func _movement_input() -> Vector2:
