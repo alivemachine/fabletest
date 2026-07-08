@@ -1121,6 +1121,9 @@ class RunPodComfyUIBackend(Backend):
         from PIL import Image
         out = []
         for png in images:
+            if isinstance(png, str):  # URL from cloud storage — skip downscale
+                out.append(png)
+                continue
             img = Image.open(io.BytesIO(png))
             if img.size != (px, px):
                 img = img.resize((px, px), Image.LANCZOS)
