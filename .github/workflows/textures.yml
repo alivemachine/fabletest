@@ -1,0 +1,99 @@
+name: Generate & publish textures
+
+# Tests the Supabase connection and RunPod endpoint, then (optionally)
+# generates the full texture gallery and publishes it to the Supabase bucket.
+#
+# Required repository secrets:
+#   SUPABASE_URL            https://<project-ref>.supabase.co
+#   SUPABASE_SERVICE_KEY    service_role key
+#   RUNPOD_ENDPOINT_ID      RunPod serverless endpoint ID
+#   RUNPOD_API_KEY          RunPod API key
+#
+# Optional repository secrets (passed through unchanged if set):
+#   SUPABASE_BUCKET         bucket name (default: textures)
+#   RUNPOD_INPUT_FORMAT     comfyui (default) | prompt
+#   RUNPOD_PROMPT_PREFIX    prepended to every generation prompt
+
+on:
+  workflow_dispatch:
+    inputs:
+      generate_all:
+        description: "Generate all textures after the smoke test (yes/no)"
+        default: "no"
+        required: true
+      seed:
+        description: "World seed for texture generation"
+        default: "42"
+        required: false
+      size:
+        description: "World grid size for generation (smaller = faster)"
+        default: "128"
+        required: false
+      concurrency:
+        description: "Parallel RunPod jobs to keep in flight"
+        default: "4"
+        required: false
+
+jobs:
+  check-and-generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      SUPABASE_BUCKET: ${{ secrets.SUPABASE_BUCKET }}
+      RUNPOD_ENDPOINT_ID: ${{ secrets.RUNPOD_ENDPOINT_ID }}
+      RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+      RUNPOD_INPUT_FORMAT: ${{ secrets.RUNPOD_INPUT_FORMAT }}
+      RUNPOD_PROMPT_PREFIX: ${{ secrets.RUNPOD_PROMPT_PREFIX }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python deps
+        run: pip install numpy pillow
+
+      # ── Step 1: Supabase connection check ──────────────────────────────────
+      - name: Check Supabase connection
+        run: python supabase_store.py check
+
+      # ── Step 2: RunPod smoke test (one texture, saves PNG to smoke_out/) ───
+      - name: RunPod smoke test
+        run: python runpod_smoke.py
+
+      - name: Upload smoke-test images
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runpod-smoke-images
+          path: runpod_smoke_out/
+          if-no-files-found: ignore
+
+      # ── Step 3: Full generation (only when requested) ─────────────────────
+      - name: Generate & publish all textures
+        if: ${{ github.event.inputs.generate_all == 'yes' }}
+        run: |
+          python export_texture_gallery.py \
+            --backend runpod-comfyui \
+            --publish supabase \
+            --seed "${{ github.event.inputs.seed }}" \
+            --size "${{ github.event.inputs.size }}" \
+            --concurrency "${{ github.event.inputs.concurrency }}"
+
+      - name: Commit web/textures/config.json
+        if: ${{ github.event.inputs.generate_all == 'yes' }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add web/textures/config.json
+          if git diff --cached --quiet; then
+            echo "config.json unchanged — no commit needed."
+          else
+            git commit -m "Update web/textures/config.json (Supabase bucket URL)"
+            git pull --rebase origin "$GITHUB_REF_NAME"
+            git push
+          fi
