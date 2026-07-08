@@ -6,3 +6,6 @@ pyodide-0.26.4.tar.bz2
 texture_store_runpod/
 runpod_smoke_out/
 runpod_fullrun.log
+# Generated texture gallery — ground truth lives in Supabase, not the repo
+web/textures/img/
+web/textures/index.json

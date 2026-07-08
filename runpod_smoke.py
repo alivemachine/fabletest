@@ -79,6 +79,10 @@ def main() -> int:
             args.out.mkdir(parents=True, exist_ok=True)
             for i, png in enumerate(images):
                 p = args.out / f"smoke_{fmt}_{i}.png"
+                if isinstance(png, str):  # URL returned — download for inspection
+                    import urllib.request
+                    with urllib.request.urlopen(png) as r:
+                        png = r.read()
                 p.write_bytes(png)
                 print("saved:", p)
             print(f"\nSUCCESS — endpoint speaks {fmt!r}. "
