@@ -130,6 +130,12 @@ input[type=number],input[type=text]{background:var(--panel2);border:1px solid va
       <div id="insp"><p class="note">hover a tile — click to pin / unpin</p></div>
     </div>
     <div class="group">
+      <h2>Textures in view</h2>
+      <div id="texcat" class="note">…</div>
+      <p class="note">every tile quantizes to one of these keys; the whole
+      planet→ant range needs only a bounded catalog to generate.</p>
+    </div>
+    <div class="group">
       <p class="note">drag to pan · wheel / pinch to zoom · double-click ×8 ·
       <b>+</b>/<b>−</b> keys · Python (<code>scale_core.py</code>) runs in your
       browser via Pyodide. Same seed ⇒ the same ant on the same pebble, every visit.</p>
@@ -161,7 +167,7 @@ const LEVELS = [
 ];
 const levelTile = k => TILE0 / Math.pow(BRANCH, k);
 const levelOf = tm => Math.log(TILE0 / tm) / Math.log(BRANCH);
-const LAYERS = ["composite","biome","elevation","temperature","moisture","territory","category","entities"];
+const LAYERS = ["composite","biome","elevation","temperature","moisture","territory","category","entities","texture"];
 
 const S = {
   seed: 42, cx: PLANET_M/2, cy: PLANET_M/2, tileM: TILE0, layer: "composite",
@@ -203,7 +209,7 @@ addEventListener("resize", layout);
 
 // ---------- pyodide bootstrap (local runtime, CDN fallback) ----------
 const PYODIDE_CDN = "https://cdn.jsdelivr.net/pyodide/v0.26.4/full/";
-let py = null, pyView, pyRender, pyDescribe, pyPlayer, pyReset;
+let py = null, pyView, pyRender, pyDescribe, pyPlayer, pyReset, pyCatalog;
 
 function loadScript(src){
   return new Promise((ok, err) => {
@@ -247,6 +253,9 @@ def js_describe(i, j):
 def js_player(seed):
     px, py = sc.find_player(int(seed))
     return [px, py]
+
+def js_catalog():
+    return sc.texture_catalog_json()
 `);
   py = pyodide;
   pyReset = py.globals.get("js_reset");
@@ -254,6 +263,7 @@ def js_player(seed):
   pyRender = py.globals.get("js_render");
   pyDescribe = py.globals.get("js_describe");
   pyPlayer = py.globals.get("js_player");
+  pyCatalog = py.globals.get("js_catalog");
   pyReset(S.seed);
   // start above the player so every rung of the ladder has content
   const p = pyPlayer(S.seed).toJs();
@@ -288,6 +298,17 @@ function render(){
   lastTile = null;              // view changed: same tile index ≠ same tile
   updateHud();
   markLadder();
+  updateCatalog();
+}
+
+function updateCatalog(){
+  if (!pyCatalog) return;
+  const cat = JSON.parse(pyCatalog());
+  let h = `<b style="color:var(--accent)">${cat.total}</b> distinct texture keys on screen<ul style="margin:5px 0 0;padding-left:15px">`;
+  for (const k of cat.keys.slice(0, 12))
+    h += `<li><b style="color:var(--ink);font-weight:400">${k.key}</b> <small>×${k.tiles}</small></li>`;
+  if (cat.keys.length > 12) h += `<li>… ${cat.keys.length - 12} more</li>`;
+  document.getElementById("texcat").innerHTML = h + "</ul>";
 }
 
 function updateHud(){
@@ -421,8 +442,10 @@ function showTile(t, force){
     const e = rec.entity;
     h += `<div class="ent"><b>${e.name}</b>` +
       `<span class="tag">${e.category}</span>` +
+      (e.part === "upper" ? `<span class="tag">upper part</span>` : "") +
       (e.interactable ? `<span class="tag yes">interactable</span>` : "") +
-      `<br><small>size ${e.size} · id ${e.id}</small></div>`;
+      `<br><small>size ${e.size} · height ${e.height} · ${e.tiles} tiles` +
+      `<br>sprite cell [${e.sprite_cell[0]},${e.sprite_cell[1]}] · id ${e.id}</small></div>`;
   }
   h += "<table>";
   const row = (k, v) => v !== undefined ? `<tr><td>${k}</td><td>${v}</td></tr>` : "";
@@ -440,6 +463,12 @@ function showTile(t, force){
     h += `<div style="margin-top:6px;color:var(--muted)">this tile contains</div><ul>`;
     for (const c of rec.contains) h += `<li><b>${c.count}</b> ${c.kind} <small>(${c.cat})</small></li>`;
     h += "</ul>";
+  }
+  if (rec.texture){
+    h += `<div style="margin-top:7px;color:var(--muted)">texture key</div>` +
+      `<div style="word-break:break-all">${rec.texture.key}</div>` +
+      `<details style="margin-top:4px"><summary style="cursor:pointer;color:var(--accent);font-size:10.5px">generation prompt (${rec.texture.prompt.length} chars)</summary>` +
+      `<div style="font-size:10px;color:var(--muted);line-height:1.5;margin-top:4px">${rec.texture.prompt}</div></details>`;
   }
   insp.innerHTML = h;
 }

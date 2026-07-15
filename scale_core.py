@@ -453,37 +453,115 @@ CAT_COLORS = {
     "player":    (240, 220, 80),
 }
 
-# rule tags are dispatched in _density(); "shape": disc or square stamp
+# Each kind's GEOMETRY is a fixed integer ratio (w, d, h): footprint width x
+# depth x HEIGHT, in units of size/w meters. Footprints on the tile grid are
+# always the ratio times an integer multiplier s, so a cubic house reads
+# 1x1 -> 2x2 -> 3x3 under zoom and a 2:1 field reads 2x1 -> 4x2 -> 6x3 —
+# the ratio is conserved, and (kind, s) names a FINITE set of sprite
+# canvases for texture generation. Height occupies tiles ABOVE the base
+# (screen-north), so a tall tree covers its base plus h*s rows up.
+#
+# "desc" is the sprite prompt body (one individual); "group" is the phrase
+# used when the kind is aggregated into a ground tile's cover texture.
+# rule tags are dispatched in _density().
 KINDS = [
-    dict(name="city",     cat="structure", size=6000.0, cell=90000.0, color=(184, 178, 170), inter=False, rule="settlement", shape="square"),
-    dict(name="town",     cat="structure", size=1500.0, cell=26000.0, color=(178, 170, 158), inter=False, rule="settlement", shape="square"),
-    dict(name="village",  cat="structure", size=380.0,  cell=9000.0,  color=(172, 160, 142), inter=False, rule="settlement", shape="square"),
-    dict(name="crop field", cat="vegetal", size=160.0,  cell=420.0,   color=(188, 178, 96),  inter=False, rule="farmland", shape="square"),
-    dict(name="wood",     cat="vegetal",   size=90.0,   cell=260.0,   color=(44, 96, 52),    inter=False, rule="woodland", shape="disc"),
-    dict(name="building", cat="structure", size=13.0,   cell=44.0,    color=(158, 138, 120), inter=True,  rule="building", shape="square"),
-    dict(name="boulder",  cat="mineral",   size=3.2,    cell=64.0,    color=(134, 130, 126), inter=False, rule="mountain", shape="disc"),
-    dict(name="tree",     cat="vegetal",   size=7.0,    cell=16.0,    color=(38, 118, 48),   inter=False, rule="tree", shape="disc"),
-    dict(name="bush",     cat="vegetal",   size=1.7,    cell=7.0,     color=(70, 130, 58),   inter=False, rule="veg", shape="disc"),
-    dict(name="garden table", cat="object", size=1.6,   cell=40.0,    color=(150, 108, 62),  inter=True,  rule="garden", shape="square"),
-    dict(name="deer",     cat="animal",    size=1.4,    cell=90.0,    color=(172, 122, 72),  inter=True,  rule="wildlife", shape="disc"),
-    dict(name="rock",     cat="mineral",   size=0.9,    cell=9.0,     color=(142, 140, 138), inter=False, rule="rocky", shape="disc"),
-    dict(name="rabbit",   cat="animal",    size=0.35,   cell=60.0,    color=(196, 176, 150), inter=True,  rule="wildlife", shape="disc"),
-    dict(name="grass tuft", cat="vegetal", size=0.28,   cell=1.1,     color=(96, 148, 60),   inter=False, rule="grass", shape="disc"),
-    dict(name="book",     cat="object",    size=0.22,   cell=0.9,     color=(120, 60, 50),   inter=True,  rule="on_table", shape="square"),
-    dict(name="flower",   cat="vegetal",   size=0.15,   cell=1.4,     color=(214, 108, 160), inter=True,  rule="meadow", shape="disc"),
-    dict(name="cup",      cat="object",    size=0.09,   cell=0.55,    color=(226, 222, 214), inter=True,  rule="on_table", shape="disc"),
-    dict(name="mushroom", cat="vegetal",   size=0.08,   cell=2.4,     color=(206, 160, 96),  inter=True,  rule="damp", shape="disc"),
-    dict(name="anthill",  cat="structure", size=0.45,   cell=42.0,    color=(150, 118, 84),  inter=True,  rule="veg", shape="disc"),
-    dict(name="pebble",   cat="mineral",   size=0.045,  cell=0.35,    color=(150, 146, 140), inter=False, rule="ground", shape="disc"),
-    dict(name="leaf",     cat="vegetal",   size=0.05,   cell=0.45,    color=(120, 110, 44),  inter=False, rule="veg", shape="disc"),
-    dict(name="ant",      cat="animal",    size=0.011,  cell=0.09,    color=(60, 40, 30),    inter=True,  rule="ant", shape="disc"),
-    dict(name="sand grain", cat="mineral", size=0.0035, cell=0.016,   color=(190, 174, 140), inter=False, rule="ground", shape="disc"),
+    dict(name="city",     cat="structure", size=6000.0, cell=90000.0, color=(184, 178, 170), inter=False, rule="settlement", ratio=(1, 1, 0),
+         desc="a dense old-town city district seen from above: hundreds of tightly packed medieval houses with clay-tile and slate roofs, winding streets, small market squares, a surrounding stone wall",
+         group="a distant walled city, a dense mass of tiny rooftops and streets"),
+    dict(name="town",     cat="structure", size=1500.0, cell=26000.0, color=(178, 170, 158), inter=False, rule="settlement", ratio=(1, 1, 0),
+         desc="a market town seen from above: a few dozen timber-framed houses with clay roofs gathered around a central square, dirt roads radiating outward",
+         group="a small market town of clustered clay rooftops"),
+    dict(name="village",  cat="structure", size=380.0,  cell=9000.0,  color=(172, 160, 142), inter=False, rule="settlement", ratio=(1, 1, 0),
+         desc="a small farming village seen from above: a handful of thatched cottages along a single dirt lane, fenced yards and vegetable gardens",
+         group="a farming hamlet of thatched cottages"),
+    dict(name="crop field", cat="vegetal", size=160.0,  cell=420.0,   color=(188, 178, 96),  inter=False, rule="farmland", ratio=(2, 1, 0),
+         desc="a cultivated crop field seen from above: neat parallel furrows of ripe golden wheat, a low hedge border and a narrow footpath along one edge",
+         group="a patchwork of cultivated wheat fields"),
+    dict(name="wood",     cat="vegetal",   size=90.0,   cell=260.0,   color=(44, 96, 52),    inter=False, rule="woodland", ratio=(1, 1, 0),
+         desc="a small dense wood seen from above: overlapping broadleaf canopies in several greens, deep understory shadow between the crowns",
+         group="closed broadleaf forest canopy, overlapping treetops"),
+    dict(name="building", cat="structure", size=13.0,   cell=44.0,    color=(158, 138, 120), inter=True,  rule="building", ratio=(1, 1, 1),
+         desc="a small rustic stone-and-timber house with a steep pitched clay-tile roof, a heavy wooden door, two shuttered windows and a small stone chimney",
+         group="a group of small rustic stone-and-timber houses with clay-tile roofs"),
+    dict(name="boulder",  cat="mineral",   size=3.2,    cell=64.0,    color=(134, 130, 126), inter=False, rule="mountain", ratio=(1, 1, 1),
+         desc="a massive weathered granite boulder with deep cracks, patches of pale lichen and moss at its base",
+         group="a scatter of massive granite boulders"),
+    dict(name="tree",     cat="vegetal",   size=7.0,    cell=16.0,    color=(38, 118, 48),   inter=False, rule="tree", ratio=(1, 1, 2),
+         desc="a mature broadleaf oak tree: a thick gnarled trunk and a wide irregular canopy built from layered clusters of leaves, small patches of sky showing through",
+         group="broadleaf tree canopy seen from above"),
+    dict(name="bush",     cat="vegetal",   size=1.7,    cell=7.0,     color=(70, 130, 58),   inter=False, rule="veg", ratio=(1, 1, 1),
+         desc="a rounded leafy shrub with dense small leaves and a few dark berries",
+         group="low shrubland thicket"),
+    dict(name="garden table", cat="object", size=1.6,   cell=40.0,    color=(150, 108, 62),  inter=True,  rule="garden", ratio=(2, 2, 1),
+         desc="a rustic wooden garden table on four sturdy legs, made of weathered gray-brown planks with visible grain",
+         group="rustic wooden garden furniture"),
+    dict(name="deer",     cat="animal",    size=1.4,    cell=90.0,    color=(172, 122, 72),  inter=True,  rule="wildlife", ratio=(2, 1, 2),
+         desc="a red deer standing in profile: slender legs, warm brown coat, pale rump, small antlers, alert ears",
+         group="a grazing herd of red deer"),
+    dict(name="rock",     cat="mineral",   size=0.9,    cell=9.0,     color=(142, 140, 138), inter=False, rule="rocky", ratio=(1, 1, 1),
+         desc="a rough gray rock with angular facets and a dusting of dirt at its base",
+         group="a rocky scatter of gray stones"),
+    dict(name="rabbit",   cat="animal",    size=0.35,   cell=60.0,    color=(196, 176, 150), inter=True,  rule="wildlife", ratio=(1, 1, 1),
+         desc="a small brown rabbit sitting upright with long ears and a white tail",
+         group="rabbits grazing in the grass"),
+    dict(name="grass tuft", cat="vegetal", size=0.28,   cell=1.1,     color=(96, 148, 60),   inter=False, rule="grass", ratio=(1, 1, 1),
+         desc="a tuft of tall wild grass, a dozen blades bending slightly in the wind, small seed heads",
+         group="a meadow of tall wild grass"),
+    dict(name="book",     cat="object",    size=0.22,   cell=0.9,     color=(120, 60, 50),   inter=True,  rule="on_table", ratio=(3, 2, 1),
+         desc="a leather-bound book lying closed: embossed dark red cover, brass clasp, yellowed page edges",
+         group="scattered leather-bound books"),
+    dict(name="flower",   cat="vegetal",   size=0.15,   cell=1.4,     color=(214, 108, 160), inter=True,  rule="meadow", ratio=(1, 1, 2),
+         desc="a single wildflower on a thin green stem: five bright pink petals around a yellow center, two small leaves",
+         group="a wildflower meadow in bloom"),
+    dict(name="cup",      cat="object",    size=0.09,   cell=0.55,    color=(226, 222, 214), inter=True,  rule="on_table", ratio=(1, 1, 1),
+         desc="a glazed ceramic cup, off-white with a thin blue rim and a small round handle",
+         group="ceramic crockery on a table"),
+    dict(name="mushroom", cat="vegetal",   size=0.08,   cell=2.4,     color=(206, 160, 96),  inter=True,  rule="damp", ratio=(1, 1, 1),
+         desc="a small forest mushroom with a domed ochre cap speckled with pale spots, on a short pale stem",
+         group="a cluster of forest mushrooms"),
+    dict(name="anthill",  cat="structure", size=0.45,   cell=42.0,    color=(150, 118, 84),  inter=True,  rule="veg", ratio=(2, 2, 1),
+         desc="a mound anthill built of fine dirt grains, several dark entrance holes, a few ants on its surface",
+         group="ant mounds of fine dirt"),
+    dict(name="pebble",   cat="mineral",   size=0.045,  cell=0.35,    color=(150, 146, 140), inter=False, rule="ground", ratio=(1, 1, 1),
+         desc="a smooth rounded river pebble, gray with faint mineral banding",
+         group="a gravel bed of smooth pebbles"),
+    dict(name="leaf",     cat="vegetal",   size=0.05,   cell=0.45,    color=(120, 110, 44),  inter=False, rule="veg", ratio=(1, 1, 0),
+         desc="a single fallen dry leaf with curled brittle edges, ochre and brown",
+         group="fallen leaf litter"),
+    dict(name="ant",      cat="animal",    size=0.011,  cell=0.09,    color=(60, 40, 30),    inter=True,  rule="ant", ratio=(2, 1, 1),
+         desc="a black worker ant seen from above: three glossy body segments, six articulated legs, bent antennae",
+         group="a swarming trail of black ants"),
+    dict(name="sand grain", cat="mineral", size=0.0035, cell=0.016,   color=(190, 174, 140), inter=False, rule="ground", ratio=(1, 1, 1),
+         desc="a single grain of quartz sand: an irregular translucent crystal with rounded edges, warm beige",
+         group="coarse quartz sand"),
 ]
 for _i, _k in enumerate(KINDS):
     _k["kid"] = _i + 1
 KIND_BY_ID = {k["kid"]: k for k in KINDS}
 PLAYER_KID = 1000
 PLAYER_SIZE = 0.6
+PLAYER_KIND = dict(
+    name="player", cat="animal", size=PLAYER_SIZE, cell=None, kid=PLAYER_KID,
+    color=(240, 220, 80), inter=True, rule="player", ratio=(1, 1, 3),
+    desc=("the player character standing and facing south: a small adventurer "
+          "in a hooded travel cloak over simple leather armor, a satchel on "
+          "the hip and a wooden walking staff in one hand"),
+    group="the player character")
+KIND_BY_ID[PLAYER_KID] = PLAYER_KIND
+
+# footprint multipliers are exact up to 8, then snap to a sparse ladder —
+# (kind, s) stays a FINITE texture catalog even when an object fills the view
+_S_LADDER = [10, 12, 16, 20, 24, 32, 48, 64, 96, 128, 192]
+
+
+def _snap_s(x):
+    """Quantize the ideal footprint multiplier (size / (tile_m * ratio_w))."""
+    s = int(round(x))
+    if s < 1:
+        return 0                                  # sub-tile: aggregated
+    if s <= 8:
+        return s
+    return min(_S_LADDER, key=lambda v: abs(v - x))
 
 _MAX_CELLS = 120_000      # safety cap on lattice candidates per kind per view
 _MAX_STAMPS = 6000        # safety cap on individuals stamped per kind per view
@@ -595,9 +673,9 @@ _state = {}
 def _place_kind(seed, kind, x0, y0, x1, y1, tile_m):
     """All individuals of `kind` intersecting the window, as arrays
     (sx, sy, ids) — or None if the kind is aggregated at this scale."""
-    fp = kind["size"] / tile_m
     win = max(x1 - x0, y1 - y0)
-    if fp < 0.45 or kind["size"] > win * 3.0:
+    if _snap_s(kind["size"] / (tile_m * kind["ratio"][0])) < 1 \
+            or kind["size"] > win * 3.0:
         return None
     cell = kind["cell"]
     pad = kind["size"]
@@ -620,45 +698,39 @@ def _place_kind(seed, kind, x0, y0, x1, y1, tile_m):
     return sx, sy, hid
 
 
-def _stamp(grid_kid, grid_eid, grid_var, kind_kid, sx, sy, hid, size_m,
-           x0, y0, tile_m, shape):
-    """Rasterize individuals onto the tile grids (later stamps overwrite:
-    kinds are drawn large→small so small things sit on top)."""
-    ny, nx = grid_kid.shape
-    half = size_m / 2.0
-    fx = (sx - x0) / tile_m
-    fy = (sy - y0) / tile_m
-    r_t = half / tile_m
+def _stamp(g, kind, s, sx, sy, hid, tile_m, gx0, gy0):
+    """Rasterize individuals as QUANTIZED sprite blocks.
 
-    def covered(c, r, hi):
-        """Tile indices along one axis overlapping [c-r, c+r] by >= 40%
-        of a tile (always at least the tile holding the center) — this is
-        what makes a 2-tile entity read as 2x2, a 3-tile one as 3x3."""
-        lo_i = int(math.floor(c - r))
-        hi_i = int(math.floor(c + r))
-        out = [i for i in range(max(0, lo_i), min(hi - 1, hi_i) + 1)
-               if min(i + 1.0, c + r) - max(float(i), c - r) >= 0.4]
-        if not out and 0 <= int(c) < hi:
-            out = [int(c)]
-        return out
-
-    for n in range(len(sx)):
-        cx_, cy_ = fx[n], fy[n]
-        cols = covered(cx_, r_t, nx)
-        rows = covered(cy_, r_t, ny)
-        if not cols or not rows:
+    Footprint is ratio * s tiles (ratio conserved under zoom); height
+    occupies h = ratio_h * s tile rows ABOVE the base (screen-north), the
+    way an isometric sprite rises up the screen. The whole sprite canvas
+    is w x (d + h) tiles — exactly the canvas its texture is generated at.
+    Anchors snap to the absolute world tile lattice so panning slides and
+    textures land on tile boundaries. Within a kind, southern entities are
+    stamped last (painter's order); across kinds, large -> small."""
+    ny, nx = g["kid"].shape
+    rw, rd, rh = kind["ratio"]
+    w, d, h = rw * s, rd * s, rh * s
+    order = np.argsort(sy, kind="stable")            # north first
+    for n in order:
+        il = int(round(sx[n] / tile_m - w / 2.0)) - gx0
+        jb = int(round(sy[n] / tile_m - d / 2.0)) - gy0   # top row of the BASE
+        jt = jb - h                                       # top row incl height
+        i0, i1 = max(0, il), min(nx, il + w)
+        j0, j1 = max(0, jt), min(ny, jt + d + h)
+        if i0 >= i1 or j0 >= j1:
             continue
-        var = float((int(hid[n]) & 0xFF) / 255.0)
         eid = np.int32(int(hid[n]) & 0x7FFFFFFF)
-        round_ = shape == "disc" and r_t >= 2.0
-        for j in rows:
-            for i in cols:
-                if round_ and ((i + 0.5 - cx_) ** 2 + (j + 0.5 - cy_) ** 2
-                               > r_t * r_t):
-                    continue
-                grid_kid[j, i] = kind_kid
-                grid_eid[j, i] = eid
-                grid_var[j, i] = var
+        var = float((int(hid[n]) & 0xFF) / 255.0)
+        vv = np.arange(j0, j1) - jt                       # row within sprite
+        uu = np.arange(i0, i1) - il                       # col within sprite
+        g["kid"][j0:j1, i0:i1] = kind["kid"]
+        g["eid"][j0:j1, i0:i1] = eid
+        g["var"][j0:j1, i0:i1] = var
+        g["sca"][j0:j1, i0:i1] = s
+        g["spr_v"][j0:j1, i0:i1] = vv[:, None]
+        g["spr_u"][j0:j1, i0:i1] = uu[None, :]
+        g["part"][j0:j1, i0:i1] = np.where(vv[:, None] >= h, 1, 2)
 
 
 def view(seed, cx, cy, tile_m, nx=GRID, ny=GRID):
@@ -685,34 +757,74 @@ def view(seed, cx, cy, tile_m, nx=GRID, ny=GRID):
     country = country_at(seed, X, Y)
     urban, ubk, ubh, ubd = urban_at(seed, X, Y, tile_m)
 
-    kid = np.zeros((ny, nx), np.int32)
-    eid = np.zeros((ny, nx), np.int32)
-    var = np.zeros((ny, nx), np.float64)
+    g = dict(kid=np.zeros((ny, nx), np.int32),
+             eid=np.zeros((ny, nx), np.int32),
+             var=np.zeros((ny, nx), np.float64),
+             sca=np.zeros((ny, nx), np.int32),
+             spr_u=np.zeros((ny, nx), np.int32),
+             spr_v=np.zeros((ny, nx), np.int32),
+             part=np.zeros((ny, nx), np.int8))
     x0, y0 = cx - nx / 2 * tile_m, cy - ny / 2 * tile_m
     x1, y1 = cx + nx / 2 * tile_m, cy + ny / 2 * tile_m
+    gx0 = int(round(x0 / tile_m))
+    gy0 = int(round(y0 / tile_m))
+    win = max(x1 - x0, y1 - y0)
     for kind in sorted(KINDS, key=lambda k: -k["size"]):
         placed = _place_kind(seed, kind, x0, y0, x1, y1, tile_m)
         if placed is None:
             continue
         sx, sy, hid = placed
         if sx.size:
-            _stamp(kid, eid, var, kind["kid"], sx, sy, hid, kind["size"],
-                   x0, y0, tile_m, kind["shape"])
+            s = _snap_s(kind["size"] / (tile_m * kind["ratio"][0]))
+            _stamp(g, kind, s, sx, sy, hid, tile_m, gx0, gy0)
 
     # the player is one more entity, at a fixed world position; like every
     # kind it stops being an entity when it outgrows the window (background)
     px, py = _state.get("player") or _state.setdefault("player", player_pos(seed))
-    win = max(x1 - x0, y1 - y0)
-    if (0.45 <= PLAYER_SIZE / tile_m and PLAYER_SIZE <= win * 3.0
-            and x0 - 1 <= px <= x1 + 1 and y0 - 1 <= py <= y1 + 1):
-        _stamp(kid, eid, var, PLAYER_KID,
-               np.array([px]), np.array([py]), np.array([1], np.uint64),
-               PLAYER_SIZE, x0, y0, tile_m, "disc")
+    s = _snap_s(PLAYER_SIZE / tile_m)
+    reach = PLAYER_SIZE * (1 + PLAYER_KIND["ratio"][2])
+    if (s >= 1 and PLAYER_SIZE <= win * 3.0
+            and x0 - reach <= px <= x1 + reach and y0 - reach <= py <= y1 + reach):
+        _stamp(g, PLAYER_KIND, s, np.array([px]), np.array([py]),
+               np.array([1], np.uint64), tile_m, gx0, gy0)
+
+    # ---- ground texture keys: quantize what each tile CONTAINS -------------
+    # coverage fraction of an aggregated kind = density * (size/cell)^2 —
+    # scale-free, so the same spot keeps the same cover class while zooming.
+    cover_kid = np.zeros((ny, nx), np.int32)
+    cover_frac = np.zeros((ny, nx))
+    env = dict(e=e, m=m, t=t, veg=veg, urban=urban,
+               land=(e >= SEA).astype(np.float64))
+    for kind in KINDS:
+        if kind["rule"] in ("settlement", "on_table"):
+            continue
+        if _snap_s(kind["size"] / (tile_m * kind["ratio"][0])) >= 1:
+            continue                                  # expanded, not cover
+        if tile_m < kind["cell"]:
+            continue                                  # rarer than one per tile
+        p = _density(seed, kind, X, Y, env)
+        frac = p * (kind["size"] / kind["cell"]) ** 2
+        take = frac > cover_frac
+        cover_frac = np.where(take, frac, cover_frac)
+        cover_kid = np.where(take, kind["kid"], cover_kid)
+    dens = np.zeros((ny, nx), np.int32)               # 0 bare 1 sparse 2 mid 3 dense
+    dens[cover_frac >= 0.02] = 1
+    dens[cover_frac >= 0.08] = 2
+    dens[cover_frac >= 0.25] = 3
+    cover_kid[dens == 0] = 0
+    # one int32 texture id per tile: entity sprites (kind, s) or ground
+    # (biome, cover kind, density) — np.unique of this grid IS the catalog
+    tex = np.where(
+        g["kid"] > 0,
+        (1 << 28) | (g["kid"] << 12) | g["sca"],
+        (2 << 28) | (bio.astype(np.int32) << 12) | (cover_kid << 4) | dens)
 
     _state.update(seed=int(seed), cx=cx, cy=cy, tile_m=tile_m, nx=nx, ny=ny,
                   e=e, m=m, t=t, bio=bio, veg=veg, det=det, country=country,
                   urban=urban, ubk=ubk, ubh=ubh, ubd=ubd,
-                  kid=kid, eid=eid, var=var, X=X, Y=Y)
+                  kid=g["kid"], eid=g["eid"], var=g["var"], sca=g["sca"],
+                  spr_u=g["spr_u"], spr_v=g["spr_v"], part=g["part"],
+                  cover_kid=cover_kid, cover_dens=dens, tex=tex, X=X, Y=Y)
     return cx, cy, tile_m
 
 
@@ -721,7 +833,7 @@ def view(seed, cx, cy, tile_m, nx=GRID, ny=GRID):
 # ---------------------------------------------------------------------------
 
 LAYER_NAMES = ["composite", "biome", "elevation", "temperature", "moisture",
-               "territory", "category", "entities"]
+               "territory", "category", "entities", "texture"]
 
 
 def _ramp(v, stops, colors):
@@ -776,12 +888,18 @@ def colorize(layer):
     elif layer == "entities":
         rgb = np.full(bio.shape + (3,), 30.0)
         rgb[water] = (18, 28, 44)
-        occ = s["kid"] > 0
         for k in KINDS:
             mask = s["kid"] == k["kid"]
             rgb[mask] = k["color"]
         rgb[s["kid"] == PLAYER_KID] = CAT_COLORS["player"]
-        rgb[~occ & ~water] *= 1.0
+    elif layer == "texture":
+        # one color per texture KEY — the quantization made visible: tiles
+        # sharing a color would share a generated texture
+        h = _mix(s["tex"].astype(np.int64).view(np.uint64))
+        rgb = np.stack([(h & _U(0xFF)).astype(np.float64),
+                        ((h >> _U(8)) & _U(0xFF)).astype(np.float64),
+                        ((h >> _U(16)) & _U(0xFF)).astype(np.float64)],
+                       axis=-1) * 0.6 + 60.0
     else:                                            # composite
         rgb = _BIOME_LUT[bio].copy()
         tint = (s["det"][..., None] - 0.5) * 34.0
@@ -797,6 +915,13 @@ def colorize(layer):
                 rgb[mask] = np.clip(np.array(k["color"], np.float64) + v, 0, 255)
         pm = s["kid"] == PLAYER_KID
         rgb[pm] = CAT_COLORS["player"]
+        # the part of a sprite that RISES above its base reads lighter, and
+        # brightens toward the top row — cheap "tall things lean up-screen"
+        up = s["part"] == 2
+        if up.any():
+            h_rows = np.maximum(s["spr_v"].max() + 1, 1)
+            lift = 1.10 + 0.10 * (1.0 - s["spr_v"] / h_rows)
+            rgb[up] = np.clip(rgb[up] * lift[up, None], 0, 255)
     return np.clip(rgb, 0, 255).astype(np.uint8)
 
 
@@ -810,14 +935,148 @@ def render_rgba(layer):
     return nx, ny, buf.tobytes()
 
 
+# ---------------------------------------------------------------------------
+# texture keys & prompts — what a tile contains, quantized into a FINITE
+# catalog of image-generation prompts (fed to the RunPod/ComfyUI pipeline)
+# ---------------------------------------------------------------------------
+# Two families of keys:
+#   obj|<kind>|s<multiplier>            one sprite per (kind, footprint step);
+#                                       ratio-conserving footprints mean a
+#                                       cubic house is only ever n x n, so the
+#                                       whole zoom range needs ~19 sizes/kind
+#   ground|<biome>|<cover>|<density>    seamless terrain tile, optionally
+#                                       carrying a GROUP texture (houses,
+#                                       canopy, ants...) when its dominant
+#                                       sub-tile content is dense enough
+
+TILE_PX = 32          # pixels per tile when a texture is generated
+DENS_NAMES = ["bare", "sparse", "scattered", "dense"]
+
+_BIOME_GROUND = {
+    "deep ocean": "deep open ocean water: dark blue swell, faint foam streaks",
+    "ocean": "coastal sea water: mid-blue with light wave crests and subtle depth variation",
+    "sea ice": "cracked pale sea ice floes over dark water, thin snow drifts",
+    "beach": "wet golden beach sand with ripple marks and a few tiny shells",
+    "snow": "a fresh snow field, soft drifts, faint blue shadows in the hollows",
+    "tundra": "mossy tundra: low lichen mats, patches of bare frozen soil and small stones",
+    "taiga": "boreal forest floor: dark conifer needles, moss patches, thin roots",
+    "forest": "temperate forest floor: brown leaf litter, soft dark soil, scattered twigs",
+    "rainforest": "lush tropical undergrowth: broad wet leaves, deep green shadow, damp earth",
+    "grassland": "a green meadow of short mixed grass with small color variations",
+    "savanna": "dry golden savanna grass with cracked bare-earth patches",
+    "desert": "wind-rippled dry desert sand and dust, a few small stones",
+    "bare rock": "bare fractured gray rock and scree, sharp shards and dust",
+}
+
+_STYLE_OBJ_PREFIX = (
+    "16-bit pixel art game sprite, classic SNES JRPG tileset style, isometric "
+    "three-quarter top-down view, crisp single-pixel dark outline around the "
+    "silhouette, limited 32-color palette with warm mid tones, flat ambient "
+    "light with the sun from the north-west and soft shadows falling to the "
+    "south-east, no anti-aliasing, careful hand-placed dithering for shading, ")
+
+_STYLE_OBJ_SUFFIX = (
+    " Fully transparent background, single isolated object, no ground plane, "
+    "no drop shadow outside the silhouette, no text, no watermark, no border, "
+    "no photorealism, no blur, no depth of field; keep the palette, outline "
+    "weight, lighting direction and level of detail exactly consistent with "
+    "the other sprites of this same tileset, so that every variation looks "
+    "like an asset from the same video game.")
+
+_STYLE_GROUND_PREFIX = (
+    "16-bit pixel art terrain tile, classic SNES JRPG overworld tileset "
+    "style, top-down three-quarter view, seamless and perfectly tileable on "
+    "all four edges, limited 32-color palette with warm mid tones, flat "
+    "ambient light from the north-west, no anti-aliasing, careful hand-placed "
+    "dithering for texture, ")
+
+_STYLE_GROUND_SUFFIX = (
+    " The tile must repeat perfectly: no element may touch or cross the tile "
+    "border, no vignette, no lighting gradient across the tile, no text, no "
+    "watermark, no photorealism, no blur; keep the palette, dithering style "
+    "and level of detail exactly consistent with the other terrain tiles of "
+    "this same tileset, so that every variation tiles seamlessly next to the "
+    "others.")
+
+_KIND_BY_NAME = {k["name"]: k for k in KINDS}
+_KIND_BY_NAME["player"] = PLAYER_KIND
+
+
+def texture_key(i, j):
+    """The texture key string for tile (i, j) of the current view."""
+    return _decode_tex(int(_state["tex"][j, i]))
+
+
+def _decode_tex(t):
+    fam = t >> 28
+    if fam == 1:
+        kid = (t >> 12) & 0xFFFF
+        s = t & 0xFFF
+        return f"obj|{KIND_BY_ID[kid]['name']}|s{s}"
+    bio_id = (t >> 12) & 0xFFFF
+    ck = (t >> 4) & 0xFF
+    dens = t & 0xF
+    cover = KIND_BY_ID[ck]["name"] if ck else "bare"
+    return f"ground|{BIOMES[bio_id][0]}|{cover}|{DENS_NAMES[dens]}"
+
+
+def texture_prompt(key):
+    """The full image-generation prompt for a texture key. Long and precise
+    on purpose: the style prefix pins the look, the body describes content
+    and exact tile proportions, the suffix pins consistency and negatives —
+    so variations of one key and neighbors in the catalog match each other."""
+    parts = key.split("|")
+    if parts[0] == "obj":
+        kind = _KIND_BY_NAME[parts[1]]
+        s = int(parts[2][1:])
+        rw, rd, rh = kind["ratio"]
+        w, d, h = rw * s, rd * s, rh * s
+        cw, ch = w * TILE_PX, (d + h) * TILE_PX
+        body = (f"{kind['desc']}. A {kind['cat']} object. It occupies a "
+                f"footprint of {w} by {d} ground tiles"
+                + (f" and rises {h} tiles tall" if h else ", lying flat")
+                + f"; draw it to exactly fill a {cw} by {ch} pixel canvas "
+                  f"({w} tiles wide, {d + h} tiles high at {TILE_PX} pixels "
+                  f"per tile), its base resting on the bottom edge of the "
+                  f"canvas, centered horizontally, the whole silhouette "
+                  f"visible and nothing cropped.")
+        return _STYLE_OBJ_PREFIX + body + _STYLE_OBJ_SUFFIX
+    _g, biome, cover, dens = parts
+    body = _BIOME_GROUND[biome]
+    if cover != "bare":
+        kind = _KIND_BY_NAME[cover]
+        body += (f", {dens}ly covered by {kind['group']}, drawn small and "
+                 f"seen from directly above as part of the ground")
+    body += (f". One seamless ground tile of {TILE_PX} by {TILE_PX} pixels "
+             f"(also valid rendered larger), uniform content edge to edge.")
+    return _STYLE_GROUND_PREFIX + body + _STYLE_GROUND_SUFFIX
+
+
+def texture_catalog():
+    """Distinct texture keys of the CURRENT view with tile counts — what
+    would have to exist in the store to skin this screen. The finiteness of
+    this list under continuous zoom is the whole point of the quantization."""
+    vals, counts = np.unique(_state["tex"], return_counts=True)
+    out = [{"key": _decode_tex(int(v)), "tiles": int(c)}
+           for v, c in sorted(zip(vals, counts), key=lambda vc: -vc[1])]
+    return {"total": len(out), "keys": out}
+
+
+def texture_catalog_json(with_prompts=False):
+    cat = texture_catalog()
+    if with_prompts:
+        for k in cat["keys"]:
+            k["prompt"] = texture_prompt(k["key"])
+    return json.dumps(cat)
+
+
 def _aggregates(seed, x, y, tile_m):
     """Closed-form estimates of what lives INSIDE one tile — the kinds too
     small to own tiles here. This is the 'zoom out aggregates' direction."""
     out = []
     for kind in sorted(KINDS, key=lambda k: -k["size"]):
-        fp = kind["size"] / tile_m
-        if fp >= 0.45:
-            continue
+        if _snap_s(kind["size"] / (tile_m * kind["ratio"][0])) >= 1:
+            continue                                  # expanded, not aggregated
         if tile_m / kind["cell"] < 1.0:
             continue
         if kind["rule"] == "settlement":
@@ -873,15 +1132,23 @@ def describe(i, j):
             sname = _gen_name(int(s["ubh"][j, i]) & 0x7FFFFFFF)
             rec["settlement"] = f"{sname} ({skind}, {fmt_m(float(s['ubd'][j, i]))} from center)"
     kid = int(s["kid"][j, i])
-    if kid == PLAYER_KID:
-        rec["entity"] = {"name": "player", "category": "animal",
-                         "size": fmt_m(PLAYER_SIZE), "interactable": True,
-                         "id": 1}
-    elif kid > 0:
+    if kid > 0:
         k = KIND_BY_ID[kid]
-        rec["entity"] = {"name": k["name"], "category": k["cat"],
-                         "size": fmt_m(k["size"]), "interactable": k["inter"],
-                         "id": int(s["eid"][j, i])}
+        sc = int(s["sca"][j, i])
+        rw, rd, rh = k["ratio"]
+        w, d, h = rw * sc, rd * sc, rh * sc
+        height_m = k["size"] * rh / rw
+        rec["entity"] = {
+            "name": k["name"], "category": k["cat"],
+            "size": fmt_m(k["size"]), "interactable": k["inter"],
+            "id": int(s["eid"][j, i]),
+            "height": fmt_m(height_m) if rh else "flat",
+            "tiles": f"{w}×{d} base" + (f" + {h} up" if h else ""),
+            "part": "base" if int(s["part"][j, i]) == 1 else "upper",
+            "sprite_cell": [int(s["spr_u"][j, i]), int(s["spr_v"][j, i])],
+        }
+    tkey = texture_key(i, j)
+    rec["texture"] = {"key": tkey, "prompt": texture_prompt(tkey)}
     rec["contains"] = _aggregates(s["seed"], x, y, tile_m)
     return rec
 
