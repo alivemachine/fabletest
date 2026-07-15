@@ -1,0 +1,502 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>World Engine — multi-scale harness</title>
+<style>
+:root{
+  --bg:#0f1317; --panel:rgba(18,23,29,.94); --panel2:#1a222a; --ink:#e8edf2;
+  --muted:#93a1af; --line:#26303a; --accent:#e2a54f; --accent-ink:#16110a;
+  --mono:ui-monospace,"SF Mono","Cascadia Mono",Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;height:100%;overflow:hidden}
+body{background:var(--bg);color:var(--ink);font:13px/1.5 var(--mono)}
+button,input,select{font:inherit;color:inherit}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+/* ---- fullscreen map ---- */
+#map{position:fixed;inset:0;display:block;image-rendering:pixelated;
+  background:#000;touch-action:none;cursor:grab}
+#map.grabbing{cursor:grabbing}
+
+/* ---- HUD (bottom-left scale readout) ---- */
+.hud{position:fixed;left:10px;bottom:10px;padding:6px 10px;border-radius:4px;
+  background:rgba(10,13,16,.78);border:1px solid var(--line);color:#dfe6ec;
+  font-size:11px;letter-spacing:.05em;font-variant-numeric:tabular-nums;
+  pointer-events:none;z-index:5;line-height:1.6}
+.hud b{color:var(--accent)}
+.hud .lvl{text-transform:uppercase;letter-spacing:.14em;font-size:10px;color:var(--muted)}
+
+/* ---- busy overlay ---- */
+.busy{position:fixed;inset:0;display:flex;flex-direction:column;gap:10px;
+  align-items:center;justify-content:center;text-align:center;padding:20px;
+  background:rgba(10,13,16,.9);color:#dfe6ec;font-size:12px;letter-spacing:.12em;z-index:20}
+.busy.off{display:none}
+.busy small{letter-spacing:.04em;color:var(--muted);font-size:10.5px}
+.spin{position:fixed;top:10px;left:10px;z-index:6;font-size:10px;color:var(--accent);
+  letter-spacing:.14em;text-transform:uppercase;display:none;
+  background:rgba(10,13,16,.78);border:1px solid var(--line);border-radius:4px;padding:4px 8px}
+.spin.on{display:block}
+
+/* ---- side panel ---- */
+#panel{position:fixed;top:0;right:0;bottom:0;width:300px;z-index:10;
+  background:var(--panel);border-left:1px solid var(--line);
+  display:flex;flex-direction:column;transition:transform .18s ease}
+#panel.hidden{transform:translateX(300px)}
+#paneltab{position:fixed;top:10px;right:310px;z-index:11;border:1px solid var(--line);
+  background:rgba(10,13,16,.78);border-radius:4px;padding:5px 9px;cursor:pointer;
+  font-size:11px;letter-spacing:.08em;transition:right .18s ease}
+#panel.hidden ~ #paneltab, body.panelhidden #paneltab{right:10px}
+.pscroll{overflow-y:auto;flex:1;padding:14px}
+.group{padding:11px 0;border-bottom:1px solid var(--line)}
+.group:first-child{padding-top:2px}
+.group h2{margin:0 0 8px;font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:var(--muted)}
+.note{font-size:10.5px;color:var(--muted);margin:6px 0 0;line-height:1.5}
+
+.ladder{display:flex;flex-direction:column;gap:3px}
+.rung{display:flex;justify-content:space-between;align-items:baseline;gap:8px;
+  border:1px solid var(--line);background:var(--panel2);border-radius:4px;
+  padding:5px 9px;cursor:pointer;font-size:11.5px;text-align:left}
+.rung small{color:var(--muted);font-size:9.5px;letter-spacing:.03em}
+.rung.active{border-color:var(--accent);color:var(--accent)}
+.rung.active small{color:var(--accent)}
+
+.layers{display:flex;flex-wrap:wrap;gap:4px}
+.lay{border:1px solid var(--line);background:var(--panel2);border-radius:3px;
+  padding:4px 8px;cursor:pointer;font-size:11px}
+.lay.active{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);font-weight:700}
+
+.pair{display:flex;gap:6px}
+.pair>*{flex:1}
+input[type=number],input[type=text]{background:var(--panel2);border:1px solid var(--line);
+  border-radius:3px;padding:6px 8px;font-size:12px;width:100%}
+.btn{border:1px solid var(--line);background:var(--panel2);border-radius:4px;
+  padding:7px 10px;cursor:pointer;font-size:11.5px;letter-spacing:.05em}
+.btn:active{border-color:var(--accent)}
+
+/* ---- inspector ---- */
+#insp{font-size:11.5px;line-height:1.65}
+#insp .pin{color:var(--accent);font-size:10px;letter-spacing:.14em;text-transform:uppercase}
+#insp table{border-collapse:collapse;width:100%}
+#insp td{padding:1px 0;vertical-align:top}
+#insp td:first-child{color:var(--muted);padding-right:10px;white-space:nowrap}
+#insp .ent{margin:7px 0 3px;padding:7px 9px;border:1px solid var(--accent);
+  border-radius:4px;background:rgba(226,165,79,.08)}
+#insp .ent b{color:var(--accent)}
+#insp .tag{display:inline-block;border:1px solid var(--line);border-radius:3px;
+  padding:0 5px;font-size:9.5px;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--muted);margin-left:5px}
+#insp .tag.yes{border-color:#6fbf73;color:#6fbf73}
+#insp ul{margin:4px 0 0;padding-left:16px}
+#insp li{color:var(--muted)}
+#insp li b{color:var(--ink);font-weight:400}
+.cursorbox{position:fixed;border:1px solid var(--accent);pointer-events:none;
+  z-index:4;display:none;box-shadow:0 0 0 1px rgba(0,0,0,.5)}
+</style>
+</head>
+<body>
+<canvas id="map"></canvas>
+<div class="cursorbox" id="cursorbox"></div>
+<div class="hud" id="hud">…</div>
+<div class="spin" id="spin">computing…</div>
+
+<div id="panel">
+  <div class="pscroll">
+    <div class="group">
+      <h2>Granularity ladder</h2>
+      <div class="ladder" id="ladder"></div>
+      <p class="note">scroll to zoom continuously · the ladder only names the rungs.
+      The view is always the same number of tiles — zoom changes what a tile <i>means</i>.</p>
+    </div>
+    <div class="group">
+      <h2>Layers</h2>
+      <div class="layers" id="layers"></div>
+    </div>
+    <div class="group">
+      <h2>World</h2>
+      <div class="pair">
+        <input id="seed" type="number" value="42" min="0" step="1" aria-label="seed">
+        <button class="btn" id="rndBtn">rnd</button>
+      </div>
+      <div class="pair" style="margin-top:6px">
+        <button class="btn" id="playerBtn">go to player</button>
+        <button class="btn" id="planetBtn">whole planet</button>
+      </div>
+    </div>
+    <div class="group">
+      <h2>Tile inspector <span id="pinstate"></span></h2>
+      <div id="insp"><p class="note">hover a tile — click to pin / unpin</p></div>
+    </div>
+    <div class="group">
+      <p class="note">drag to pan · wheel / pinch to zoom · double-click ×8 ·
+      <b>+</b>/<b>−</b> keys · Python (<code>scale_core.py</code>) runs in your
+      browser via Pyodide. Same seed ⇒ the same ant on the same pebble, every visit.</p>
+    </div>
+  </div>
+</div>
+<button id="paneltab" title="toggle panel">☰ panel</button>
+
+<div class="busy" id="busy">LOADING PYTHON RUNTIME…<small id="busysub">pyodide + numpy, ~12 MB on first visit — cached after that</small></div>
+
+<script>
+/* The world math is scale_core.py in Pyodide. This page is only a canvas,
+   pointer handling and a side panel — a test harness for the multi-scale
+   tile system (planet → country → city → … → desk → ant). */
+
+const PLANET_M = 20000000, GRID = 64, BRANCH = 8;
+const TILE0 = PLANET_M / GRID, MIN_TILE = 0.002;
+const LEVELS = [
+  ["planet",   "continents, oceans"],
+  ["country",  "territories, ranges"],
+  ["city",     "cities own tiles"],
+  ["district", "urban plan, fields"],
+  ["block",    "blocks, woods"],
+  ["building", "buildings, gardens"],
+  ["figure",   "people, animals"],
+  ["desk",     "cups, books, flowers"],
+  ["insect",   "ants, pebbles"],
+  ["grain",    "sand grains"],
+];
+const levelTile = k => TILE0 / Math.pow(BRANCH, k);
+const levelOf = tm => Math.log(TILE0 / tm) / Math.log(BRANCH);
+const LAYERS = ["composite","biome","elevation","temperature","moisture","territory","category","entities"];
+
+const S = {
+  seed: 42, cx: PLANET_M/2, cy: PLANET_M/2, tileM: TILE0, layer: "composite",
+  nx: 64, ny: 40, tilePx: 16, dirty: true, pinned: null,
+};
+
+const map = document.getElementById("map");
+const ctx = map.getContext("2d");
+const buf = document.createElement("canvas");
+const bctx = buf.getContext("2d");
+const hud = document.getElementById("hud");
+const spin = document.getElementById("spin");
+const busy = document.getElementById("busy");
+const busysub = document.getElementById("busysub");
+const insp = document.getElementById("insp");
+const cursorbox = document.getElementById("cursorbox");
+
+function fmtM(v){
+  const f = x => {
+    let s = x >= 1000 ? String(Math.round(x)) : x.toPrecision(3);
+    return s.replace(/(\.\d*?)0+$/, "$1").replace(/\.$/, "");
+  };
+  if (v >= 1000) return f(v/1000) + " km";
+  if (v >= 1) return f(v) + " m";
+  if (v >= 0.01) return f(v*100) + " cm";
+  return f(v*1000) + " mm";
+}
+
+// ---------- layout: the view is always ~GRID tiles on its longest side ----------
+function layout(){
+  const W = innerWidth, H = innerHeight;
+  map.width = W; map.height = H;
+  S.tilePx = Math.max(W, H) / GRID;
+  S.nx = Math.min(GRID, Math.ceil(W / S.tilePx));
+  S.ny = Math.min(GRID, Math.ceil(H / S.tilePx));
+  S.dirty = true;
+}
+addEventListener("resize", layout);
+
+// ---------- pyodide bootstrap (local runtime, CDN fallback) ----------
+const PYODIDE_CDN = "https://cdn.jsdelivr.net/pyodide/v0.26.4/full/";
+let py = null, pyView, pyRender, pyDescribe, pyPlayer, pyReset;
+
+function loadScript(src){
+  return new Promise((ok, err) => {
+    const s = document.createElement("script");
+    s.src = src; s.onload = ok; s.onerror = err;
+    document.head.appendChild(s);
+  });
+}
+
+async function boot(){
+  let indexURL = "pyodide/";
+  try { await loadScript("pyodide/pyodide.js"); }
+  catch (e) {
+    busysub.textContent = "local pyodide runtime not found; loading CDN fallback…";
+    await loadScript(PYODIDE_CDN + "pyodide.js");
+    indexURL = PYODIDE_CDN;
+  }
+  const pyodide = await loadPyodide({ indexURL });
+  busysub.textContent = "loading numpy…";
+  await pyodide.loadPackage("numpy");
+  busysub.textContent = "loading scale_core.py…";
+  const res = await fetch("scale_core.py");
+  if (!res.ok) throw new Error("scale_core.py not found");
+  pyodide.FS.writeFile("scale_core.py", await res.text());
+  pyodide.runPython(`
+import scale_core as sc
+
+def js_reset(seed):
+    sc.reset(int(seed))
+
+def js_view(seed, cx, cy, tile_m, nx, ny):
+    cx, cy, tm = sc.view(int(seed), float(cx), float(cy), float(tile_m), int(nx), int(ny))
+    return [cx, cy, tm]
+
+def js_render(layer):
+    return sc.render_rgba(str(layer))
+
+def js_describe(i, j):
+    return sc.describe_json(int(i), int(j))
+
+def js_player(seed):
+    px, py = sc.find_player(int(seed))
+    return [px, py]
+`);
+  py = pyodide;
+  pyReset = py.globals.get("js_reset");
+  pyView = py.globals.get("js_view");
+  pyRender = py.globals.get("js_render");
+  pyDescribe = py.globals.get("js_describe");
+  pyPlayer = py.globals.get("js_player");
+  pyReset(S.seed);
+  // start above the player so every rung of the ladder has content
+  const p = pyPlayer(S.seed).toJs();
+  S.cx = p[0]; S.cy = p[1];
+  busy.classList.add("off");
+  layout();
+  requestAnimationFrame(loop);
+}
+boot().catch(e => { busy.firstChild.textContent = "FAILED TO START"; busysub.textContent = e; });
+
+// ---------- render ----------
+let snapped = { cx: S.cx, cy: S.cy, tm: S.tileM };
+
+function render(){
+  const r = pyView(S.seed, S.cx, S.cy, S.tileM, S.nx, S.ny);
+  const [cx, cy, tm] = r.toJs(); r.destroy();
+  snapped = { cx, cy, tm };
+  const res = pyRender(S.layer);
+  const [nx, ny, bytes] = res.toJs(); res.destroy();
+  if (buf.width !== nx || buf.height !== ny){ buf.width = nx; buf.height = ny; }
+  const arr = new Uint8ClampedArray(bytes.length);
+  arr.set(bytes);
+  bctx.putImageData(new ImageData(arr, nx, ny), 0, 0);
+  ctx.imageSmoothingEnabled = false;
+  ctx.clearRect(0, 0, map.width, map.height);
+  // the buffer is centered on (cx,cy): tile (i,j) center sits at world
+  // cx + (i - nx/2 + .5)*tm  ->  screen W/2 + (world - S.cx)/tm * tilePx
+  const px = S.tilePx * (S.nx % 2 ? 1 : 1); // uniform tile size
+  const ox = map.width / 2 - (S.cx - (cx - nx / 2 * tm)) / tm * S.tilePx;
+  const oy = map.height / 2 - (S.cy - (cy - ny / 2 * tm)) / tm * S.tilePx;
+  ctx.drawImage(buf, ox, oy, nx * S.tilePx, ny * S.tilePx);
+  lastTile = null;              // view changed: same tile index ≠ same tile
+  updateHud();
+  markLadder();
+}
+
+function updateHud(){
+  const lf = levelOf(S.tileM);
+  const k = Math.max(0, Math.min(LEVELS.length - 1, Math.round(lf)));
+  hud.innerHTML =
+    `<span class="lvl">L${k} ${LEVELS[k][0]} (${lf.toFixed(2)})</span><br>` +
+    `tile <b>${fmtM(S.tileM)}</b> · view <b>${fmtM(S.tileM * S.nx)}</b> across`;
+}
+
+function loop(){
+  if (S.dirty && py){
+    S.dirty = false;
+    spin.classList.add("on");
+    // let the spinner paint before the (synchronous) python call
+    setTimeout(() => { render(); spin.classList.remove("on"); }, 0);
+  }
+  requestAnimationFrame(loop);
+}
+
+// ---------- pan / zoom ----------
+function worldAt(px_, py_){
+  return [S.cx + (px_ - map.width / 2) * (S.tileM / S.tilePx),
+          S.cy + (py_ - map.height / 2) * (S.tileM / S.tilePx)];
+}
+function zoomAt(px_, py_, factor){
+  const nt = Math.min(TILE0, Math.max(MIN_TILE, S.tileM / factor));
+  if (nt === S.tileM) return;
+  const [wx, wy] = worldAt(px_, py_);
+  S.tileM = nt;
+  S.cx = wx - (px_ - map.width / 2) * (S.tileM / S.tilePx);
+  S.cy = wy - (py_ - map.height / 2) * (S.tileM / S.tilePx);
+  S.dirty = true;
+}
+
+const pointers = new Map();
+let panLast = null, pinchDist = 0;
+map.addEventListener("pointerdown", e => {
+  map.setPointerCapture(e.pointerId);
+  pointers.set(e.pointerId, [e.clientX, e.clientY]);
+  if (pointers.size === 1) panLast = [e.clientX, e.clientY];
+  map.classList.add("grabbing");
+});
+map.addEventListener("pointermove", e => {
+  if (pointers.has(e.pointerId)) pointers.set(e.pointerId, [e.clientX, e.clientY]);
+  if (pointers.size >= 2){
+    const pts = [...pointers.values()];
+    const d = Math.hypot(pts[0][0]-pts[1][0], pts[0][1]-pts[1][1]);
+    const mx = (pts[0][0]+pts[1][0])/2, my = (pts[0][1]+pts[1][1])/2;
+    if (pinchDist) zoomAt(mx, my, d / pinchDist);
+    pinchDist = d;
+    panLast = null;
+    return;
+  }
+  if (panLast){
+    S.cx -= (e.clientX - panLast[0]) * (S.tileM / S.tilePx);
+    S.cy -= (e.clientY - panLast[1]) * (S.tileM / S.tilePx);
+    panLast = [e.clientX, e.clientY];
+    S.dirty = true;
+  } else {
+    hover(e.clientX, e.clientY);
+  }
+});
+function endPointer(e){
+  pointers.delete(e.pointerId);
+  if (pointers.size < 2) pinchDist = 0;
+  if (pointers.size === 0){ panLast = null; map.classList.remove("grabbing"); }
+}
+map.addEventListener("pointerup", endPointer);
+map.addEventListener("pointercancel", endPointer);
+map.addEventListener("wheel", e => {
+  e.preventDefault();
+  zoomAt(e.clientX, e.clientY, e.deltaY < 0 ? 1.25 : 1/1.25);
+}, { passive: false });
+map.addEventListener("dblclick", e => zoomAt(e.clientX, e.clientY, 8));
+addEventListener("keydown", e => {
+  if (e.key === "+" || e.key === "=") zoomAt(map.width/2, map.height/2, 1.25);
+  if (e.key === "-") zoomAt(map.width/2, map.height/2, 1/1.25);
+});
+
+// drag = pan, click = pin: suppress click after a real drag
+let downAt = null;
+map.addEventListener("pointerdown", e => { downAt = [e.clientX, e.clientY]; });
+map.addEventListener("click", e => {
+  if (downAt && Math.hypot(e.clientX-downAt[0], e.clientY-downAt[1]) > 4) return;
+  const t = tileAt(e.clientX, e.clientY);
+  if (!t) return;
+  if (S.pinned && S.pinned[0] === t[0] && S.pinned[1] === t[1]) S.pinned = null;
+  else S.pinned = t;
+  document.getElementById("pinstate").textContent = S.pinned ? "· pinned" : "";
+  showTile(t, true);
+});
+
+// ---------- inspector ----------
+function tileAt(px_, py_){
+  if (!py) return null;
+  const [wx, wy] = worldAt(px_, py_);
+  const i = Math.floor((wx - (snapped.cx - S.nx/2*snapped.tm)) / snapped.tm);
+  const j = Math.floor((wy - (snapped.cy - S.ny/2*snapped.tm)) / snapped.tm);
+  if (i < 0 || j < 0 || i >= S.nx || j >= S.ny) return null;
+  return [i, j];
+}
+
+let hoverTimer = 0, lastTile = null;
+function hover(px_, py_){
+  if (S.pinned) return;
+  const t = tileAt(px_, py_);
+  if (!t){ cursorbox.style.display = "none"; return; }
+  if (lastTile && t[0] === lastTile[0] && t[1] === lastTile[1]) return;
+  lastTile = t;
+  const now = performance.now();
+  if (now - hoverTimer < 70) return;
+  hoverTimer = now;
+  showTile(t, false);
+}
+
+function showTile(t, force){
+  if (!py) return;
+  const [i, j] = t;
+  // highlight the tile on screen
+  const x = map.width/2 + ((snapped.cx - S.nx/2*snapped.tm + i*snapped.tm) - S.cx) / S.tileM * S.tilePx;
+  const y = map.height/2 + ((snapped.cy - S.ny/2*snapped.tm + j*snapped.tm) - S.cy) / S.tileM * S.tilePx;
+  cursorbox.style.display = "block";
+  cursorbox.style.left = x + "px";
+  cursorbox.style.top = y + "px";
+  cursorbox.style.width = S.tilePx * (snapped.tm / S.tileM) + "px";
+  cursorbox.style.height = S.tilePx * (snapped.tm / S.tileM) + "px";
+  const rec = JSON.parse(pyDescribe(i, j));
+  let h = "";
+  if (rec.entity){
+    const e = rec.entity;
+    h += `<div class="ent"><b>${e.name}</b>` +
+      `<span class="tag">${e.category}</span>` +
+      (e.interactable ? `<span class="tag yes">interactable</span>` : "") +
+      `<br><small>size ${e.size} · id ${e.id}</small></div>`;
+  }
+  h += "<table>";
+  const row = (k, v) => v !== undefined ? `<tr><td>${k}</td><td>${v}</td></tr>` : "";
+  h += row("level", rec.level + ` <small>(${rec.level_f})</small>`);
+  h += row("tile", rec.tile_size + ` @ [${rec.tile[0]},${rec.tile[1]}]`);
+  h += row("biome", rec.biome);
+  h += row("elevation", rec.elevation);
+  h += row("temp", rec.temperature);
+  h += row("moisture", rec.moisture);
+  h += row("vegetation", rec.vegetation);
+  h += row("territory", rec.territory);
+  h += row("settlement", rec.settlement);
+  h += "</table>";
+  if (rec.contains && rec.contains.length){
+    h += `<div style="margin-top:6px;color:var(--muted)">this tile contains</div><ul>`;
+    for (const c of rec.contains) h += `<li><b>${c.count}</b> ${c.kind} <small>(${c.cat})</small></li>`;
+    h += "</ul>";
+  }
+  insp.innerHTML = h;
+}
+
+// ---------- panel widgets ----------
+const ladder = document.getElementById("ladder");
+LEVELS.forEach(([name, what], k) => {
+  const b = document.createElement("button");
+  b.className = "rung";
+  b.innerHTML = `<span>L${k} ${name}</span><small>${fmtM(Math.max(levelTile(k), MIN_TILE))} / tile · ${what}</small>`;
+  b.onclick = () => { S.tileM = Math.max(levelTile(k), MIN_TILE); S.dirty = true; };
+  ladder.appendChild(b);
+});
+function markLadder(){
+  const k = Math.max(0, Math.min(LEVELS.length - 1, Math.round(levelOf(S.tileM))));
+  [...ladder.children].forEach((b, i) => b.classList.toggle("active", i === k));
+}
+
+const layersBox = document.getElementById("layers");
+LAYERS.forEach(name => {
+  const b = document.createElement("button");
+  b.className = "lay" + (name === S.layer ? " active" : "");
+  b.textContent = name;
+  b.onclick = () => {
+    S.layer = name; S.dirty = true;
+    [...layersBox.children].forEach(x => x.classList.toggle("active", x === b));
+  };
+  layersBox.appendChild(b);
+});
+
+const seedInput = document.getElementById("seed");
+function setSeed(v){
+  S.seed = v|0;
+  seedInput.value = S.seed;
+  if (!py) return;
+  pyReset(S.seed);
+  const p = pyPlayer(S.seed).toJs();
+  S.cx = p[0]; S.cy = p[1];
+  S.pinned = null;
+  S.dirty = true;
+}
+seedInput.addEventListener("change", () => setSeed(+seedInput.value));
+document.getElementById("rndBtn").onclick = () => setSeed(Math.floor(Math.random()*1e6));
+document.getElementById("playerBtn").onclick = () => {
+  if (!py) return;
+  const p = pyPlayer(S.seed).toJs();
+  S.cx = p[0]; S.cy = p[1]; S.tileM = 0.6; S.dirty = true;
+};
+document.getElementById("planetBtn").onclick = () => {
+  S.cx = PLANET_M/2; S.cy = PLANET_M/2; S.tileM = TILE0; S.dirty = true;
+};
+document.getElementById("paneltab").onclick = () => {
+  document.getElementById("panel").classList.toggle("hidden");
+  document.body.classList.toggle("panelhidden");
+};
+
+layout();
+</script>
+</body>
+</html>

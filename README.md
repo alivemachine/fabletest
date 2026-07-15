@@ -24,6 +24,38 @@ for the full design. This repo is the Python prototype stage of the roadmap:
 **Live console:** https://alivemachine.github.io/fabletest/
 (first visit downloads the Python runtime, ~12 MB, cached afterwards)
 
+## Multi-scale tile core (`scale_core.py` + `web/scales.html`)
+
+The next experiment: Google-Earth-style navigation where the scale range —
+planet → country → city → urban plan → building → garden → desk → ant — is
+the whole point, and **the view always renders the same number of tiles**.
+Resolution is which *granularity level* a tile's properties come from, never
+tile count.
+
+- `scale_core.py` — the pure-function core. Coordinates are meters (float64,
+  int64 lattice hashing survives the full 20,000 km → 2 mm range). A formal
+  **granularity ladder** `L0 planet … L9 grain` (tile size ÷8 per rung) names
+  the scales; every **entity kind** (city, building, tree, garden table, cup,
+  ant, sand grain…) has an intrinsic physical size and a hashed-lattice
+  placement conditioned downward through the ladder (buildings inside
+  settlement influence, cups on tables). Below ~half-a-tile footprint a kind
+  is **aggregated** into tile statistics (`contains: ~214 trees, ~17k
+  pebbles`); above it, individuals are **expanded** onto tiles, growing
+  1 → 2×2 → 3×3 as you dive (the player does exactly this). Deterministic and
+  storage-free: the same ant sits on the same pebble every visit.
+- `web/scales.html` — **the multi-scale test harness** (linked from the main
+  console): fullscreen tile map, all controls in a side panel (granularity
+  ladder, layers, seed, inspector), continuous wheel/pinch zoom from planet
+  to ant, hover/click any tile to see its properties (level, biome, units,
+  territory, entity kind/category/size/interactable, aggregate contents).
+  Runs `scale_core.py` in the browser via Pyodide, like the main console.
+- `test_scale_core.py` — determinism, pan/zoom coherence, entity stability
+  across zoom, footprint growth, aggregation vs expansion, the full ladder.
+  Run `python3 test_scale_core.py`.
+
+Interiors, rivers/hydrology at fine scales, and time are deliberately not in
+this core yet — exterior world first (see the plan in the PR / commit).
+
 ![console](docs/console.png)
 
 ## Run
