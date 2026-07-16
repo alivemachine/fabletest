@@ -465,22 +465,22 @@ CAT_COLORS = {
 # used when the kind is aggregated into a ground tile's cover texture.
 # rule tags are dispatched in _density().
 KINDS = [
-    dict(name="city",     cat="structure", size=6000.0, cell=90000.0, color=(184, 178, 170), inter=False, rule="settlement", ratio=(1, 1, 0),
+    dict(name="city",     cat="structure", size=6000.0, cell=90000.0, color=(190, 148, 122), inter=False, rule="settlement", ratio=(1, 1, 0),
          desc="a dense old-town city district seen from above: hundreds of tightly packed medieval houses with clay-tile and slate roofs, winding streets, small market squares, a surrounding stone wall",
          group="a distant walled city, a dense mass of tiny rooftops and streets"),
-    dict(name="town",     cat="structure", size=1500.0, cell=26000.0, color=(178, 170, 158), inter=False, rule="settlement", ratio=(1, 1, 0),
+    dict(name="town",     cat="structure", size=1500.0, cell=26000.0, color=(184, 142, 114), inter=False, rule="settlement", ratio=(1, 1, 0),
          desc="a market town seen from above: a few dozen timber-framed houses with clay roofs gathered around a central square, dirt roads radiating outward",
          group="a small market town of clustered clay rooftops"),
-    dict(name="village",  cat="structure", size=380.0,  cell=9000.0,  color=(172, 160, 142), inter=False, rule="settlement", ratio=(1, 1, 0),
+    dict(name="village",  cat="structure", size=380.0,  cell=9000.0,  color=(178, 136, 106), inter=False, rule="settlement", ratio=(1, 1, 0),
          desc="a small farming village seen from above: a handful of thatched cottages along a single dirt lane, fenced yards and vegetable gardens",
          group="a farming hamlet of thatched cottages"),
-    dict(name="crop field", cat="vegetal", size=160.0,  cell=420.0,   color=(188, 178, 96),  inter=False, rule="farmland", ratio=(2, 1, 0),
+    dict(name="crop field", cat="vegetal", size=160.0,  cell=420.0,   color=(202, 184, 92),  inter=False, rule="farmland", ratio=(2, 1, 0), jit=0.35,
          desc="a cultivated crop field seen from above: neat parallel furrows of ripe golden wheat, a low hedge border and a narrow footpath along one edge",
          group="a patchwork of cultivated wheat fields"),
     dict(name="wood",     cat="vegetal",   size=90.0,   cell=260.0,   color=(44, 96, 52),    inter=False, rule="woodland", ratio=(1, 1, 0),
          desc="a small dense wood seen from above: overlapping broadleaf canopies in several greens, deep understory shadow between the crowns",
          group="closed broadleaf forest canopy, overlapping treetops"),
-    dict(name="building", cat="structure", size=13.0,   cell=44.0,    color=(158, 138, 120), inter=True,  rule="building", ratio=(1, 1, 1),
+    dict(name="building", cat="structure", size=13.0,   cell=44.0,    color=(186, 110, 84),  inter=True,  rule="building", ratio=(1, 1, 1), jit=0.3,
          desc="a small rustic stone-and-timber house with a steep pitched clay-tile roof, a heavy wooden door, two shuttered windows and a small stone chimney",
          group="a group of small rustic stone-and-timber houses with clay-tile roofs"),
     dict(name="boulder",  cat="mineral",   size=3.2,    cell=64.0,    color=(134, 130, 126), inter=False, rule="mountain", ratio=(1, 1, 1),
@@ -531,7 +531,7 @@ KINDS = [
     dict(name="ant",      cat="animal",    size=0.011,  cell=0.09,    color=(60, 40, 30),    inter=True,  rule="ant", ratio=(2, 1, 1),
          desc="a black worker ant seen from above: three glossy body segments, six articulated legs, bent antennae",
          group="a swarming trail of black ants"),
-    dict(name="sand grain", cat="mineral", size=0.0035, cell=0.016,   color=(190, 174, 140), inter=False, rule="ground", ratio=(1, 1, 1),
+    dict(name="sand grain", cat="mineral", size=0.0035, cell=0.016,   color=(190, 174, 140), inter=False, rule="sandy", ratio=(1, 1, 1),
          desc="a single grain of quartz sand: an irregular translucent crystal with rounded edges, warm beige",
          group="coarse quartz sand"),
 ]
@@ -604,9 +604,9 @@ def _density(seed, kind, xs, ys, env):
         return land * np.clip(urban, 0.0, 1.0) ** 1.4 * 0.9 + land * 0.004
     if rule == "farmland":
         band = 4.0 * urban * (1.0 - urban)          # ring around settlements
-        return land * np.clip(band, 0.0, 1.0) * veg * 0.6
+        return land * np.clip(band, 0.0, 1.0) ** 0.7 * np.clip(veg * 2.0, 0, 1) * 0.85
     if rule == "woodland":
-        return land * np.clip(veg - 0.45, 0.0, 1.0) * 1.3 * (1.0 - urban)
+        return land * np.clip(veg - 0.30, 0.0, 1.0) * 1.6 * (1.0 - urban)
     if rule == "garden":
         return land * np.clip(urban - 0.25, 0.0, 1.0) * 0.5
     if rule == "on_table":
@@ -616,7 +616,7 @@ def _density(seed, kind, xs, ys, env):
     if rule == "veg":
         return land * veg * 0.45
     if rule == "grass":
-        return land * veg * 0.75
+        return land * np.clip(veg * 1.15, 0, 1)
     if rule == "meadow":
         return land * veg * np.clip(1.0 - env["m"], 0.2, 1.0) * 0.4
     if rule == "damp":
@@ -629,6 +629,11 @@ def _density(seed, kind, xs, ys, env):
         return land * (0.05 + np.clip(env["e"] - 0.6, 0.0, 1.0) * 0.8)
     if rule == "ground":
         return land * 0.35
+    if rule == "sandy":
+        # sand lives on beaches and in deserts; only traces elsewhere
+        near_sea = np.clip(1.0 - (env["e"] - SEA) / 0.006, 0.0, 1.0)
+        dry = np.clip((0.32 - env["m"]) / 0.15, 0.0, 1.0)
+        return land * (0.03 + 0.55 * np.maximum(near_sea, dry))
     if rule == "ant":
         return land * (0.06 + veg * 0.35)
     return land * 0.1
@@ -645,8 +650,9 @@ def _kind_site(seed, kind, ii, jj):
     jx = _hash01(seed, salt + 1, ii, jj)
     jy = _hash01(seed, salt + 2, ii, jj)
     cell = kind["cell"]
-    sx = (ii + 0.1 + 0.8 * jx) * cell
-    sy = (jj + 0.1 + 0.8 * jy) * cell
+    jit = kind.get("jit", 0.8)          # low jitter -> loose rows (urban plan)
+    sx = (ii + (1.0 - jit) / 2.0 + jit * jx) * cell
+    sy = (jj + (1.0 - jit) / 2.0 + jit * jy) * cell
     env = _env_at(seed, sx, sy, max(kind["size"] * 8.0, 24.0))
     p = _density(seed, kind, sx, sy, env)
     return (r < p).astype(np.float64), sx, sy, _hash_u64(seed, salt + 3, ii, jj)
@@ -670,12 +676,19 @@ def player_pos(seed):
 _state = {}
 
 
+_SETTLE_MIN_TILE = 35.0   # below this tile size a settlement's CONTENTS
+                          # (buildings, streets) have expanded — the
+                          # container stops being an entity and yields
+
+
 def _place_kind(seed, kind, x0, y0, x1, y1, tile_m):
     """All individuals of `kind` intersecting the window, as arrays
     (sx, sy, ids) — or None if the kind is aggregated at this scale."""
     win = max(x1 - x0, y1 - y0)
     if _snap_s(kind["size"] / (tile_m * kind["ratio"][0])) < 1 \
             or kind["size"] > win * 3.0:
+        return None
+    if kind["rule"] == "settlement" and tile_m < _SETTLE_MIN_TILE:
         return None
     cell = kind["cell"]
     pad = kind["size"]
@@ -808,9 +821,9 @@ def view(seed, cx, cy, tile_m, nx=GRID, ny=GRID):
         cover_frac = np.where(take, frac, cover_frac)
         cover_kid = np.where(take, kind["kid"], cover_kid)
     dens = np.zeros((ny, nx), np.int32)               # 0 bare 1 sparse 2 mid 3 dense
-    dens[cover_frac >= 0.02] = 1
-    dens[cover_frac >= 0.08] = 2
-    dens[cover_frac >= 0.25] = 3
+    dens[cover_frac >= 0.006] = 1
+    dens[cover_frac >= 0.05] = 2
+    dens[cover_frac >= 0.20] = 3
     cover_kid[dens == 0] = 0
     # one int32 texture id per tile: entity sprites (kind, s) or ground
     # (biome, cover kind, density) — np.unique of this grid IS the catalog
@@ -824,7 +837,11 @@ def view(seed, cx, cy, tile_m, nx=GRID, ny=GRID):
                   urban=urban, ubk=ubk, ubh=ubh, ubd=ubd,
                   kid=g["kid"], eid=g["eid"], var=g["var"], sca=g["sca"],
                   spr_u=g["spr_u"], spr_v=g["spr_v"], part=g["part"],
-                  cover_kid=cover_kid, cover_dens=dens, tex=tex, X=X, Y=Y)
+                  cover_kid=cover_kid, cover_dens=dens, cover_frac=cover_frac,
+                  tile_hash=_hash01(seed, 909,
+                                    (X / tile_m).round().astype(np.int64),
+                                    (Y / tile_m).round().astype(np.int64)),
+                  tex=tex, X=X, Y=Y)
     return cx, cy, tile_m
 
 
@@ -904,7 +921,22 @@ def colorize(layer):
         rgb = _BIOME_LUT[bio].copy()
         tint = (s["det"][..., None] - 0.5) * 34.0
         rgb = rgb + tint
+        # per-tile hash dither: kills the flat-field look, reads as 16-bit
+        rgb += (s["tile_hash"][..., None] - 0.5) * 14.0
         rgb = rgb * _shade(_state)[..., None]
+        # ground COVER: what the tile contains, stippled in the cover
+        # kind's color (forest patches, field rings, gravel, grass speckle)
+        cf = s["cover_frac"]
+        ck = s["cover_kid"]
+        if ck.any():
+            cover_col = np.zeros(rgb.shape)
+            for k in KINDS:
+                m2 = ck == k["kid"]
+                if m2.any():
+                    cover_col[m2] = k["color"]
+            stip = 0.35 + 0.65 * (s["tile_hash"] < np.clip(cf * 3.0, 0.15, 0.9))
+            mix = np.clip(cf * 3.0, 0.0, 0.8) * stip * (ck > 0) * ~water
+            rgb = rgb * (1 - mix[..., None]) + cover_col * mix[..., None]
         # urban wash so settlements read at coarse zoom
         uw = np.clip(s["urban"], 0, 1)[..., None] * ~water[..., None]
         rgb = rgb * (1 - 0.35 * uw) + np.array((186, 178, 168)) * (0.35 * uw)
@@ -915,6 +947,14 @@ def colorize(layer):
                 rgb[mask] = np.clip(np.array(k["color"], np.float64) + v, 0, 255)
         pm = s["kid"] == PLAYER_KID
         rgb[pm] = CAT_COLORS["player"]
+        # so-close-it-is-a-surface: sprites past s>=16 stop being icons and
+        # read as material — desaturate toward their luminance and add the
+        # ground dither back so a roof at desk scale is a texture, not a wall
+        close = (s["kid"] > 0) & (s["sca"] >= 16)
+        if close.any():
+            lum = rgb[close].mean(axis=1, keepdims=True)
+            rgb[close] = rgb[close] * 0.55 + lum * 0.45
+            rgb[close] += ((s["tile_hash"][close] - 0.5) * 16.0)[:, None]
         # the part of a sprite that RISES above its base reads lighter, and
         # brightens toward the top row — cheap "tall things lean up-screen"
         up = s["part"] == 2

@@ -171,8 +171,25 @@ const LAYERS = ["composite","biome","elevation","temperature","moisture","territ
 
 const S = {
   seed: 42, cx: PLANET_M/2, cy: PLANET_M/2, tileM: TILE0, layer: "composite",
-  nx: 64, ny: 40, tilePx: 16, dirty: true, pinned: null,
+  nx: 64, ny: 40, tilePx: 16, dirty: true, pinned: null, fromHash: false,
 };
+
+// shareable location: #<seed>,<cx>,<cy>,<tile_m>  (kept updated while moving)
+function readHash(){
+  const m = location.hash.slice(1).split(",").map(Number);
+  if (m.length === 4 && m.every(v => isFinite(v))){
+    S.seed = m[0]|0; S.cx = m[1]; S.cy = m[2];
+    S.tileM = Math.min(TILE0, Math.max(MIN_TILE, m[3]));
+    S.fromHash = true;
+  }
+}
+readHash();
+let hashTimer = 0;
+function writeHash(){
+  clearTimeout(hashTimer);
+  hashTimer = setTimeout(() => history.replaceState(null, "",
+    `#${S.seed},${S.cx.toFixed(4)},${S.cy.toFixed(4)},${S.tileM.toPrecision(6)}`), 250);
+}
 
 const map = document.getElementById("map");
 const ctx = map.getContext("2d");
@@ -265,9 +282,12 @@ def js_catalog():
   pyPlayer = py.globals.get("js_player");
   pyCatalog = py.globals.get("js_catalog");
   pyReset(S.seed);
-  // start above the player so every rung of the ladder has content
-  const p = pyPlayer(S.seed).toJs();
-  S.cx = p[0]; S.cy = p[1];
+  if (!S.fromHash){
+    // start above the player so every rung of the ladder has content
+    const p = pyPlayer(S.seed).toJs();
+    S.cx = p[0]; S.cy = p[1];
+  }
+  seedInput.value = S.seed;
   busy.classList.add("off");
   layout();
   requestAnimationFrame(loop);
@@ -277,7 +297,17 @@ boot().catch(e => { busy.firstChild.textContent = "FAILED TO START"; busysub.tex
 // ---------- render ----------
 let snapped = { cx: S.cx, cy: S.cy, tm: S.tileM };
 
+// shortest wrapped difference a-b on the planet torus
+function wdelta(a, b){
+  let d = (a - b) % PLANET_M;
+  if (d > PLANET_M / 2) d -= PLANET_M;
+  if (d < -PLANET_M / 2) d += PLANET_M;
+  return d;
+}
+
 function render(){
+  S.cx = ((S.cx % PLANET_M) + PLANET_M) % PLANET_M;
+  S.cy = ((S.cy % PLANET_M) + PLANET_M) % PLANET_M;
   const r = pyView(S.seed, S.cx, S.cy, S.tileM, S.nx, S.ny);
   const [cx, cy, tm] = r.toJs(); r.destroy();
   snapped = { cx, cy, tm };
@@ -291,14 +321,14 @@ function render(){
   ctx.clearRect(0, 0, map.width, map.height);
   // the buffer is centered on (cx,cy): tile (i,j) center sits at world
   // cx + (i - nx/2 + .5)*tm  ->  screen W/2 + (world - S.cx)/tm * tilePx
-  const px = S.tilePx * (S.nx % 2 ? 1 : 1); // uniform tile size
-  const ox = map.width / 2 - (S.cx - (cx - nx / 2 * tm)) / tm * S.tilePx;
-  const oy = map.height / 2 - (S.cy - (cy - ny / 2 * tm)) / tm * S.tilePx;
+  const ox = map.width / 2 - (wdelta(S.cx, cx) + nx / 2 * tm) / tm * S.tilePx;
+  const oy = map.height / 2 - (wdelta(S.cy, cy) + ny / 2 * tm) / tm * S.tilePx;
   ctx.drawImage(buf, ox, oy, nx * S.tilePx, ny * S.tilePx);
   lastTile = null;              // view changed: same tile index ≠ same tile
   updateHud();
   markLadder();
   updateCatalog();
+  writeHash();
 }
 
 function updateCatalog(){
@@ -406,8 +436,8 @@ map.addEventListener("click", e => {
 function tileAt(px_, py_){
   if (!py) return null;
   const [wx, wy] = worldAt(px_, py_);
-  const i = Math.floor((wx - (snapped.cx - S.nx/2*snapped.tm)) / snapped.tm);
-  const j = Math.floor((wy - (snapped.cy - S.ny/2*snapped.tm)) / snapped.tm);
+  const i = Math.floor((wdelta(wx, snapped.cx) + S.nx/2*snapped.tm) / snapped.tm);
+  const j = Math.floor((wdelta(wy, snapped.cy) + S.ny/2*snapped.tm) / snapped.tm);
   if (i < 0 || j < 0 || i >= S.nx || j >= S.ny) return null;
   return [i, j];
 }
@@ -429,8 +459,8 @@ function showTile(t, force){
   if (!py) return;
   const [i, j] = t;
   // highlight the tile on screen
-  const x = map.width/2 + ((snapped.cx - S.nx/2*snapped.tm + i*snapped.tm) - S.cx) / S.tileM * S.tilePx;
-  const y = map.height/2 + ((snapped.cy - S.ny/2*snapped.tm + j*snapped.tm) - S.cy) / S.tileM * S.tilePx;
+  const x = map.width/2 + wdelta(snapped.cx - S.nx/2*snapped.tm + i*snapped.tm, S.cx) / S.tileM * S.tilePx;
+  const y = map.height/2 + wdelta(snapped.cy - S.ny/2*snapped.tm + j*snapped.tm, S.cy) / S.tileM * S.tilePx;
   cursorbox.style.display = "block";
   cursorbox.style.left = x + "px";
   cursorbox.style.top = y + "px";
