@@ -85,20 +85,68 @@ def test_constant_tile_count():
 
 
 def test_player_footprint_grows():
+    """Base footprint 1 -> 2x2 -> 3x3, plus a HEIGHT column of tiles above:
+    the player is 1x1x3 (0.6 m wide, 1.8 m tall)."""
     px, py = setup_world()
-    sizes = {}
-    for tm in (1.19, 0.6, 0.3, 0.2):
+    base, above = {}, {}
+    for tm in (0.6, 0.3, 0.2):
         sc.view(SEED, px, py, tm, 64, 40)
-        n = int((sc._state["kid"] == sc.PLAYER_KID).sum())
-        sizes[tm] = n
-    assert sizes[1.19] <= 1, "far: at most a speck"
-    assert 1 <= sizes[0.6] <= 4, f"~1 tile at 0.6 m tiles, got {sizes[0.6]}"
-    assert sizes[0.3] > sizes[0.6], "closer: more tiles"
-    assert sizes[0.2] >= 7, f"~3x3 at 0.2 m tiles, got {sizes[0.2]}"
+        me = sc._state["kid"] == sc.PLAYER_KID
+        base[tm] = int((me & (sc._state["part"] == 1)).sum())
+        above[tm] = int((me & (sc._state["part"] == 2)).sum())
+    assert base[0.6] == 1 and above[0.6] == 3, (base, above)
+    assert base[0.3] == 4 and above[0.3] == 12, (base, above)
+    assert base[0.2] == 9 and above[0.2] == 27, (base, above)
     # zoom way out: the player must vanish from the grid entirely
     sc.view(SEED, px, py, 4882.8, 64, 40)
     assert int((sc._state["kid"] == sc.PLAYER_KID).sum()) == 0
-    print(f"ok player footprint — {sizes} tiles, invisible from orbit")
+    print(f"ok player footprint — base {base}, height tiles {above}, "
+          f"invisible from orbit")
+
+
+def test_ratio_conserved():
+    """A cubic kind is only ever n x n; a 2:1 kind only ever 2n x n — the
+    quantization that keeps the texture catalog finite."""
+    b = sc._KIND_BY_NAME["building"]        # ratio (1,1,1)
+    f = sc._KIND_BY_NAME["crop field"]      # ratio (2,1,0)
+    for tm in (13.0, 6.5, 4.3, 2.0, 1.0, 0.31, 0.05):
+        s = sc._snap_s(b["size"] / (tm * b["ratio"][0]))
+        if s >= 1:
+            w, d = b["ratio"][0] * s, b["ratio"][1] * s
+            assert w == d, "cubic house must stay square"
+    for tm in (80.0, 40.0, 20.0, 8.0, 2.0):
+        s = sc._snap_s(f["size"] / (tm * f["ratio"][0]))
+        if s >= 1:
+            w, d = f["ratio"][0] * s, f["ratio"][1] * s
+            assert w == 2 * d, "2:1 field must stay 2:1"
+    assert sc._snap_s(100) == 96, "large multipliers snap to the sparse ladder"
+    print("ok ratio conserved — square stays n×n, 2:1 stays 2n×n, "
+          "multipliers snap to a finite ladder")
+
+
+def test_texture_catalog_finite():
+    """Sweeping the whole zoom range over one spot must need only a bounded
+    set of texture keys, each with a long, style-pinned prompt."""
+    px, py = setup_world()
+    keys = set()
+    tm = sc.TILE0_M
+    while tm >= sc.MIN_TILE_M:
+        sc.view(SEED, px, py, tm, 64, 40)
+        cat = sc.texture_catalog()
+        assert cat["total"] <= 40, f"too many textures in one view: {cat['total']}"
+        keys.update(k["key"] for k in cat["keys"])
+        tm /= 4.0
+    assert len(keys) < 120, f"zoom sweep needs {len(keys)} keys — not finite enough"
+    for key in list(keys)[:20]:
+        p = sc.texture_prompt(key)
+        assert len(p) > 500, f"prompt too short for {key}"
+        assert "16-bit pixel art" in p and "palette" in p
+        if key.startswith("obj|"):
+            assert "isometric" in p and "transparent" in p.lower()
+        else:
+            assert "seamless" in p.lower()
+    print(f"ok texture catalog — whole planet→grain sweep over one spot "
+          f"needs {len(keys)} distinct keys, prompts are long and pinned")
 
 
 def test_entity_stable_across_zoom():
@@ -180,6 +228,8 @@ if __name__ == "__main__":
     test_zoom_coherence()
     test_constant_tile_count()
     test_player_footprint_grows()
+    test_ratio_conserved()
+    test_texture_catalog_finite()
     test_entity_stable_across_zoom()
     test_aggregation_vs_expansion()
     test_describe_schema()

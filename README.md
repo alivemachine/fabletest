@@ -43,6 +43,19 @@ tile count.
   pebbles`); above it, individuals are **expanded** onto tiles, growing
   1 → 2×2 → 3×3 as you dive (the player does exactly this). Deterministic and
   storage-free: the same ant sits on the same pebble every visit.
+
+  Every kind also has a **height** — an integer geometry ratio `(w, d, h)` —
+  and its sprite occupies `h` tile rows *above* its base (screen-north), the
+  isometric way: the 0.6 m player is 1×1 base + 3 tiles up. Footprints are
+  **quantized conserving that ratio** (a cubic house is only ever n×n, a 2:1
+  field only 2n×n; multipliers snap to a sparse ladder past 8), so
+  `(kind, footprint step)` names a **finite texture catalog**. Ground tiles
+  quantize `(biome, dominant sub-tile cover, density)` — dense enough cover
+  becomes a *group* texture (house cluster, closed canopy, ant trail).
+  `texture_prompt(key)` emits a long, style-pinned 16-bit isometric pixel-art
+  prompt (fixed prefix/suffix, exact tile-canvas proportions) per key, ready
+  for the RunPod pipeline; `texture_catalog()` lists what the current view
+  needs. A full planet→grain zoom over one spot needs ~40 keys.
 - `web/scales.html` — **the multi-scale test harness** (linked from the main
   console): fullscreen tile map, all controls in a side panel (granularity
   ladder, layers, seed, inspector), continuous wheel/pinch zoom from planet
